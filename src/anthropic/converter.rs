@@ -127,12 +127,15 @@ pub fn map_model(model: &str) -> Option<String> {
     {
         Some("minimax-m2.1".to_string())
     } else if model_lower.contains("minimax")
-        && (model_lower.contains("m2-2") || model_lower.contains("m2.2"))
+        && (model_lower.contains("m2-5") || model_lower.contains("m2.5"))
     {
         Some("minimax-m2.5".to_string())
     } else if model_lower.contains("qwen3") && model_lower.contains("coder") {
         Some("qwen3-coder-next".to_string())
-    } else {
+    } else if model_lower.contains("auto-model")  {
+        Some("auto".to_string())
+    }
+    else {
         None
     }
 }
@@ -946,9 +949,8 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_minimax_m2_2() {
-        assert_eq!(map_model("minimax-m2.2").unwrap(), "minimax-m2.5");
-        assert_eq!(map_model("minimax-m2-2").unwrap(), "minimax-m2.5");
+    fn test_map_model_minimax_m2_5() {
+        assert_eq!(map_model("minimax-m2.5").unwrap(), "minimax-m2.5");
     }
 
     #[test]

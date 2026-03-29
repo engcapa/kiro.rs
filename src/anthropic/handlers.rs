@@ -4,7 +4,7 @@ use std::convert::Infallible;
 
 use anyhow::Error;
 use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model::requests::kiro::{InferenceConfig, KiroRequest};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use axum::{
@@ -174,15 +174,6 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
-            id: "deepseek-3-2".to_string(),
-            object: "model".to_string(),
-            created: 1704067200,
-            owned_by: "deepseek".to_string(),
-            display_name: "DeepSeek 3.2".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
             id: "minimax-m2.1".to_string(),
             object: "model".to_string(),
             created: 1701388800,
@@ -192,29 +183,11 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
-            id: "minimax-m2-1".to_string(),
-            object: "model".to_string(),
-            created: 1701388800,
-            owned_by: "minimax".to_string(),
-            display_name: "Minimax M2.1".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "minimax-m2.2".to_string(),
+            id: "minimax-m2.5".to_string(),
             object: "model".to_string(),
             created: 1706659200,
             owned_by: "minimax".to_string(),
-            display_name: "Minimax M2.2".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "minimax-m2-2".to_string(),
-            object: "model".to_string(),
-            created: 1706659200,
-            owned_by: "minimax".to_string(),
-            display_name: "Minimax M2.2".to_string(),
+            display_name: "Minimax M2.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
@@ -224,15 +197,6 @@ pub async fn get_models() -> impl IntoResponse {
             created: 1740960000,
             owned_by: "qwen".to_string(),
             display_name: "Qwen3 Coder Next".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "qwen3-14b-coder".to_string(),
-            object: "model".to_string(),
-            created: 1740960000,
-            owned_by: "qwen".to_string(),
-            display_name: "Qwen3 14B Coder".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
@@ -317,6 +281,11 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
+        inference_config: Some(InferenceConfig {
+            max_tokens: payload.max_tokens as i32,
+            temperature: 0.0,
+            top_p: 0.0,
+        }),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -800,6 +769,11 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
+        inference_config: Some(InferenceConfig {
+            max_tokens: payload.max_tokens as i32,
+            temperature: 0.0,
+            top_p: 0.0,
+        }),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {

@@ -35,6 +35,18 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 推理配置（可选，全为默认值时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_config: Option<InferenceConfig>,
+}
+
+/// 推理配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceConfig {
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_p: f32,
 }
 #[cfg(test)]
 mod tests {

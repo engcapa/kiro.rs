@@ -90,6 +90,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 最大并发请求数（0 表示不限制）
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -108,7 +112,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.10.0".to_string()
+    "0.11.107".to_string()
 }
 
 fn default_system_version() -> String {
@@ -117,7 +121,7 @@ fn default_system_version() -> String {
 }
 
 fn default_node_version() -> String {
-    "22.21.1".to_string()
+    "22.22.0".to_string()
 }
 
 fn default_count_tokens_auth_type() -> String {
@@ -130,6 +134,10 @@ fn default_tls_backend() -> TlsBackend {
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_max_concurrency() -> usize {
+    3
 }
 
 impl Default for Config {
@@ -154,6 +162,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            max_concurrency: default_max_concurrency(),
             config_path: None,
         }
     }

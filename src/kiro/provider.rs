@@ -9,6 +9,7 @@ use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -38,6 +39,8 @@ pub struct KiroProvider {
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
+    /// 全局并发限制器（None 表示不限制）
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl KiroProvider {
@@ -55,11 +58,19 @@ impl KiroProvider {
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
+        let max_concurrency = token_manager.config().max_concurrency;
+        let semaphore = if max_concurrency > 0 {
+            Some(Arc::new(Semaphore::new(max_concurrency)))
+        } else {
+            None
+        };
+
         Self {
             token_manager,
             global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
+            semaphore,
         }
     }
 
@@ -167,6 +178,10 @@ impl KiroProvider {
 
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AmazonQDeveloperStreamingService.SendMessage"),
+        );
+        headers.insert(
             "x-amzn-codewhisperer-optout",
             HeaderValue::from_static("true"),
         );
@@ -219,6 +234,10 @@ impl KiroProvider {
 
         // 按照严格顺序添加请求头
         headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "x-amz-target",
+            HeaderValue::from_static("AmazonQDeveloperStreamingService.SendMessage"),
+        );
         headers.insert(
             "x-amz-user-agent",
             HeaderValue::from_str(&x_amz_user_agent).unwrap(),
@@ -387,7 +406,12 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_429(attempt)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -420,6 +444,13 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
+        // 并发限制：获取 semaphore permit，超出限制的请求在此排队等待
+        let _permit = if let Some(sem) = &self.semaphore {
+            Some(sem.acquire().await?)
+        } else {
+            None
+        };
+
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -565,7 +596,12 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_429(attempt)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -609,6 +645,17 @@ impl KiroProvider {
         const BASE_MS: u64 = 200;
         const MAX_MS: u64 = 2_000;
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn retry_delay_429(attempt: usize) -> Duration {
+        // 429 专用：更长的退避，给上游足够的恢复时间
+        const BASE_MS: u64 = 2_000;
+        const MAX_MS: u64 = 30_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(4) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
