@@ -29,14 +29,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -53,7 +65,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -80,6 +97,10 @@ Complete all chunked operations without commentary.";
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
+/// - deepseek 3.2/3-2 → deepseek-3.2
+/// - minimax m2.1/m2-1 → minimax-m2.1
+/// - minimax m2.2/m2-2 → minimax-m2.5
+/// - qwen3 + coder → qwen3-coder-next
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -97,6 +118,20 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
+    } else if model_lower.contains("deepseek")
+        && (model_lower.contains("3-2") || model_lower.contains("3.2"))
+    {
+        Some("deepseek-3.2".to_string())
+    } else if model_lower.contains("minimax")
+        && (model_lower.contains("m2-1") || model_lower.contains("m2.1"))
+    {
+        Some("minimax-m2.1".to_string())
+    } else if model_lower.contains("minimax")
+        && (model_lower.contains("m2-2") || model_lower.contains("m2.2"))
+    {
+        Some("minimax-m2.5".to_string())
+    } else if model_lower.contains("qwen3") && model_lower.contains("coder") {
+        Some("qwen3-coder-next".to_string())
     } else {
         None
     }
@@ -146,8 +181,8 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-        // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
+                                                // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+                                                // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
         if session_part.len() >= 36 {
             let uuid_str = &session_part[..36];
             // 简单验证 UUID 格式
@@ -547,7 +582,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
                 tool_specification: ToolSpecification {
                     name: t.name.clone(),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -590,7 +627,11 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -836,34 +877,26 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(
-            map_model("claude-sonnet-4-20250514")
-                .unwrap()
-                .contains("sonnet")
-        );
-        assert!(
-            map_model("claude-3-5-sonnet-20241022")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-20250514")
+            .unwrap()
+            .contains("sonnet"));
+        assert!(map_model("claude-3-5-sonnet-20241022")
+            .unwrap()
+            .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
-        );
+        assert!(map_model("claude-opus-4-20250514")
+            .unwrap()
+            .contains("opus"));
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(
-            map_model("claude-haiku-4-20250514")
-                .unwrap()
-                .contains("haiku")
-        );
+        assert!(map_model("claude-haiku-4-20250514")
+            .unwrap()
+            .contains("haiku"));
     }
 
     #[test]
@@ -897,6 +930,31 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_deepseek_3_2() {
+        assert_eq!(map_model("deepseek-3.2").unwrap(), "deepseek-3.2");
+        assert_eq!(map_model("deepseek-3-2").unwrap(), "deepseek-3.2");
+        assert_eq!(map_model("deepseek-chat-3.2").unwrap(), "deepseek-3.2");
+    }
+
+    #[test]
+    fn test_map_model_minimax_m2_1() {
+        assert_eq!(map_model("minimax-m2.1").unwrap(), "minimax-m2.1");
+        assert_eq!(map_model("minimax-m2-1").unwrap(), "minimax-m2.1");
+    }
+
+    #[test]
+    fn test_map_model_minimax_m2_2() {
+        assert_eq!(map_model("minimax-m2.2").unwrap(), "minimax-m2.5");
+        assert_eq!(map_model("minimax-m2-2").unwrap(), "minimax-m2.5");
+    }
+
+    #[test]
+    fn test_map_model_qwen3_coder() {
+        assert_eq!(map_model("qwen3-coder-next").unwrap(), "qwen3-coder-next");
+        assert_eq!(map_model("qwen3-14b-coder").unwrap(), "qwen3-coder-next");
     }
 
     #[test]
@@ -1128,10 +1186,9 @@ mod tests {
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-orphan", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg =
+            assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-orphan", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1160,10 +1217,8 @@ mod tests {
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         let history = vec![
             Message::User(HistoryUserMessage::new(
@@ -1225,10 +1280,8 @@ mod tests {
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
         let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
-        assistant_msg1 = assistant_msg1.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 构建历史中的 user 消息，包含 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1271,10 +1324,8 @@ mod tests {
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-        ]);
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
 
         // 历史中已有 tool_result
         let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
@@ -1417,7 +1468,7 @@ mod tests {
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({})),
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({}))
         ]);
 
         let mut history = vec![
@@ -1470,9 +1521,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -1522,7 +1579,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
