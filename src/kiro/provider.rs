@@ -8,6 +8,8 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
+use http::{HeaderMap, HeaderValue};
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -15,7 +17,7 @@ use uuid::Uuid;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
