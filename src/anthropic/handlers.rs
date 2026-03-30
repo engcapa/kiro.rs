@@ -320,6 +320,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -328,11 +330,12 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
     }
 }
 
@@ -343,6 +346,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -351,7 +355,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -477,6 +481,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -549,10 +554,15 @@ async fn handle_non_stream_request(
                                         })
                                 };
 
+                                let original_name = tool_name_map
+                                    .get(&tool_use.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| tool_use.name.clone());
+
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
-                                    "name": tool_use.name,
+                                    "name": original_name,
                                     "input": input
                                 }));
                             }
@@ -808,6 +818,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -816,11 +828,12 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
         // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, tool_name_map).await
     }
 }
 
@@ -834,6 +847,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -842,7 +856,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
