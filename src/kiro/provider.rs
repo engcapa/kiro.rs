@@ -499,11 +499,16 @@ impl KiroProvider {
                 config.system_version, config.node_version, config.kiro_version, machine_id
             );
 
+            // 用当前凭据的 profile_arn 替换请求体中的 profile_arn
+            // 这是多凭据场景的关键：每个凭据有自己的 profile_arn（或没有），
+            // 不能使用启动时从第一个凭据静态取出的值
+            let effective_body = Self::patch_profile_arn(request_body, ctx.credentials.profile_arn.as_deref());
+
             // 发送请求
             let response = match self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(request_body.to_string())
+                .body(effective_body)
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
                 .header("x-amzn-kiro-agent-mode", "vibe")
@@ -668,6 +673,31 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    /// 用当前凭据的 profile_arn 替换请求体中的 profile_arn 字段
+    ///
+    /// 多凭据场景下，每个凭据有自己的 profile_arn（或没有）。
+    /// 请求体在 handler 层构建时使用的是启动时第一个凭据的 profile_arn，
+    /// 这里在发送前动态替换为当前实际使用凭据的值。
+    fn patch_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(request_body) else {
+            return request_body.to_string();
+        };
+
+        match profile_arn {
+            Some(arn) => {
+                value["profileArn"] = serde_json::Value::String(arn.to_string());
+            }
+            None => {
+                // 当前凭据没有 profile_arn，移除该字段
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("profileArn");
+                }
+            }
+        }
+
+        serde_json::to_string(&value).unwrap_or_else(|_| request_body.to_string())
     }
 
     fn retry_delay(attempt: usize) -> Duration {
