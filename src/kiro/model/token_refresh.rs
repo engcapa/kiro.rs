@@ -41,6 +41,4 @@ pub struct IdcRefreshResponse {
     // pub token_type: Option<String>,
     #[serde(default)]
     pub expires_in: Option<i64>,
-    #[serde(default)]
-    pub profile_arn: Option<String>,
 }
