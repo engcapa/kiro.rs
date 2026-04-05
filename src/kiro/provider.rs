@@ -396,6 +396,23 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                // 打印详细的请求信息用于分析
+                tracing::error!(
+                    "MCP API 400 错误详情 - URL: {}, 凭据ID: {:?}, profile_arn: {:?}, 请求体长度: {} bytes",
+                    url,
+                    ctx.credentials.id,
+                    ctx.credentials.profile_arn,
+                    request_body.len()
+                );
+
+                // 打印请求体的前500字符（避免过长）
+                let body_preview = if request_body.len() > 500 {
+                    format!("{}...(truncated)", &request_body[..500])
+                } else {
+                    request_body.to_string()
+                };
+                tracing::error!("请求体预览: {}", body_preview);
+
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -504,6 +521,14 @@ impl KiroProvider {
             // 不能使用启动时从第一个凭据静态取出的值
             let effective_body = Self::patch_profile_arn(request_body, ctx.credentials.profile_arn.as_deref());
 
+            // 保存请求体信息用于错误日志（在 body 被移动前）
+            let body_len = effective_body.len();
+            let body_preview = if effective_body.len() > 500 {
+                format!("{}...(truncated)", &effective_body[..500])
+            } else {
+                effective_body.clone()
+            };
+
             // 发送请求
             let response = match self
                 .client_for(&ctx.credentials)?
@@ -582,6 +607,19 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // 打印详细的请求信息用于分析
+                tracing::error!(
+                    "API 400 错误详情 - URL: {}, 凭据ID: {:?}, profile_arn: {:?}, 模型: {:?}, 请求体长度: {} bytes",
+                    url,
+                    ctx.credentials.id,
+                    ctx.credentials.profile_arn,
+                    model,
+                    body_len
+                );
+
+                // 打印请求体预览
+                tracing::error!("请求体预览: {}", body_preview);
+
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
