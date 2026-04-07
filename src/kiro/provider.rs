@@ -264,6 +264,19 @@ impl KiroProvider {
         Ok(headers)
     }
 
+    /// 将凭据的 profile_arn 注入到请求体 JSON 中
+    fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+        if let Some(arn) = profile_arn {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+                json["profileArn"] = serde_json::Value::String(arn.clone());
+                if let Ok(body) = serde_json::to_string(&json) {
+                    return body;
+                }
+            }
+        }
+        request_body.to_string()
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移：
@@ -512,24 +525,14 @@ impl KiroProvider {
             let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
-            // 用当前凭据的 profile_arn 替换请求体中的 profile_arn
-            // 这是多凭据场景的关键：每个凭据有自己的 profile_arn（或没有），
-            // 不能使用启动时从第一个凭据静态取出的值
-            let effective_body = Self::patch_profile_arn(request_body, ctx.credentials.profile_arn.as_deref());
-
-            // 保存请求体信息用于错误日志（在 body 被移动前）
-            let body_len = effective_body.len();
-            let body_preview = if effective_body.len() > 500 {
-                format!("{}...(truncated)", &effective_body[..500])
-            } else {
-                effective_body.clone()
-            };
+            // 注入实际凭据的 profile_arn 到请求体
+            let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
 
             // 发送请求
             let response = match self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(effective_body)
+                .body(body)
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "false")
                 .header("x-amzn-kiro-agent-mode", "vibe")
@@ -709,31 +712,6 @@ impl KiroProvider {
         }))
     }
 
-    /// 用当前凭据的 profile_arn 替换请求体中的 profile_arn 字段
-    ///
-    /// 多凭据场景下，每个凭据有自己的 profile_arn（或没有）。
-    /// 请求体在 handler 层构建时使用的是启动时第一个凭据的 profile_arn，
-    /// 这里在发送前动态替换为当前实际使用凭据的值。
-    fn patch_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(request_body) else {
-            return request_body.to_string();
-        };
-
-        match profile_arn {
-            Some(arn) => {
-                value["profileArn"] = serde_json::Value::String(arn.to_string());
-            }
-            None => {
-                // 当前凭据没有 profile_arn，移除该字段
-                if let Some(obj) = value.as_object_mut() {
-                    obj.remove("profileArn");
-                }
-            }
-        }
-
-        serde_json::to_string(&value).unwrap_or_else(|_| request_body.to_string())
-    }
-
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -824,5 +802,47 @@ mod tests {
     fn test_is_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_inject_profile_arn_with_some() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+        );
+        // 原有字段保留
+        assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_with_none() {
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let result = KiroProvider::inject_profile_arn(body, &None);
+        // 不注入 profileArn，原样返回
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(json.get("profileArn").is_none());
+        assert_eq!(json["conversationState"]["conversationId"], "c1");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_overwrites_existing() {
+        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
+        let arn = Some("new-arn".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "new-arn");
+    }
+
+    #[test]
+    fn test_inject_profile_arn_invalid_json() {
+        let body = "not-valid-json";
+        let arn = Some("arn:test".to_string());
+        let result = KiroProvider::inject_profile_arn(body, &arn);
+        // 解析失败时原样返回
+        assert_eq!(result, "not-valid-json");
     }
 }
