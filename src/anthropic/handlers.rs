@@ -4,7 +4,7 @@ use std::convert::Infallible;
 
 use anyhow::Error;
 use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::{InferenceConfig, KiroRequest};
+use crate::kiro::model::requests::kiro::{KiroRequest};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use axum::{
@@ -290,11 +290,6 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
-        inference_config: Some(InferenceConfig {
-            max_tokens: payload.max_tokens as i32,
-            temperature: 0.0,
-            top_p: 0.0,
-        }),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -788,11 +783,6 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
-        inference_config: Some(InferenceConfig {
-            max_tokens: payload.max_tokens as i32,
-            temperature: 0.0,
-            top_p: 0.0,
-        }),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {

@@ -1766,12 +1766,6 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req);
-        assert!(
-            result.is_ok(),
-            "连续 assistant 消息场景不应报错: {:?}",
-            result.err()
-        );
         let result = convert_request(&req, "AI_EDITOR", false);
         assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
 
