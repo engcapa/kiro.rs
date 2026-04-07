@@ -266,7 +266,7 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -764,7 +764,7 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {

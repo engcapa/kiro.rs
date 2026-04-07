@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
-    AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
+    AssistantMessage, ConversationState, CurrentMessage, EnvState, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
@@ -32,26 +32,14 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        obj.insert(
-            "type".to_string(),
-            serde_json::Value::String("object".to_string()),
-        );
+    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => {
-            obj.insert(
-                "properties".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
+        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
     }
 
     // required（必须是 string 数组）
@@ -68,12 +56,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => {
-            obj.insert(
-                "additionalProperties".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
+        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
     }
 
     serde_json::Value::Object(obj)
@@ -100,10 +83,6 @@ Complete all chunked operations without commentary.";
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
-/// - deepseek 3.2/3-2 → deepseek-3.2
-/// - minimax m2.1/m2-1 → minimax-m2.1
-/// - minimax m2.2/m2-2 → minimax-m2.5
-/// - qwen3 + coder → qwen3-coder-next
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -121,28 +100,6 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
-    } else if model_lower.contains("deepseek")
-        && (model_lower.contains("3-2") || model_lower.contains("3.2"))
-    {
-        Some("deepseek-3.2".to_string())
-    } else if model_lower.contains("minimax")
-        && (model_lower.contains("m2-1") || model_lower.contains("m2.1"))
-    {
-        Some("minimax-m2.1".to_string())
-    } else if model_lower.contains("minimax")
-        && (model_lower.contains("m2-5") || model_lower.contains("m2.5"))
-    {
-        Some("minimax-m2.5".to_string())
-    } else if model_lower.contains("qwen3") && model_lower.contains("coder") {
-        Some("qwen3-coder-next".to_string())
-    } else if model_lower.contains("auto-model") {
-        Some("auto".to_string())
-    } else if model_lower.contains("glm") {
-        if model_lower.contains("glm-5") || model_lower.contains("glm5") {
-            Some("glm-5".to_string())
-        } else {
-            None
-        }
     } else {
         None
     }
@@ -206,8 +163,6 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     // 回退到字符串格式: 查找 "session_" 后面的内容
     if let Some(pos) = user_id.find("session_") {
         let session_part = &user_id[pos + 8..]; // "session_" 长度为 8
-                                                // session_part 应该是 UUID 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-                                                // 验证是否是有效的 UUID 格式（36 字符，包含 4 个连字符）
         if session_part.len() >= 36 {
             let uuid_str = &session_part[..36];
             if is_valid_uuid(uuid_str) {
@@ -261,7 +216,7 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bool) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -335,6 +290,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
+    if inject_env_state {
+        context = context.with_env_state(EnvState {
+            operating_system: "linux".to_string(),
+            current_working_directory: "/home/user".to_string(),
+        });
+    }
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
@@ -348,7 +309,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
-        .with_origin("AI_EDITOR");
+        .with_origin(origin);
 
     if !images.is_empty() {
         user_input = user_input.with_images(images);
@@ -365,7 +326,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
+        tracing::info!(
+            "工具名称映射: {} 个超长名称已缩短",
+            tool_name_map.len()
+        );
     }
 
     Ok(ConversionResult {
@@ -616,10 +580,7 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(
-    tools: &Option<Vec<super::types::Tool>>,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Vec<Tool> {
+fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -650,9 +611,7 @@ fn convert_tools(
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
                 },
             }
         })
@@ -695,12 +654,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(
-    req: &MessagesRequest,
-    messages: &[super::types::Message],
-    model_id: &str,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -864,8 +818,7 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses
-                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -950,26 +903,34 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514")
-            .unwrap()
-            .contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022")
-            .unwrap()
-            .contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514")
-            .unwrap()
-            .contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514")
-            .unwrap()
-            .contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]
@@ -1003,40 +964,6 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_deepseek_3_2() {
-        assert_eq!(map_model("deepseek-3.2").unwrap(), "deepseek-3.2");
-        assert_eq!(map_model("deepseek-3-2").unwrap(), "deepseek-3.2");
-        assert_eq!(map_model("deepseek-chat-3.2").unwrap(), "deepseek-3.2");
-    }
-
-    #[test]
-    fn test_map_model_minimax_m2_1() {
-        assert_eq!(map_model("minimax-m2.1").unwrap(), "minimax-m2.1");
-        assert_eq!(map_model("minimax-m2-1").unwrap(), "minimax-m2.1");
-    }
-
-    #[test]
-    fn test_map_model_minimax_m2_5() {
-        assert_eq!(map_model("minimax-m2.5").unwrap(), "minimax-m2.5");
-    }
-
-    #[test]
-    fn test_map_model_qwen3_coder() {
-        assert_eq!(map_model("qwen3-coder-next").unwrap(), "qwen3-coder-next");
-        assert_eq!(map_model("qwen3-14b-coder").unwrap(), "qwen3-coder-next");
-    }
-
-    #[test]
-    fn test_map_model_glm_5() {
-        assert_eq!(map_model("glm-5").unwrap(), "glm-5");
-        assert_eq!(map_model("glm5").unwrap(), "glm-5");
-        assert_eq!(
-            map_model("my-openai-provider/ZhipuAI/glm-5").unwrap(),
-            "glm-5"
-        );
     }
 
     #[test]
@@ -1100,18 +1027,13 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name =
-            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(
-            short1.len() <= TOOL_NAME_MAX_LEN,
-            "短名称长度应 <= 63，实际 {}",
-            short1.len()
-        );
+        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
     }
 
     #[test]
@@ -1174,7 +1096,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -1242,7 +1164,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -1299,7 +1221,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1387,7 +1309,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1415,7 +1337,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -1850,6 +1772,8 @@ mod tests {
             "连续 assistant 消息场景不应报错: {:?}",
             result.err()
         );
+        let result = convert_request(&req, "AI_EDITOR", false);
+        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;

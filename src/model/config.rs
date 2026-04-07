@@ -16,6 +16,32 @@ impl Default for TlsBackend {
     }
 }
 
+/// 客户端模拟模式
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientMode {
+    /// 模拟 Kiro IDE（默认，原有行为）
+    #[default]
+    KiroIde,
+    /// 模拟 Kiro CLI
+    KiroCli,
+}
+
+impl ClientMode {
+    /// 获取 origin 字段值
+    pub fn origin(&self) -> &'static str {
+        match self {
+            ClientMode::KiroIde => "AI_EDITOR",
+            ClientMode::KiroCli => "KIRO_CLI",
+        }
+    }
+
+    /// 是否为 kiro-cli 模式
+    pub fn is_cli(&self) -> bool {
+        matches!(self, ClientMode::KiroCli)
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +116,14 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 客户端模拟模式（"kiro-ide" 或 "kiro-cli"）
+    #[serde(default)]
+    pub client_mode: ClientMode,
+
+    /// kiro-cli 版本号（仅 kiro-cli 模式使用）
+    #[serde(default = "default_kiro_cli_version")]
+    pub kiro_cli_version: String,
+
     /// 最大并发请求数（0 表示不限制）
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
@@ -136,6 +170,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_kiro_cli_version() -> String {
+    "1.29.3".to_string()
+}
+
 fn default_max_concurrency() -> usize {
     3
 }
@@ -162,6 +200,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            client_mode: ClientMode::default(),
+            kiro_cli_version: default_kiro_cli_version(),
             max_concurrency: default_max_concurrency(),
             config_path: None,
         }
