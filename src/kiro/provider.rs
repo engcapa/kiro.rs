@@ -527,6 +527,8 @@ impl KiroProvider {
 
             // 注入实际凭据的 profile_arn 到请求体
             let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
+            let body_len = body.len();
+            let body_preview = body.chars().take(500).collect::<String>();
 
             // 发送请求
             let response = match self
