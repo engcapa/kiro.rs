@@ -23,6 +23,12 @@ mod router;
 mod service;
 pub mod types;
 
+#[cfg(test)]
+mod persistence_tests;
+
+#[cfg(test)]
+mod backward_compat_tests;
+
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;

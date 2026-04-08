@@ -24,6 +24,7 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  name?: string
 }
 
 // 余额响应
@@ -60,6 +61,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetNameRequest {
+  name: string
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
@@ -73,6 +78,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  name?: string
 }
 
 // 添加凭据响应

@@ -476,6 +476,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 用户自定义名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1377,6 +1380,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                     }.to_string()),
+                    name: e.credentials.name.clone(),
                 })
                 .collect(),
             current_id,
@@ -1440,6 +1444,21 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+        }
+        // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据名称（Admin API）
+    pub fn set_name(&self, id: u64, name: String) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.name = Some(name);
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1612,6 +1631,7 @@ impl MultiTokenManager {
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
+        validated_cred.name = new_cred.name;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;

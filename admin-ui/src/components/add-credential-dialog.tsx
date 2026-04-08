@@ -21,6 +21,7 @@ type AuthMethod = 'social' | 'idc'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
+  const [name, setName] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
@@ -36,6 +37,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const resetForm = () => {
     setRefreshToken('')
+    setName('')
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
@@ -66,6 +68,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     mutate(
       {
         refreshToken: refreshToken.trim(),
+        name: name.trim() || undefined,
         authMethod,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
@@ -112,6 +115,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 onChange={(e) => setRefreshToken(e.target.value)}
                 disabled={isPending}
               />
+            </div>
+
+            {/* 凭据名称 */}
+            <div className="space-y-2">
+              <label htmlFor="name" className="text-sm font-medium">
+                凭据名称
+              </label>
+              <Input
+                id="name"
+                placeholder="为凭据设置一个易于识别的名称（可选）"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={isPending}
+                maxLength={100}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，最多 100 个字符
+              </p>
             </div>
 
             {/* 认证方式 */}

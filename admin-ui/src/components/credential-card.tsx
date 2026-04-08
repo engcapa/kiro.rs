@@ -22,6 +22,7 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useSetCredentialName,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -60,12 +61,15 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [editingName, setEditingName] = useState(false)
+  const [nameValue, setNameValue] = useState(credential.name || '')
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setName = useSetCredentialName()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -141,6 +145,49 @@ export function CredentialCard({
     })
   }
 
+  const handleNameChange = () => {
+    const trimmedName = nameValue.trim()
+    
+    if (!trimmedName) {
+      toast.error('名称不能为空')
+      setNameValue(credential.name || '')
+      setEditingName(false)
+      return
+    }
+
+    if (trimmedName === credential.name) {
+      setEditingName(false)
+      return
+    }
+
+    setName.mutate(
+      { id: credential.id, name: trimmedName },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingName(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+          setNameValue(credential.name || '')
+          setEditingName(false)
+        },
+      }
+    )
+  }
+
+  const handleNameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleNameChange()
+    } else if (e.key === 'Escape') {
+      setNameValue(credential.name || '')
+      setEditingName(false)
+    }
+  }
+
+  // Display Name 解析逻辑：优先级 name > email > "凭据 #id"
+  const displayName = credential.name || credential.email || `凭据 #${credential.id}`
+
   return (
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
@@ -151,18 +198,41 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
-                {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
-                )}
-              </CardTitle>
+              {editingName ? (
+                <div className="flex items-center gap-1">
+                  <Input
+                    value={nameValue}
+                    onChange={(e) => setNameValue(e.target.value)}
+                    onBlur={handleNameChange}
+                    onKeyDown={handleNameKeyDown}
+                    className="h-8 text-lg font-semibold"
+                    autoFocus
+                    disabled={setName.isPending}
+                  />
+                </div>
+              ) : (
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <span
+                    className="cursor-pointer hover:underline"
+                    onClick={() => {
+                      setEditingName(true)
+                      setNameValue(credential.name || '')
+                    }}
+                    title="点击编辑名称"
+                  >
+                    {displayName}
+                  </span>
+                  {credential.isCurrent && (
+                    <Badge variant="success">当前</Badge>
+                  )}
+                  {credential.disabled && (
+                    <Badge variant="destructive">已禁用</Badge>
+                  )}
+                  {credential.disabled && credential.disabledReason && (
+                    <Badge variant="outline">{credential.disabledReason}</Badge>
+                  )}
+                </CardTitle>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>

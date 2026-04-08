@@ -58,6 +58,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 用户自定义名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -76,6 +79,14 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 设置凭据名称请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameRequest {
+    /// 凭据名称
+    pub name: String,
 }
 
 /// 添加凭据请求
@@ -127,6 +138,9 @@ pub struct AddCredentialRequest {
 
     /// 凭据级客户端模拟模式（可选，"kiro-ide" 或 "kiro-cli"）
     pub client_mode: Option<ClientMode>,
+
+    /// 用户自定义名称（可选）
+    pub name: Option<String>,
 }
 
 fn default_auth_method() -> String {

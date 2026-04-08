@@ -73,6 +73,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 用户自定义凭据名称（用于标识和管理）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -345,6 +349,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -464,6 +469,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -495,6 +501,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -608,6 +615,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -877,5 +885,72 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ name 字段测试 ============
+
+    #[test]
+    fn test_name_field_parsing() {
+        // 测试解析包含 name 字段的 JSON
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "name": "My Credential"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(creds.name, Some("My Credential".to_string()));
+    }
+
+    #[test]
+    fn test_name_field_missing_backward_compat() {
+        // 测试向后兼容：不包含 name 字段的旧格式 JSON
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authMethod": "social"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
+        assert_eq!(creds.name, None);
+    }
+
+    #[test]
+    fn test_name_field_serialization() {
+        // 测试序列化时正确输出 name 字段
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.name = Some("Test Credential".to_string());
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(json.contains("name"));
+        assert!(json.contains("Test Credential"));
+    }
+
+    #[test]
+    fn test_name_field_none_not_serialized() {
+        // 测试 name 为 None 时不序列化（skip_serializing_if）
+        let mut creds = KiroCredentials::default();
+        creds.refresh_token = Some("test".to_string());
+        creds.name = None;
+
+        let json = creds.to_pretty_json().unwrap();
+        assert!(!json.contains("name"));
+    }
+
+    #[test]
+    fn test_name_field_roundtrip() {
+        // 测试序列化和反序列化的往返一致性
+        let mut original = KiroCredentials::default();
+        original.refresh_token = Some("refresh".to_string());
+        original.name = Some("Production Credential".to_string());
+        original.email = Some("user@example.com".to_string());
+
+        let json = original.to_pretty_json().unwrap();
+        let parsed = KiroCredentials::from_json(&json).unwrap();
+
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.email, original.email);
+        assert_eq!(parsed.refresh_token, original.refresh_token);
     }
 }
