@@ -20,9 +20,38 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
 
-    /// 账户信息（包含 email、userId、provider 等）
+    /// 账户信息（包含 email、userId、provider 等）- 字段名 accountInfo
     #[serde(default)]
     pub account_info: Option<AccountInfo>,
+
+    /// 捕获所有未知字段（用于调试）
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl UsageLimitsResponse {
+    /// 从 extra 字段中尝试提取账户信息（处理不同字段名）
+    pub fn resolve_account_info(&self) -> Option<AccountInfo> {
+        if self.account_info.is_some() {
+            return self.account_info.clone();
+        }
+        // 尝试其他可能的字段名
+        for key in &["userInfo", "user_info", "identity", "user", "profile", "userProfile"] {
+            if let Some(val) = self.extra.get(*key) {
+                tracing::debug!("尝试从 {} 字段解析 AccountInfo: {}", key, val);
+                match serde_json::from_value::<AccountInfo>(val.clone()) {
+                    Ok(info) => {
+                        tracing::info!("成功从 {} 字段解析 AccountInfo: {:?}", key, info);
+                        return Some(info);
+                    }
+                    Err(e) => {
+                        tracing::warn!("从 {} 字段解析 AccountInfo 失败: {}", key, e);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// 订阅信息
@@ -165,24 +194,18 @@ impl UsageLimitsResponse {
     }
 
     /// 获取用户邮箱
-    pub fn email(&self) -> Option<&str> {
-        self.account_info
-            .as_ref()
-            .and_then(|info| info.email.as_deref())
+    pub fn email(&self) -> Option<String> {
+        self.resolve_account_info().and_then(|info| info.email)
     }
 
     /// 获取用户 ID
-    pub fn user_id(&self) -> Option<&str> {
-        self.account_info
-            .as_ref()
-            .and_then(|info| info.user_id.as_deref())
+    pub fn user_id(&self) -> Option<String> {
+        self.resolve_account_info().and_then(|info| info.user_id)
     }
 
     /// 获取认证供应商
-    pub fn provider(&self) -> Option<&str> {
-        self.account_info
-            .as_ref()
-            .and_then(|info| info.provider.as_deref())
+    pub fn provider(&self) -> Option<String> {
+        self.resolve_account_info().and_then(|info| info.provider)
     }
 
     /// 获取第一个使用量明细
@@ -242,5 +265,58 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_userinfo_from_api() {
+        let json = r#"{
+            "daysUntilReset": 0,
+            "limits": [],
+            "nextDateReset": 1.7775936E9,
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO FREE"
+            },
+            "usageBreakdownList": [],
+            "userInfo": {
+                "email": null,
+                "userId": "d-9067c98495.94a81478-9081-704e-0722-8a7cbcb6b16f"
+            }
+        }"#;
+
+        let result: Result<UsageLimitsResponse, _> = serde_json::from_str(json);
+        println!("Parse result: {:?}", result);
+
+        assert!(result.is_ok(), "JSON 解析应该成功");
+        let response = result.unwrap();
+
+        println!("Extra fields: {:?}", response.extra.keys().collect::<Vec<_>>());
+        println!("account_info: {:?}", response.account_info);
+
+        let resolved = response.resolve_account_info();
+        println!("resolve_account_info(): {:?}", resolved);
+
+        assert!(resolved.is_some(), "应该能从 userInfo 解析出 AccountInfo");
+        let account_info = resolved.unwrap();
+
+        assert_eq!(account_info.email, None, "email 应该是 None");
+        assert_eq!(
+            account_info.user_id,
+            Some("d-9067c98495.94a81478-9081-704e-0722-8a7cbcb6b16f".to_string()),
+            "user_id 应该被正确解析"
+        );
+
+        println!("email(): {:?}", response.email());
+        println!("user_id(): {:?}", response.user_id());
+
+        assert_eq!(response.email(), None);
+        assert_eq!(
+            response.user_id(),
+            Some("d-9067c98495.94a81478-9081-704e-0722-8a7cbcb6b16f".to_string())
+        );
     }
 }

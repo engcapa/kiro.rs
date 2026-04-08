@@ -32,6 +32,7 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+base64 = "0.22"       # Base64 编解码（用于 JWT 解析）
 rusqlite = { version = "0.34", features = ["bundled"], optional = true }
 
 [features]
