@@ -192,9 +192,14 @@ impl AdminService {
             0.0
         };
 
-        // 获取凭据信息以提取 profile_arn 和 regions
+        // 获取凭据信息以提取 profile_arn、regions 和 email（如果 API 没有返回）
         let snapshot = self.token_manager.snapshot();
         let credential = snapshot.entries.iter().find(|e| e.id == id);
+
+        // 优先使用 API 返回的 email，如果没有则使用凭据中保存的 email
+        let email = usage.email()
+            .map(|s| s.to_string())
+            .or_else(|| credential.and_then(|c| c.email.clone()));
 
         Ok(BalanceResponse {
             id,
@@ -204,7 +209,7 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
-            email: usage.email().map(|s| s.to_string()),
+            email,
             user_id: usage.user_id().map(|s| s.to_string()),
             provider: usage.provider().map(|s| s.to_string()),
             profile_arn: if credential.map(|c| c.has_profile_arn).unwrap_or(false) {
