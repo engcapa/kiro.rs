@@ -1,6 +1,5 @@
 //! Kiro API 客户端模块
 
-pub mod jwt_parser;
 pub mod machine_id;
 pub mod model;
 pub mod parser;

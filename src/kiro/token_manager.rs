@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::jwt_parser;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -227,7 +226,7 @@ async fn refresh_social_token(
     let data: RefreshResponse = response.json().await?;
 
     let mut new_credentials = credentials.clone();
-    new_credentials.access_token = Some(data.access_token.clone());
+    new_credentials.access_token = Some(data.access_token);
 
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
@@ -240,20 +239,6 @@ async fn refresh_social_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
-    }
-
-    // 尝试从 access_token 中解析用户信息
-    if let Some(token_user_info) = jwt_parser::parse_token_user_info(&data.access_token) {
-        // 如果 JWT 中有 email，且凭据中没有，则更新
-        if let Some(email) = token_user_info.email {
-            if new_credentials.email.is_none() {
-                tracing::info!("从 JWT token 中提取到 email: {}", email);
-                new_credentials.email = Some(email);
-            }
-        }
-
-        // 可以在这里添加更多字段的提取，比如 provider
-        // 但需要先在 KiroCredentials 中添加 provider 字段
     }
 
     Ok(new_credentials)
@@ -340,17 +325,6 @@ async fn refresh_idc_token(
     // 同步更新 profile_arn（如果 IdC 响应中包含）
     if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
-    }
-
-    // 尝试从 access_token 中解析用户信息
-    if let Some(token_user_info) = jwt_parser::parse_token_user_info(&data.access_token) {
-        // 如果 JWT 中有 email，且凭据中没有，则更新
-        if let Some(email) = token_user_info.email {
-            if new_credentials.email.is_none() {
-                tracing::info!("从 JWT token 中提取到 email: {}", email);
-                new_credentials.email = Some(email);
-            }
-        }
     }
 
     Ok(new_credentials)
@@ -604,18 +578,6 @@ impl MultiTokenManager {
                     {
                         cred.machine_id = Some(machine_id);
                         has_new_machine_ids = true;
-                    }
-                }
-
-                // 如果凭据中没有 email，尝试从 access_token 中解析
-                if cred.email.is_none() {
-                    if let Some(access_token) = &cred.access_token {
-                        if let Some(token_user_info) = jwt_parser::parse_token_user_info(access_token) {
-                            if let Some(email) = token_user_info.email {
-                                tracing::info!("凭据 #{} 从 JWT token 中提取到 email: {}", id, email);
-                                cred.email = Some(email);
-                            }
-                        }
                     }
                 }
 
