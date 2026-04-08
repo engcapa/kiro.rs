@@ -20,6 +20,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    decode_jwt_claims, extract_user_info_from_extra,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -223,10 +224,16 @@ async fn refresh_social_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: RefreshResponse = response.json().await?;
+    let body_text = response.text().await?;
+    tracing::info!(
+        "Social refreshToken response (first 2000 chars): {}",
+        &body_text[..body_text.len().min(2000)]
+    );
+    let data: RefreshResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Social refresh response: {}", e))?;
 
     let mut new_credentials = credentials.clone();
-    new_credentials.access_token = Some(data.access_token);
+    new_credentials.access_token = Some(data.access_token.clone());
 
     if let Some(new_refresh_token) = data.refresh_token {
         new_credentials.refresh_token = Some(new_refresh_token);
@@ -239,6 +246,62 @@ async fn refresh_social_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    // Extract user info from refresh response
+    // Priority: direct fields > id_token JWT > extra fields
+    if let Some(email) = &data.email {
+        tracing::info!("Social refresh: got email from direct field: {}", email);
+        new_credentials.email = Some(email.clone());
+    }
+    if let Some(uid) = &data.user_id {
+        tracing::info!("Social refresh: got user_id from direct field: {}", uid);
+        new_credentials.user_id = Some(uid.clone());
+    }
+
+    if let Some(id_token) = &data.id_token {
+        tracing::info!("Social refresh: id_token present, attempting JWT decode");
+        if let Some(claims) = decode_jwt_claims(id_token) {
+            tracing::info!("Social refresh: JWT claims: {:?}", claims);
+            if new_credentials.email.is_none() {
+                if let Some(email) = claims.email {
+                    tracing::info!("Social refresh: got email from id_token: {}", email);
+                    new_credentials.email = Some(email);
+                }
+            }
+            if new_credentials.user_id.is_none() {
+                if let Some(sub) = claims.sub {
+                    tracing::info!("Social refresh: got user_id from id_token sub: {}", sub);
+                    new_credentials.user_id = Some(sub);
+                }
+            }
+        }
+    }
+
+    if !data.extra.is_empty() {
+        tracing::info!(
+            "Social refresh: extra fields: {:?}",
+            data.extra.keys().collect::<Vec<_>>()
+        );
+        let (ex_email, ex_uid, ex_provider) = extract_user_info_from_extra(&data.extra);
+        if new_credentials.email.is_none() {
+            if let Some(email) = ex_email {
+                tracing::info!("Social refresh: got email from extra fields: {}", email);
+                new_credentials.email = Some(email);
+            }
+        }
+        if new_credentials.user_id.is_none() {
+            if let Some(uid) = ex_uid {
+                tracing::info!("Social refresh: got user_id from extra fields: {}", uid);
+                new_credentials.user_id = Some(uid);
+            }
+        }
+        if new_credentials.provider.is_none() {
+            if let Some(prov) = ex_provider {
+                tracing::info!("Social refresh: got provider from extra fields: {}", prov);
+                new_credentials.provider = Some(prov);
+            }
+        }
     }
 
     Ok(new_credentials)
@@ -308,7 +371,13 @@ async fn refresh_idc_token(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: IdcRefreshResponse = response.json().await?;
+    let body_text = response.text().await?;
+    tracing::info!(
+        "IdC refreshToken response (first 2000 chars): {}",
+        &body_text[..body_text.len().min(2000)]
+    );
+    let data: IdcRefreshResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse IdC refresh response: {}", e))?;
 
     let mut new_credentials = credentials.clone();
     new_credentials.access_token = Some(data.access_token.clone());
@@ -322,9 +391,51 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
-    // 同步更新 profile_arn（如果 IdC 响应中包含）
     if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
+    }
+
+    // Extract user info from id_token (AWS SSO OIDC returns JWT id_token)
+    if let Some(id_token) = &data.id_token {
+        tracing::info!("IdC refresh: id_token present, attempting JWT decode");
+        if let Some(claims) = decode_jwt_claims(id_token) {
+            tracing::info!("IdC refresh: JWT claims: {:?}", claims);
+            if let Some(email) = claims.email {
+                tracing::info!("IdC refresh: got email from id_token: {}", email);
+                new_credentials.email = Some(email);
+            }
+            if let Some(sub) = claims.sub {
+                tracing::info!("IdC refresh: got user_id from id_token sub: {}", sub);
+                new_credentials.user_id = Some(sub);
+            }
+        }
+    }
+
+    // Check extra fields for user info
+    if !data.extra.is_empty() {
+        tracing::info!(
+            "IdC refresh: extra fields: {:?}",
+            data.extra.keys().collect::<Vec<_>>()
+        );
+        let (ex_email, ex_uid, ex_provider) = extract_user_info_from_extra(&data.extra);
+        if new_credentials.email.is_none() {
+            if let Some(email) = ex_email {
+                tracing::info!("IdC refresh: got email from extra fields: {}", email);
+                new_credentials.email = Some(email);
+            }
+        }
+        if new_credentials.user_id.is_none() {
+            if let Some(uid) = ex_uid {
+                tracing::info!("IdC refresh: got user_id from extra fields: {}", uid);
+                new_credentials.user_id = Some(uid);
+            }
+        }
+        if new_credentials.provider.is_none() {
+            if let Some(prov) = ex_provider {
+                tracing::info!("IdC refresh: got provider from extra fields: {}", prov);
+                new_credentials.provider = Some(prov);
+            }
+        }
     }
 
     Ok(new_credentials)
@@ -459,8 +570,14 @@ pub struct CredentialEntrySnapshot {
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
     pub refresh_token_hash: Option<String>,
-    /// 用户邮箱（用于前端显示）
+    /// 用户邮箱
     pub email: Option<String>,
+    /// 用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 认证供应商 (GitHub, Google 等)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1369,6 +1486,8 @@ impl MultiTokenManager {
                     expires_at: e.credentials.expires_at.clone(),
                     refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                     email: e.credentials.email.clone(),
+                    user_id: e.credentials.user_id.clone(),
+                    provider: e.credentials.provider.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1577,20 +1696,33 @@ impl MultiTokenManager {
             }
         }
 
-        // 更新 email 信息（如果 API 返回了）
-        if let Some(email) = usage_limits.email() {
+        // Update account info from API response (email, user_id, provider)
+        {
+            let resolved = usage_limits.resolve_account_info();
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let old_email = entry.credentials.email.clone();
-                if old_email.as_deref() != Some(&email) {
-                    entry.credentials.email = Some(email.clone());
-                    tracing::info!(
-                        "凭据 #{} email 已更新: {:?} -> {}",
-                        id,
-                        old_email,
-                        email
-                    );
-                    changed = true;
+                if let Some(ref info) = resolved {
+                    if let Some(ref email) = info.email {
+                        if entry.credentials.email.as_deref() != Some(email) {
+                            tracing::info!("凭据 #{} email updated: {:?} -> {}", id, entry.credentials.email, email);
+                            entry.credentials.email = Some(email.clone());
+                            changed = true;
+                        }
+                    }
+                    if let Some(ref uid) = info.user_id {
+                        if entry.credentials.user_id.as_deref() != Some(uid) {
+                            tracing::info!("凭据 #{} user_id updated: {:?} -> {}", id, entry.credentials.user_id, uid);
+                            entry.credentials.user_id = Some(uid.clone());
+                            changed = true;
+                        }
+                    }
+                    if let Some(ref prov) = info.provider {
+                        if entry.credentials.provider.as_deref() != Some(prov) {
+                            tracing::info!("凭据 #{} provider updated: {:?} -> {}", id, entry.credentials.provider, prov);
+                            entry.credentials.provider = Some(prov.clone());
+                            changed = true;
+                        }
+                    }
                 }
             }
         }

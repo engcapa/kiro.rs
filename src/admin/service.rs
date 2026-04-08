@@ -196,9 +196,13 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let credential = snapshot.entries.iter().find(|e| e.id == id);
 
-        // 优先使用 API 返回的 email，如果没有则使用凭据中保存的 email
+        // Prefer API response, fall back to persisted credential data
         let email = usage.email()
             .or_else(|| credential.and_then(|c| c.email.clone()));
+        let user_id = usage.user_id()
+            .or_else(|| credential.and_then(|c| c.user_id.clone()));
+        let provider = usage.provider()
+            .or_else(|| credential.and_then(|c| c.provider.clone()));
 
         Ok(BalanceResponse {
             id,
@@ -209,8 +213,8 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
             email,
-            user_id: usage.user_id(),
-            provider: usage.provider(),
+            user_id,
+            provider,
             profile_arn: if credential.map(|c| c.has_profile_arn).unwrap_or(false) {
                 self.token_manager.get_credential_profile_arn(id)
             } else {
@@ -237,11 +241,7 @@ impl AdminService {
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
-            id: None,
-            access_token: None,
             refresh_token: Some(req.refresh_token),
-            profile_arn: None,
-            expires_at: None,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
@@ -252,12 +252,11 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             name: req.name,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             client_mode: req.client_mode,
-            disabled: false, // 新添加的凭据默认启用
+            ..Default::default()
         };
 
         // 调用 token_manager 添加凭据
