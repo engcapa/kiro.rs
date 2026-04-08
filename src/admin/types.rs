@@ -180,6 +180,24 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 用户邮箱
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// 用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 认证供应商 (GitHub, Google 等)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Profile ARN
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    /// Auth Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// API Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
 }
 
 // ============ 负载均衡配置 ============

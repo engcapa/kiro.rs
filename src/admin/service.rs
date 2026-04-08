@@ -192,6 +192,10 @@ impl AdminService {
             0.0
         };
 
+        // 获取凭据信息以提取 profile_arn 和 regions
+        let snapshot = self.token_manager.snapshot();
+        let credential = snapshot.entries.iter().find(|e| e.id == id);
+
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
@@ -200,6 +204,24 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            email: usage.email().map(|s| s.to_string()),
+            user_id: usage.user_id().map(|s| s.to_string()),
+            provider: usage.provider().map(|s| s.to_string()),
+            profile_arn: if credential.map(|c| c.has_profile_arn).unwrap_or(false) {
+                self.token_manager.get_credential_profile_arn(id)
+            } else {
+                None
+            },
+            auth_region: if credential.is_some() {
+                self.token_manager.get_credential_auth_region(id)
+            } else {
+                None
+            },
+            api_region: if credential.is_some() {
+                self.token_manager.get_credential_api_region(id)
+            } else {
+                None
+            },
         })
     }
 

@@ -36,6 +36,12 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  email?: string
+  userId?: string
+  provider?: string
+  profileArn?: string
+  authRegion?: string
+  apiRegion?: string
 }
 
 // 成功响应

@@ -19,6 +19,10 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 账户信息（包含 email、userId、provider 等）
+    #[serde(default)]
+    pub account_info: Option<AccountInfo>,
 }
 
 /// 订阅信息
@@ -28,6 +32,27 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+}
+
+/// 账户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfo {
+    /// 用户邮箱
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
+
+    /// 认证供应商 (GitHub, Google 等)
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// 供应商用户 ID
+    #[serde(default)]
+    pub provider_user_id: Option<String>,
 }
 
 /// 使用量明细
@@ -137,6 +162,27 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取用户邮箱
+    pub fn email(&self) -> Option<&str> {
+        self.account_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+    }
+
+    /// 获取用户 ID
+    pub fn user_id(&self) -> Option<&str> {
+        self.account_info
+            .as_ref()
+            .and_then(|info| info.user_id.as_deref())
+    }
+
+    /// 获取认证供应商
+    pub fn provider(&self) -> Option<&str> {
+        self.account_info
+            .as_ref()
+            .and_then(|info| info.provider.as_deref())
     }
 
     /// 获取第一个使用量明细

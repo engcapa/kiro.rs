@@ -1530,34 +1530,48 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
+        // 更新订阅等级和账户信息到凭据（仅在发生变化时持久化）
+        let mut changed = false;
+        
         if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
-                        tracing::info!(
-                            "凭据 #{} 订阅等级已更新: {:?} -> {}",
-                            id,
-                            old_title,
-                            subscription_title
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let old_title = entry.credentials.subscription_title.clone();
+                if old_title.as_deref() != Some(subscription_title) {
+                    entry.credentials.subscription_title =
+                        Some(subscription_title.to_string());
+                    tracing::info!(
+                        "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                        id,
+                        old_title,
+                        subscription_title
+                    );
+                    changed = true;
                 }
-            };
+            }
+        }
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+        // 更新 email 信息（如果 API 返回了）
+        if let Some(email) = usage_limits.email() {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let old_email = entry.credentials.email.clone();
+                if old_email.as_deref() != Some(email) {
+                    entry.credentials.email = Some(email.to_string());
+                    tracing::info!(
+                        "凭据 #{} email 已更新: {:?} -> {}",
+                        id,
+                        old_email,
+                        email
+                    );
+                    changed = true;
                 }
+            }
+        }
+
+        if changed {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("凭据信息更新后持久化失败（不影响本次请求）: {}", e);
             }
         }
 
@@ -1766,6 +1780,33 @@ impl MultiTokenManager {
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
         self.load_balancing_mode.lock().clone()
+    }
+
+    /// 获取凭据的 Profile ARN（Admin API）
+    pub fn get_credential_profile_arn(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.credentials.profile_arn.clone())
+    }
+
+    /// 获取凭据的 Auth Region（Admin API）
+    pub fn get_credential_auth_region(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.effective_auth_region(&self.config).to_string())
+    }
+
+    /// 获取凭据的 API Region（Admin API）
+    pub fn get_credential_api_region(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.effective_api_region(&self.config).to_string())
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {

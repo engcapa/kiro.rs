@@ -317,6 +317,42 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {balance?.email && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">邮箱：</span>
+                <span className="font-medium">{balance.email}</span>
+              </div>
+            )}
+            {balance?.userId && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">User ID：</span>
+                <span className="font-medium text-xs">{balance.userId}</span>
+              </div>
+            )}
+            {balance?.provider && (
+              <div>
+                <span className="text-muted-foreground">供应商：</span>
+                <span className="font-medium">{balance.provider}</span>
+              </div>
+            )}
+            {balance?.authRegion && (
+              <div>
+                <span className="text-muted-foreground">Auth Region：</span>
+                <span className="font-medium">{balance.authRegion}</span>
+              </div>
+            )}
+            {balance?.apiRegion && (
+              <div>
+                <span className="text-muted-foreground">API Region：</span>
+                <span className="font-medium">{balance.apiRegion}</span>
+              </div>
+            )}
+            {balance?.profileArn && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">Profile ARN：</span>
+                <span className="font-medium text-xs break-all">{balance.profileArn}</span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
@@ -338,11 +374,6 @@ export function CredentialCard({
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}
           </div>
