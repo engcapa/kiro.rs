@@ -69,14 +69,20 @@ impl AdminService {
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
+                profile_arn: entry.profile_arn,
                 refresh_token_hash: entry.refresh_token_hash,
+                name: entry.name,
+                provider: entry.provider,
                 email: entry.email,
+                user_id: entry.user_id,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
+                auth_region: entry.auth_region,
+                api_region: entry.api_region,
             })
             .collect();
 
@@ -172,6 +178,19 @@ impl AdminService {
             0.0
         };
 
+        let (email, user_id) = match &usage.user_info {
+            Some(info) => (info.email.clone(), info.user_id.clone()),
+            None => (None, None),
+        };
+
+        let provider = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.provider.clone());
+
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
@@ -180,6 +199,9 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            email,
+            user_id,
+            provider,
         })
     }
 
@@ -204,7 +226,10 @@ impl AdminService {
             auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
+            name: req.name,
+            provider: req.provider,
             email: req.email,
+            user_id: None,
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,

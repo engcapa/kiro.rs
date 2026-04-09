@@ -20,8 +20,10 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const [credentialName, setCredentialName] = useState('')
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [provider, setProvider] = useState('')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
@@ -35,8 +37,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const { mutate, isPending } = useAddCredential()
 
   const resetForm = () => {
+    setCredentialName('')
     setRefreshToken('')
     setAuthMethod('social')
+    setProvider('')
     setAuthRegion('')
     setApiRegion('')
     setClientId('')
@@ -66,6 +70,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     mutate(
       {
         refreshToken: refreshToken.trim(),
+        name: credentialName.trim() || undefined,
+        provider: provider.trim() || undefined,
         authMethod,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
@@ -99,6 +105,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            {/* 凭据名称 */}
+            <div className="space-y-2">
+              <label htmlFor="credentialName" className="text-sm font-medium">
+                凭据名称
+              </label>
+              <Input
+                id="credentialName"
+                placeholder="可选，用于标识凭据（如 test-account-1）"
+                value={credentialName}
+                onChange={(e) => setCredentialName(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，留空时卡片标题显示邮箱或凭据 ID
+              </p>
+            </div>
+
             {/* Refresh Token */}
             <div className="space-y-2">
               <label htmlFor="refreshToken" className="text-sm font-medium">
@@ -130,6 +153,29 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <option value="idc">IdC/Builder-ID/IAM</option>
               </select>
             </div>
+
+            {/* 认证供应商 */}
+            {authMethod === 'social' && (
+              <div className="space-y-2">
+                <label htmlFor="provider" className="text-sm font-medium">
+                  认证供应商
+                </label>
+                <select
+                  id="provider"
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value)}
+                  disabled={isPending}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">未指定</option>
+                  <option value="github">GitHub</option>
+                  <option value="google">Google</option>
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  可选，选择账号的 OAuth 供应商（刷新 Token 时可能自动获取）
+                </p>
+              </div>
+            )}
 
             {/* Region 配置 */}
             <div className="space-y-2">

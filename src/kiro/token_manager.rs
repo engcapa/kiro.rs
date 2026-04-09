@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::auth_provider;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -241,6 +242,17 @@ async fn refresh_social_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
+    if let Some(provider) = data.provider {
+        new_credentials.provider = auth_provider::normalize_provider_slug(&provider)
+            .or_else(|| Some(provider.trim().to_lowercase()));
+    }
+
+    if new_credentials.provider.is_none() {
+        if let Some(at) = new_credentials.access_token.as_deref() {
+            new_credentials.provider = auth_provider::infer_from_access_token(at);
+        }
+    }
+
     Ok(new_credentials)
 }
 
@@ -392,6 +404,106 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// Fetch usage limits with isEmailRequired=true to obtain userInfo (email + userId).
+///
+/// Uses the same q.{region} host as get_usage_limits, but appends &isEmailRequired=true.
+/// If the q.{region} host does not return userInfo, falls back to the
+/// codewhisperer.{region} host which is known to support this parameter.
+pub(crate) async fn get_usage_limits_with_email(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<UsageLimitsResponse> {
+    tracing::debug!("Fetching usage limits with isEmailRequired=true...");
+
+    let region = credentials.effective_api_region(config);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
+    let user_agent = config.runtime_user_agent(&machine_id, mode);
+    let amz_user_agent = config.runtime_x_amz_user_agent(&machine_id, mode);
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    // Try codewhisperer.{region} host first (known to support isEmailRequired)
+    let cw_host = format!("codewhisperer.{}.amazonaws.com", region);
+    let mut cw_url = format!(
+        "https://{}/getUsageLimits?isEmailRequired=true",
+        cw_host,
+    );
+    if let Some(profile_arn) = &credentials.profile_arn {
+        cw_url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    let cw_response = client
+        .get(&cw_url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &cw_host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .send()
+        .await;
+
+    if let Ok(resp) = cw_response {
+        if resp.status().is_success() {
+            let data: UsageLimitsResponse = resp.json().await?;
+            if data.user_info.is_some() {
+                return Ok(data);
+            }
+            tracing::debug!("codewhisperer host returned success but no userInfo, falling back to q host");
+        } else {
+            tracing::debug!(
+                "codewhisperer host returned {}, falling back to q host",
+                resp.status()
+            );
+        }
+    } else {
+        tracing::debug!("codewhisperer host request failed, falling back to q host");
+    }
+
+    // Fallback: q.{region} host with isEmailRequired=true appended
+    let q_host = format!("q.{}.amazonaws.com", region);
+    let mut q_url = format!(
+        "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        q_host,
+        mode.origin()
+    );
+    if let Some(profile_arn) = &credentials.profile_arn {
+        q_url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    let response = client
+        .get(&q_url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &q_host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取使用额度",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取使用额度（含 email）失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: UsageLimitsResponse = response.json().await?;
+    Ok(data)
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -456,12 +568,24 @@ pub struct CredentialEntrySnapshot {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Profile ARN 实际值
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
     pub refresh_token_hash: Option<String>,
+    /// 凭据自定义名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 认证供应商 (github / google 等)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -476,6 +600,12 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// Auth Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// API Region
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1363,9 +1493,13 @@ impl MultiTokenManager {
                         }
                     }),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
+                    profile_arn: e.credentials.profile_arn.clone(),
                     expires_at: e.credentials.expires_at.clone(),
                     refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                    name: e.credentials.name.clone(),
+                    provider: e.credentials.provider.clone(),
                     email: e.credentials.email.clone(),
+                    user_id: e.credentials.user_id.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1377,6 +1511,8 @@ impl MultiTokenManager {
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                     }.to_string()),
+                    auth_region: Some(e.credentials.effective_auth_region(&self.config).to_string()),
+                    api_region: Some(e.credentials.effective_api_region(&self.config).to_string()),
                 })
                 .collect(),
             current_id,
@@ -1509,13 +1645,14 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits = get_usage_limits_with_email(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+        // Update subscription title, email, and userId from the response
+        {
+            let mut changed = false;
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if let Some(subscription_title) = usage_limits.subscription_title() {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
                         entry.credentials.subscription_title =
@@ -1526,18 +1663,69 @@ impl MultiTokenManager {
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
-                } else {
-                    false
                 }
-            };
+
+                if let Some(user_info) = &usage_limits.user_info {
+                    if let Some(email) = &user_info.email {
+                        if entry.credentials.email.as_deref() != Some(email) {
+                            tracing::info!("Credential #{} email updated: {:?} -> {}", id, entry.credentials.email, email);
+                            entry.credentials.email = Some(email.clone());
+                            changed = true;
+                        }
+                    }
+                    if let Some(user_id) = &user_info.user_id {
+                        if entry.credentials.user_id.as_deref() != Some(user_id) {
+                            tracing::info!("Credential #{} userId updated: {:?} -> {}", id, entry.credentials.user_id, user_id);
+                            entry.credentials.user_id = Some(user_id.clone());
+                            changed = true;
+                        }
+                    }
+                    if let Some(hint) = user_info.provider_hint() {
+                        if entry.credentials.provider.as_deref() != Some(hint.as_str()) {
+                            tracing::info!(
+                                "Credential #{} provider updated from userInfo: {:?} -> {}",
+                                id,
+                                entry.credentials.provider,
+                                hint
+                            );
+                            entry.credentials.provider = Some(hint);
+                            changed = true;
+                        }
+                    }
+                }
+
+                let is_idc = entry
+                    .credentials
+                    .auth_method
+                    .as_deref()
+                    .map(|m| {
+                        matches!(
+                            m.to_lowercase().as_str(),
+                            "idc" | "builder-id" | "iam"
+                        )
+                    })
+                    .unwrap_or(false);
+
+                if !is_idc && entry.credentials.provider.is_none() {
+                    if let Some(p) = auth_provider::infer_from_access_token(&token) {
+                        tracing::info!(
+                            "Credential #{} provider inferred from access_token JWT",
+                            id
+                        );
+                        entry.credentials.provider = Some(p);
+                        changed = true;
+                    }
+                }
+            }
+
+            // Must drop entries lock before calling persist_credentials
+            drop(entries);
 
             if changed {
                 if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                    tracing::warn!("订阅/用户信息更新后持久化失败（不影响本次请求）: {}", e);
                 }
             }
         }
@@ -1611,7 +1799,10 @@ impl MultiTokenManager {
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
+        validated_cred.name = new_cred.name;
+        validated_cred.provider = new_cred.provider;
         validated_cred.email = new_cred.email;
+        validated_cred.user_id = new_cred.user_id;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;

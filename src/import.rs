@@ -40,6 +40,7 @@ pub fn import_credentials(db_path: &Path) -> anyhow::Result<KiroCredentials> {
         profile_arn: token.get("profile_arn").and_then(|v| v.as_str()).map(String::from),
         expires_at: token.get("expires_at").and_then(|v| v.as_str()).map(String::from),
         auth_method: Some("social".to_string()),
+        provider: token.get("provider").and_then(|v| v.as_str()).map(String::from),
         client_mode: Some(ClientMode::KiroCli),
         ..Default::default()
     };

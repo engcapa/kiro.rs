@@ -19,6 +19,64 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 用户信息（仅在请求中包含 isEmailRequired=true 时返回）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 用户信息（来自 getUsageLimits 响应的 userInfo 字段）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 用户邮箱
+    #[serde(default)]
+    pub email: Option<String>,
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 身份供应商（若上游返回）
+    #[serde(default)]
+    pub identity_provider: Option<String>,
+    #[serde(default)]
+    pub federation_provider: Option<String>,
+    #[serde(default)]
+    pub login_provider: Option<String>,
+    #[serde(default)]
+    pub auth_provider: Option<String>,
+    /// 部分响应在 userInfo 中带 `provider`
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+impl UserInfo {
+    /// Social / IdP hint for UI (slug: github, google, idc).
+    pub fn provider_hint(&self) -> Option<String> {
+        use crate::kiro::auth_provider::{normalize_provider_slug, provider_from_username};
+
+        for raw in [
+            self.identity_provider.as_deref(),
+            self.provider.as_deref(),
+            self.auth_provider.as_deref(),
+            self.login_provider.as_deref(),
+            self.federation_provider.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(s) = normalize_provider_slug(raw) {
+                return Some(s);
+            }
+        }
+        if let Some(u) = self.username.as_deref() {
+            if let Some(s) = provider_from_username(u) {
+                return Some(s);
+            }
+        }
+        None
+    }
 }
 
 /// 订阅信息

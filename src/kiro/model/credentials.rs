@@ -69,9 +69,21 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
+    /// 凭据自定义名称（可选，用于前端显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// 认证供应商 (github / google 等，由刷新响应或手动设置)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+
+    /// 用户 ID（从 getUsageLimits API 的 userInfo 获取）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,7 +356,10 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            name: None,
+            provider: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -463,7 +478,10 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            name: None,
+            provider: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -494,7 +512,10 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: None,
+            name: None,
+            provider: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -607,7 +628,10 @@ mod tests {
             auth_region: None,
             api_region: None,
             machine_id: Some("c".repeat(64)),
+            name: None,
+            provider: None,
             email: None,
+            user_id: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,

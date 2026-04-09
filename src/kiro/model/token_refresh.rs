@@ -18,6 +18,9 @@ pub struct RefreshResponse {
     pub profile_arn: Option<String>,
     #[serde(default)]
     pub expires_in: Option<i64>,
+    /// Auth provider (e.g. "github", "google") - may be returned by the auth server
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// IdC Token 刷新请求体 (AWS SSO OIDC)

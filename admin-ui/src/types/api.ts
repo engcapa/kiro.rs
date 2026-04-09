@@ -16,7 +16,11 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
+  profileArn?: string
   email?: string
+  userId?: string
+  name?: string
+  provider?: string
   refreshTokenHash?: string
   successCount: number
   lastUsedAt: string | null
@@ -24,6 +28,8 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  authRegion?: string
+  apiRegion?: string
 }
 
 // 余额响应
@@ -35,6 +41,9 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  email?: string
+  userId?: string
+  provider?: string
 }
 
 // 成功响应
@@ -63,6 +72,8 @@ export interface SetPriorityRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
+  name?: string
+  provider?: string
   authMethod?: 'social' | 'idc'
   clientId?: string
   clientSecret?: string

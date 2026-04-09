@@ -914,6 +914,7 @@ version = "2026.3.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "clap",

@@ -11,3 +11,6 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/.kiro
+/.claude
+/.vscode

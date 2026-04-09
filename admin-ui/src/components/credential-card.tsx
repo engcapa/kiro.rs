@@ -49,6 +49,24 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatProvider(authMethod: string | null, provider?: string): string {
+  if (provider) {
+    const p = provider.toLowerCase()
+    switch (p) {
+      case 'github': return 'GitHub'
+      case 'google': return 'Google'
+      case 'idc': return 'IdC / Builder ID'
+      default: return provider
+    }
+  }
+  if (!authMethod) return '未知'
+  switch (authMethod.toLowerCase()) {
+    case 'social': return 'Social Login'
+    case 'idc': return 'IdC / Builder ID'
+    default: return authMethod
+  }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -152,7 +170,7 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
               <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+                {credential.name || credential.email || `凭据 #${credential.id}`}
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -243,6 +261,43 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
+            <div>
+              <span className="text-muted-foreground">供应商：</span>
+              <span className="font-medium">
+                {loadingBalance ? (
+                  <Loader2 className="inline w-3 h-3 animate-spin" />
+                ) : (
+                  formatProvider(
+                    credential.authMethod,
+                    balance?.provider ?? credential.provider
+                  )
+                )}
+              </span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">邮箱：</span>
+              <span className="font-medium">
+                {loadingBalance ? (
+                  <Loader2 className="inline w-3 h-3 animate-spin" />
+                ) : balance?.email || credential.email || '未知'}
+              </span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">User ID：</span>
+              <span className="font-medium text-xs break-all">
+                {loadingBalance ? (
+                  <Loader2 className="inline w-3 h-3 animate-spin" />
+                ) : balance?.userId || credential.userId || '未知'}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Auth Region：</span>
+              <span className="font-medium">{credential.authRegion || '未知'}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">API Region：</span>
+              <span className="font-medium">{credential.apiRegion || '未知'}</span>
+            </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
@@ -270,9 +325,10 @@ export function CredentialCard({
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
-            {credential.hasProfileArn && (
+            {credential.profileArn && (
               <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
+                <span className="text-muted-foreground">Profile ARN：</span>
+                <span className="font-medium text-xs break-all">{credential.profileArn}</span>
               </div>
             )}
           </div>
