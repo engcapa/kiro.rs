@@ -100,6 +100,11 @@ pub(crate) async fn refresh_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
+    // API Key 凭据不需要刷新，直接返回
+    if credentials.is_api_key_credential() {
+        return Ok(credentials.clone());
+    }
+
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
@@ -411,6 +416,8 @@ enum DisabledReason {
     QuotaExceeded,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
+    /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
+    InvalidConfig,
 }
 
 /// 统计数据持久化条目
@@ -579,6 +586,26 @@ impl MultiTokenManager {
             })
             .collect();
 
+        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        let mut entries = entries;
+        for entry in &mut entries {
+            if entry.credentials.kiro_api_key.is_none()
+                && entry
+                    .credentials
+                    .auth_method
+                    .as_deref()
+                    .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
+                    .unwrap_or(false)
+            {
+                tracing::warn!(
+                    "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
+                    entry.id
+                );
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+            }
+        }
+
         // 检测重复 ID
         let mut seen_ids = std::collections::HashSet::new();
         let mut duplicate_ids = Vec::new();
@@ -591,9 +618,10 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        // 选择初始凭据：优先级最高（priority 最小）的凭据，无凭据时为 0
+        // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
         let initial_id = entries
             .iter()
+            .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
             .map(|e| e.id)
             .unwrap_or(0);
@@ -841,6 +869,19 @@ impl MultiTokenManager {
         id: u64,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
+        if credentials.is_api_key_credential() {
+            let token = credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            return Ok(CallContext {
+                id,
+                credentials: credentials.clone(),
+                token,
+            });
+        }
+
         // 第一次检查（无锁）：快速判断是否需要刷新
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
@@ -1349,16 +1390,35 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
-                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                            "idc".to_string()
-                        } else {
-                            m.to_string()
-                        }
-                    }),
+                    auth_method: if e.credentials.is_api_key_credential() {
+                        Some("api_key".to_string())
+                    } else {
+                        e.credentials.auth_method.as_deref().map(|m| {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                                "idc".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        })
+                    },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: e.credentials.expires_at.clone(),
-                    refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
+                    expires_at: if e.credentials.is_api_key_credential() {
+                        None // API Key 不过期
+                    } else {
+                        e.credentials.expires_at.clone()
+                    },
+                    refresh_token_hash: if e.credentials.is_api_key_credential() {
+                        // API Key 凭据显示脱敏的 key
+                        e.credentials.kiro_api_key.as_deref().map(|k| {
+                            if k.len() > 8 {
+                                format!("{}...{}", &k[..8], &k[k.len()-4..])
+                            } else {
+                                "***".to_string()
+                            }
+                        })
+                    } else {
+                        e.credentials.refresh_token.as_deref().map(sha256_hex)
+                    },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
@@ -1371,6 +1431,7 @@ impl MultiTokenManager {
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                        DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                 })
                 .collect(),
@@ -1431,6 +1492,12 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
+                anyhow::bail!(
+                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
+                    id
+                );
+            }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
             entry.disabled = false;
@@ -1929,6 +1996,38 @@ mod tests {
             "错误消息应包含 '重复的凭据 ID'，实际: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
+        let config = Config::default();
+
+        // auth_method=api_key 但缺少 kiro_api_key → 应被自动禁用
+        let mut bad_cred = KiroCredentials::default();
+        bad_cred.auth_method = Some("api_key".to_string());
+        // kiro_api_key 保持 None
+
+        let mut good_cred = KiroCredentials::default();
+        good_cred.refresh_token = Some("valid_token".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
+        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
+    }
+
+    #[test]
+    fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
+        let config = Config::default();
+
+        // auth_method=api_key 且有 kiro_api_key → 不应被禁用
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("api_key".to_string());
+        cred.kiro_api_key = Some("ksk_test123".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.available_count(), 1);
     }
 
     #[test]
