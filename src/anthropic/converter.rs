@@ -13,7 +13,6 @@ use crate::kiro::model::requests::conversation::{
     ReasoningContent, ReasoningText,
 };
 
-use super::signature_cache::SignatureCacheManager;
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -697,7 +696,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, conversation_id)?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -716,7 +715,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, conversation_id)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -774,9 +773,9 @@ fn merge_user_messages(
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
-    conversation_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
+    let mut signature = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -791,6 +790,9 @@ fn convert_assistant_message(
                         "thinking" => {
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                            }
+                            if let Some(sig) = block.signature {
+                                signature = Some(sig);
                             }
                         }
                         "text" => {
@@ -827,50 +829,46 @@ fn convert_assistant_message(
 
     // 填充推理历史 (reasoning_content)
     if !thinking_content.is_empty() {
-        let sig = SignatureCacheManager::get(conversation_id, &thinking_content)
-            .unwrap_or_else(|| {
-                // 用户抓取包中提供的最新真实签名，作为安全的 fallback
-                "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
-            });
-
-        let reasoning_content = ReasoningContent {
-            reasoning_text: ReasoningText {
-                text: thinking_content,
-                signature: sig,
-            },
-        };
-        assistant = assistant.with_reasoning_content(reasoning_content);
+        if let Some(sig) = signature {
+            let reasoning_content = ReasoningContent {
+                reasoning_text: ReasoningText {
+                    text: thinking_content,
+                    signature: sig,
+                },
+            };
+            assistant = assistant.with_reasoning_content(reasoning_content);
+        }
     }
 
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
 }
-
 /// 合并多个连续的 assistant 消息为一条
 /// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
-    conversation_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map, conversation_id);
+        return convert_assistant_message(messages[0], tool_name_map);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
     let mut accumulated_thinking = String::new();
+    let mut accumulated_signature = None;
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, conversation_id)?;
+        let converted = convert_assistant_message(msg, tool_name_map)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
         }
         if let Some(rc) = am.reasoning_content {
             accumulated_thinking.push_str(&rc.reasoning_text.text);
+            accumulated_signature = Some(rc.reasoning_text.signature.clone());
         }
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
@@ -889,18 +887,15 @@ fn merge_assistant_messages(
     }
 
     if !accumulated_thinking.is_empty() {
-        let sig = SignatureCacheManager::get(conversation_id, &accumulated_thinking)
-            .unwrap_or_else(|| {
-                "EtwCCmUIDhABGAIqQDfx/kjoqI7rNQFnaobcJgdBgQTd2Fn59Lxqmoqtkyak44/G4Q7Zm0snfHOBQty2QGe5fnLPjiU2JDTfD2PVwwIyD2NsYXVkZS1vcHVzLTQtNzgAQgh0aGlua2luZxIMF8kq9u+GWAmAv3EfGgz6fyvtULcFIDRfiSUiMJortDwfl79BXbVdDfhW1QIGFksD3uEc7//g+DvW87GWXhCmxawP9t5YJzFAB6zHYSqkARqgotZo2+H2+dU8X2I3ZvfXfwkqwgc11ag8nj4o2prBHDo8HxSv1uINRrQfiMEgUERdv0+2qPM/go9uPPYOcd9Gm++mRiTOl23iqrJqxJPT5NR+vKqRHR43ijsOmREri3qPepVjc9Rshe626mFkc5PblojzcPjbrshb+S2rboiGKE4FUv3b0vfFJkcjfsxSgqJXKF0sDbS6zigjGuSZsrq0ehrXGAE=".to_string()
+        if let Some(sig) = accumulated_signature {
+            assistant = assistant.with_reasoning_content(ReasoningContent {
+                reasoning_text: ReasoningText {
+                    text: accumulated_thinking.clone(),
+                    signature: sig,
+                },
             });
-        assistant = assistant.with_reasoning_content(ReasoningContent {
-            reasoning_text: ReasoningText {
-                text: accumulated_thinking,
-                signature: sig,
-            },
-        });
+        }
     }
-
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -1569,7 +1564,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), "test-session").expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -1604,7 +1599,7 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), "test-session").expect("应该成功转换");
+        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -1702,7 +1697,7 @@ mod tests {
         let msg1 = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
-                {"type": "thinking", "thinking": "Let me think about this..."},
+                {"type": "thinking", "thinking": "Let me think about this...", "signature": "sig1"},
                 {"type": "text", "text": " "}
             ]),
         };
@@ -1710,14 +1705,14 @@ mod tests {
         let msg2 = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
-                {"type": "thinking", "thinking": "I should read the file."},
+                {"type": "thinking", "thinking": "I should read the file.", "signature": "sig2"},
                 {"type": "text", "text": "Let me read that file."},
                 {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "/test.txt"}}
             ]),
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new(), "test-session").expect("合并应成功");
+        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(result.assistant_response_message.reasoning_content.is_some(), "应包含 reasoning_content");
@@ -1746,14 +1741,14 @@ mod tests {
                 AnthropicMessage {
                     role: "assistant".to_string(),
                     content: serde_json::json!([
-                        {"type": "thinking", "thinking": "I need to read the file..."},
+                        {"type": "thinking", "thinking": "I need to read the file...", "signature": "sig3"},
                         {"type": "text", "text": " "}
                     ]),
                 },
                 AnthropicMessage {
                     role: "assistant".to_string(),
                     content: serde_json::json!([
-                        {"type": "thinking", "thinking": "Let me read the config."},
+                        {"type": "thinking", "thinking": "Let me read the config.", "signature": "sig4"},
                         {"type": "text", "text": "I'll read the config file for you."},
                         {"type": "tool_use", "id": "toolu_01XYZ", "name": "read_file", "input": {"path": "/config.json"}}
                     ]),

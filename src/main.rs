@@ -150,22 +150,7 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-    // 初始化签名缓存配置
-    anthropic::signature_cache::init(
-        config.signature_cache_max_entries,
-        config.signature_cache_ttl_hours,
-    );
 
-    // 启动签名缓存定期清理任务
-    tokio::spawn(async {
-        let interval = std::time::Duration::from_secs(
-            anthropic::signature_cache::CLEANUP_INTERVAL_SECS,
-        );
-        loop {
-            tokio::time::sleep(interval).await;
-            anthropic::signature_cache::SignatureCacheManager::cleanup_expired();
-        }
-    });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(

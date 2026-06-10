@@ -322,10 +322,6 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
-    /// 会话 ID，用于签名缓存
-    pub conversation_id: String,
-    /// 累积的 thinking 内容
-    pub accumulated_thinking: String,
     /// 捕获到的推理签名
     pub signature: Option<String>,
 }
@@ -337,7 +333,6 @@ impl StreamContext {
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
-        conversation_id: String,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -353,8 +348,6 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
-            conversation_id,
-            accumulated_thinking: String::new(),
             signature: None,
         }
     }
@@ -425,7 +418,6 @@ impl StreamContext {
                 if let Some(ref sig) = resp.signature {
                     self.signature = Some(sig.clone());
                 }
-                self.accumulated_thinking.push_str(&resp.text);
                 self.process_reasoning_content(&resp.text)
             }
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
@@ -525,18 +517,7 @@ impl StreamContext {
         let mut events = Vec::new();
 
         // If we are still in thinking block, close it first
-        if self.in_thinking_block {
-            self.in_thinking_block = false;
-            self.thinking_extracted = true;
-
-            if let Some(thinking_index) = self.thinking_block_index {
-                // Send empty thinking_delta and stop the block
-                events.push(self.create_thinking_delta_event(thinking_index, ""));
-                if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
-                    events.push(stop_event);
-                }
-            }
-        }
+        events.extend(self.close_thinking_block());
 
         // Emit text_delta events
         events.extend(self.create_text_delta_events(content));
@@ -617,6 +598,43 @@ impl StreamContext {
                 }
             }),
         )
+    }
+
+    /// 创建 signature_delta 事件
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
+    /// 关闭当前 thinking 块并生成相应的事件（包括 signature_delta 和 thinking_delta 的收尾）
+    fn close_thinking_block(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.in_thinking_block {
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
+
+            if let Some(thinking_index) = self.thinking_block_index {
+                // 如果存在加密签名，先发送 signature_delta 事件
+                if let Some(ref sig) = self.signature {
+                    events.push(self.create_signature_delta_event(thinking_index, sig));
+                }
+                // 发送空的 thinking_delta 并停止该块
+                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+                    events.push(stop_event);
+                }
+            }
+        }
+        events
     }
 
     /// Process tool use event
@@ -710,29 +728,7 @@ impl StreamContext {
         let mut events = Vec::new();
 
         // If we are still in thinking block, close it first
-        if self.in_thinking_block {
-            self.in_thinking_block = false;
-            self.thinking_extracted = true;
-
-            if let Some(thinking_index) = self.thinking_block_index {
-                // Send empty thinking_delta and stop the block
-                events.push(self.create_thinking_delta_event(thinking_index, ""));
-                if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
-                    events.push(stop_event);
-                }
-            }
-        }
-
-        // 保存签名到全局缓存
-        if let (Some(sig), false) = (&self.signature, self.conversation_id.is_empty()) {
-            if !self.accumulated_thinking.is_empty() {
-                super::signature_cache::SignatureCacheManager::insert(
-                    self.conversation_id.clone(),
-                    self.accumulated_thinking.clone(),
-                    sig.clone(),
-                );
-            }
-        }
+        events.extend(self.close_thinking_block());
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
@@ -785,10 +781,9 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
-        conversation_id: String,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map, conversation_id);
+            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -928,7 +923,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -952,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1021,7 +1016,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::AssistantResponseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let initial_events = ctx.generate_initial_events();
         assert_eq!(initial_events.len(), 1);
         assert_eq!(initial_events[0].event, "message_start");
@@ -1071,7 +1066,7 @@ mod tests {
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));
@@ -1112,7 +1107,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::AssistantResponseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));
@@ -1139,7 +1134,7 @@ mod tests {
         use crate::kiro::model::events::ReasoningContentEvent;
         use crate::kiro::model::events::ToolUseEvent;
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), "test-session".to_string());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _ = ctx.generate_initial_events();
 
         let event1 = Event::ReasoningContent(ReasoningContentEvent::new("Thinking process..."));

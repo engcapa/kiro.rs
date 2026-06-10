@@ -309,9 +309,6 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
-
-    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     if payload.stream {
         // 流式响应
@@ -322,7 +319,6 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
-            conversation_id,
         )
         .await
     } else {
@@ -339,7 +335,6 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -347,10 +342,8 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
-
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, conversation_id);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -479,20 +472,11 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    let conversation_id = serde_json::from_str::<serde_json::Value>(request_body)
-        .ok()
-        .and_then(|v| v.get("conversationState").cloned())
-        .and_then(|v| v.get("conversationId").cloned())
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
-
-    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -631,10 +615,14 @@ async fn handle_non_stream_request(
 
     if thinking_enabled {
         if !thinking_content.is_empty() {
-            content.push(json!({
+            let mut block = json!({
                 "type": "thinking",
                 "thinking": thinking_content
-            }));
+            });
+            if let Some(ref sig) = signature {
+                block["signature"] = json!(sig);
+            }
+            content.push(block);
         }
         if !text_content.is_empty() {
             content.push(json!({
@@ -672,11 +660,7 @@ async fn handle_non_stream_request(
         }
     });
 
-    if let (Some(sig), false) = (signature, conversation_id.is_empty()) {
-        super::signature_cache::SignatureCacheManager::insert(
-            conversation_id, thinking_content, sig,
-        );
-    }
+
 
     if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
         let _ = std::fs::write(format!("kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
@@ -887,9 +871,6 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
-
-    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -900,7 +881,6 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
-            conversation_id,
         )
         .await
     } else {
@@ -920,7 +900,6 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    conversation_id: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -928,10 +907,8 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
 
-    super::signature_cache::SignatureCacheManager::touch(conversation_id.clone());
-
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map, conversation_id);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

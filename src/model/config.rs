@@ -98,15 +98,7 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 签名缓存最大条目数（所有会话的签名总数，默认 10000）
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature_cache_max_entries: Option<usize>,
 
-    /// 签名缓存过期时间（小时，默认 12）
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature_cache_ttl_hours: Option<u64>,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -192,8 +184,6 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
-            signature_cache_max_entries: None,
-            signature_cache_ttl_hours: None,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
