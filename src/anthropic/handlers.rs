@@ -73,116 +73,156 @@ fn map_provider_error(err: Error) -> Response {
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
+    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+    let models = if let Some(catalog) = &*guard {
+        let mut list = Vec::new();
+        for m in &catalog.models {
+            // 基础模型
+            list.push(Model {
+                id: m.model_id.clone(),
+                object: "model".to_string(),
+                created: 1776276000,
+                owned_by: "anthropic".to_string(),
+                display_name: m.model_name.clone(),
+                model_type: "chat".to_string(),
+                max_tokens: m.token_limits.as_ref().and_then(|l| l.max_output_tokens).unwrap_or(64000),
+            });
+
+            // 检查 schema properties 中是否包含 thinking 或 output_config 相关的配置
+            let supports_thinking = m.additional_model_request_fields_schema
+                .as_ref()
+                .and_then(|s| s.as_object())
+                .and_then(|obj| obj.get("properties"))
+                .and_then(|props| props.as_object())
+                .map(|props| props.contains_key("thinking") || props.contains_key("output_config"))
+                .unwrap_or(false);
+
+            if supports_thinking {
+                list.push(Model {
+                    id: format!("{}-thinking", m.model_id),
+                    object: "model".to_string(),
+                    created: 1776276000,
+                    owned_by: "anthropic".to_string(),
+                    display_name: format!("{} (Thinking)", m.model_name),
+                    model_type: "chat".to_string(),
+                    max_tokens: m.token_limits.as_ref().and_then(|l| l.max_output_tokens).unwrap_or(64000),
+                });
+            }
+        }
+        list
+    } else {
+        // Fallback hardcoded list if catalog is not loaded yet
+        vec![
+            Model {
+                id: "claude-opus-4-7".to_string(),
+                object: "model".to_string(),
+                created: 1776276000,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.7".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-opus-4-7-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1776276000,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-opus-4-6".to_string(),
+                object: "model".to_string(),
+                created: 1770163200,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.6".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-opus-4-6-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1770163200,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.6 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-sonnet-4-6".to_string(),
+                object: "model".to_string(),
+                created: 1771286400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Sonnet 4.6".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-sonnet-4-6-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1771286400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-opus-4-5-20251101".to_string(),
+                object: "model".to_string(),
+                created: 1763942400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.5".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-opus-4-5-20251101-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1763942400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Opus 4.5 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-sonnet-4-5-20250929".to_string(),
+                object: "model".to_string(),
+                created: 1759104000,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Sonnet 4.5".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1759104000,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-haiku-4-5-20251001".to_string(),
+                object: "model".to_string(),
+                created: 1760486400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Haiku 4.5".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+            Model {
+                id: "claude-haiku-4-5-20251001-thinking".to_string(),
+                object: "model".to_string(),
+                created: 1760486400,
+                owned_by: "anthropic".to_string(),
+                display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            },
+        ]
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -708,6 +748,105 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 }
 
 fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
+    // 1. 获取映射后的模型 ID
+    let mapped_id = crate::anthropic::converter::map_model(&payload.model)?;
+    
+    // 2. 在全局模型元数据目录中寻找
+    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+    if let Some(catalog) = &*guard {
+        let model_meta = catalog.models.iter().find(|m| m.model_id == mapped_id)?;
+        
+        // 获取对应的扩展字段 schema properties
+        let schema = model_meta.additional_model_request_fields_schema.as_ref()?;
+        let schema_obj = schema.as_object()?;
+        let properties = schema_obj.get("properties")?.as_object()?;
+        
+        // 判断请求中是否启用了 thinking
+        if let Some(ref t) = payload.thinking {
+            if t.is_enabled() {
+                let mut fields = serde_json::Map::new();
+                
+                // 如果 schema properties 中支持 thinking
+                if let Some(thinking_prop) = properties.get("thinking") {
+                    let mut thinking_obj = serde_json::Map::new();
+                    let thinking_type = if let Some(enum_vals) = thinking_prop.get("properties").and_then(|p| p.get("type")).and_then(|e| e.get("enum")).and_then(|ev| ev.as_array()) {
+                        let mut has_adaptive = false;
+                        for v in enum_vals {
+                            if v.as_str() == Some("adaptive") {
+                                has_adaptive = true;
+                                break;
+                            }
+                        }
+                        if has_adaptive { "adaptive" } else { "disabled" }
+                    } else {
+                        "adaptive"
+                    };
+                    thinking_obj.insert("type".to_string(), serde_json::Value::String(thinking_type.to_string()));
+                    fields.insert("thinking".to_string(), serde_json::Value::Object(thinking_obj));
+                }
+                
+                // 如果 schema properties 中支持 output_config (effort)
+                if let Some(output_config_prop) = properties.get("output_config") {
+                    let effort = if t.thinking_type == "adaptive" {
+                        payload
+                            .output_config
+                            .as_ref()
+                            .map(|c| c.effort.clone())
+                            .unwrap_or_else(|| "high".to_string())
+                    } else {
+                        if t.budget_tokens >= 4000 {
+                            "max".to_string()
+                        } else {
+                            "high".to_string()
+                        }
+                    };
+                    
+                    // 校验 effort 是否在 schema 允许的 enum 中
+                    let effort_valid = if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
+                        if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
+                            let mut matched = false;
+                            for val in enum_vals {
+                                if let Some(val_str) = val.as_str() {
+                                    if val_str == effort {
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if matched {
+                                effort
+                            } else {
+                                effort_prop.get("default")
+                                    .and_then(|d| d.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| "high".to_string())
+                            }
+                        } else {
+                            effort
+                        }
+                    } else {
+                        effort
+                    };
+                    
+                    let mut output_config_obj = serde_json::Map::new();
+                    output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
+                    fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+                }
+                
+                if !fields.is_empty() {
+                    return Some(serde_json::Value::Object(fields));
+                }
+            }
+        }
+        return None;
+    }
+
+    // 单元测试/未加载元数据时的硬编码备用逻辑
+    if mapped_id == "claude-sonnet-4.5" || mapped_id == "claude-opus-4.5" {
+        // claude-sonnet-4.5 和 claude-opus-4.5 在 catalog 中不支持 thinking
+        return None;
+    }
+
     if let Some(ref t) = payload.thinking {
         if t.is_enabled() {
             let effort = if t.thinking_type == "adaptive" {

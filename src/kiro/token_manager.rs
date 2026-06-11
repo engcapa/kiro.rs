@@ -2039,6 +2039,79 @@ impl MultiTokenManager {
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
+
+    /// 获取最新的 Kiro 模型目录元数据
+    pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
+        let ctx = self.acquire_context(None).await?;
+        let credentials = &ctx.credentials;
+        let token = &ctx.token;
+        let region = credentials.effective_api_region(&self.config);
+        let host = format!("management.{}.kiro.dev", region);
+        let url = format!("https://{}/", host);
+
+        let machine_id = machine_id::generate_from_credentials(credentials, &self.config);
+        let kiro_version = &self.config.kiro_version;
+        let os_name = &self.config.system_version;
+        let node_version = &self.config.node_version;
+
+        let user_agent = format!(
+            "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kirocontrolplanebearer#1.0.0 m/N,E KiroIDE-{}-{}",
+            os_name, node_version, kiro_version, machine_id
+        );
+        let amz_user_agent = format!(
+            "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+            kiro_version, machine_id
+        );
+
+        let client = build_client(self.proxy.as_ref(), 10, self.config.tls_backend)?;
+
+        let mut body = serde_json::json!({
+            "origin": "AI_EDITOR"
+        });
+        if let Some(profile_arn) = &credentials.profile_arn {
+            body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+        }
+
+        let response = client
+            .post(&url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", "KiroControlPlaneBearerService.ListAvailableModels")
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("获取模型目录失败: {} {}", status, body_text);
+        }
+
+        let catalog: crate::kiro::model::model_catalog::KiroModelCatalog = response.json().await?;
+        Ok(catalog)
+    }
+
+    /// 刷新全局模型目录元数据
+    pub async fn refresh_model_catalog(&self) -> anyhow::Result<()> {
+        match self.fetch_model_catalog().await {
+            Ok(catalog) => {
+                let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
+                *guard = Some(catalog);
+                tracing::info!("动态模型元数据刷新成功");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("动态模型元数据刷新失败: {}", e);
+                Err(e)
+            }
+        }
+    }
 }
 
 impl Drop for MultiTokenManager {

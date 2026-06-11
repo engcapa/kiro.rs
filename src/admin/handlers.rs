@@ -17,7 +17,7 @@ use super::{
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+    let response = state.service.get_all_credentials().await;
     Json(response)
 }
 
