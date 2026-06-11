@@ -135,13 +135,13 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
 
-    // 启动时拉取模型目录元数据，失败则退出
+    // 启动时拉取模型目录元数据，即使失败也不退出
     tracing::info!("正在拉取 Kiro 模型目录元数据...");
     if let Err(e) = token_manager.refresh_model_catalog().await {
         tracing::error!("启动时拉取 Kiro 模型目录元数据失败: {}", e);
-        std::process::exit(1);
+    } else {
+        tracing::info!("模型元数据加载流程结束，继续启动流程");
     }
-    tracing::info!("模型元数据加载成功，继续启动流程");
 
     // 开启 10 分钟定时刷新后台任务
     let tm_clone = token_manager.clone();

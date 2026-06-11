@@ -2040,10 +2040,13 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取最新的 Kiro 模型目录元数据
-    pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
-        let ctx = self.acquire_context(None).await?;
-        let credentials = &ctx.credentials;
+    /// 获取最新的 Kiro 模型目录元数据 (针对特定凭据)
+    pub async fn fetch_model_catalog_for_credential(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
+        let ctx = self.try_ensure_token(id, credentials).await?;
         let token = &ctx.token;
         let region = credentials.effective_api_region(&self.config);
         let host = format!("management.{}.kiro.dev", region);
@@ -2097,37 +2100,92 @@ impl MultiTokenManager {
         Ok(catalog)
     }
 
+    /// 获取最新的 Kiro 模型目录元数据
+    pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
+        let ctx = self.acquire_context(None).await?;
+        self.fetch_model_catalog_for_credential(ctx.id, &ctx.credentials).await
+    }
+
     /// 刷新全局模型目录元数据（有最少 5 分钟的冷却时间限制，防止频繁刷新）
     pub async fn refresh_model_catalog(&self) -> anyhow::Result<()> {
-        // 检查冷却时间，防止频繁被触发导致流量过大和日志刷屏
-        if let Ok(time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.read() {
-            if let Some(last_refresh) = *time_guard {
-                if last_refresh.elapsed() < std::time::Duration::from_secs(300) {
-                    tracing::debug!("模型元数据最近已刷新过，忽略本次刷新请求");
-                    return Ok(());
+        self.refresh_model_catalog_ext(false).await
+    }
+
+    /// 扩展的刷新模型目录元数据方法
+    /// - `force`: 是否强制刷新（绕过 5 分钟冷却时间限制）
+    pub async fn refresh_model_catalog_ext(&self, force: bool) -> anyhow::Result<()> {
+        // 1. 检查冷却时间，防止频繁被触发导致流量过大和日志刷屏
+        if !force {
+            if let Ok(time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.read() {
+                if let Some(last_refresh) = *time_guard {
+                    if last_refresh.elapsed() < std::time::Duration::from_secs(300) {
+                        tracing::debug!("模型元数据最近已刷新过，忽略本次刷新请求");
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        match self.fetch_model_catalog().await {
-            Ok(catalog) => {
-                {
-                    let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
-                    *guard = Some(catalog);
+        // 2. 收集所有未禁用的凭据
+        let active_entries: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries.iter()
+                .filter(|e| !e.disabled)
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        if active_entries.is_empty() {
+            tracing::error!("无法刷新模型元数据：所有凭据均已禁用");
+            return Ok(());
+        }
+
+        let mut success = false;
+        let mut last_error = None;
+
+        for (id, creds) in active_entries {
+            tracing::info!("正在通过凭据 #{} 刷新 Kiro 模型目录元数据...", id);
+            match self.fetch_model_catalog_for_credential(id, &creds).await {
+                Ok(catalog) => {
+                    {
+                        let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
+                        *guard = Some(catalog);
+                    }
+                    
+                    // 更新最后刷新时间
+                    if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
+                        *time_guard = Some(std::time::Instant::now());
+                    }
+                    
+                    tracing::info!("通过凭据 #{} 动态模型元数据刷新成功", id);
+                    success = true;
+                    break; // 只要有一个成功，刷新就完成了！
                 }
-                
-                // 更新最后刷新时间
-                if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
-                    *time_guard = Some(std::time::Instant::now());
+                Err(e) => {
+                    tracing::error!("通过凭据 #{} 刷新模型元数据失败: {}。该凭据将被自动禁用！", id, e);
+                    // 刷新失败，禁用该凭据并保存
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.disabled = true;
+                            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                        }
+                    }
+                    if let Err(err) = self.persist_credentials() {
+                        tracing::error!("持久化凭据更改失败: {}", err);
+                    }
+                    last_error = Some(e);
                 }
-                
-                tracing::info!("动态模型元数据刷新成功");
-                Ok(())
             }
-            Err(e) => {
-                tracing::error!("动态模型元数据刷新失败: {}", e);
-                Err(e)
+        }
+
+        if success {
+            Ok(())
+        } else {
+            if let Some(err) = last_error {
+                tracing::error!("所有启用凭据刷新模型元数据均告失败，全部已被禁用: {}", err);
             }
+            Ok(()) // 不返回错误，保证启动程序不会因为这个失败
         }
     }
 }
@@ -2900,5 +2958,23 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_model_catalog_all_fail_does_not_return_err() {
+        let config = Config::default();
+        let cred1 = KiroCredentials {
+            refresh_token: Some("invalid-token".to_string()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+        
+        let result = manager.refresh_model_catalog().await;
+        assert!(result.is_ok());
+
+        // The credential should have been disabled and marked with TooManyFailures reason
+        let entries = manager.entries.lock();
+        assert!(entries[0].disabled);
+        assert_eq!(entries[0].disabled_reason, Some(DisabledReason::TooManyFailures));
     }
 }
