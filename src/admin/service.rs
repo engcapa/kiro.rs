@@ -60,7 +60,12 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
-    pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+    pub async fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        // 查询时尝试更新模型元数据，失败沿用上次
+        if let Err(e) = self.token_manager.refresh_model_catalog().await {
+            tracing::warn!("Admin 查询时自动刷新元数据失败 (将沿用上次元数据): {}", e);
+        }
+
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 

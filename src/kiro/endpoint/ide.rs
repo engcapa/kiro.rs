@@ -1,8 +1,8 @@
 //! Kiro IDE 端点
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! 对应 Kiro IDE 客户端目前使用的端点：
+//! - API: `https://runtime.{api_region}.kiro.dev/generateAssistantResponse`
+//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
@@ -27,7 +27,7 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("runtime.{}.kiro.dev", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -61,13 +61,13 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            "https://runtime.{}.kiro.dev/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {

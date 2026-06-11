@@ -134,6 +134,27 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 启动时拉取模型目录元数据，失败则退出
+    tracing::info!("正在拉取 Kiro 模型目录元数据...");
+    if let Err(e) = token_manager.refresh_model_catalog().await {
+        tracing::error!("启动时拉取 Kiro 模型目录元数据失败: {}", e);
+        std::process::exit(1);
+    }
+    tracing::info!("模型元数据加载成功，继续启动流程");
+
+    // 开启 10 分钟定时刷新后台任务
+    let tm_clone = token_manager.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+            tracing::info!("定时刷新 Kiro 模型目录元数据...");
+            if let Err(e) = tm_clone.refresh_model_catalog().await {
+                tracing::warn!("定时刷新 Kiro 模型目录元数据失败 (将沿用上次元数据): {}", e);
+            }
+        }
+    });
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

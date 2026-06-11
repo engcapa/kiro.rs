@@ -77,49 +77,508 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
+fn normalize_string(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
+fn extract_version(model_id: &str) -> (f64, f64) {
+    let model_lower = model_id.to_lowercase();
+    
+    // 特殊情况：如果是 -next 结尾的，比如 qwen3-coder-next，给予一个较高的权重
+    if model_lower.contains("next") {
+        return (99.0, 0.0);
+    }
+    
+    // 将夹在数字中间的 '-' 替换为 '.'
+    let mut chars: Vec<char> = model_lower.chars().collect();
+    for i in 1..chars.len().saturating_sub(1) {
+        if chars[i] == '-' && chars[i-1].is_ascii_digit() && chars[i+1].is_ascii_digit() {
+            chars[i] = '.';
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
+    }
+    let model_lower: String = chars.into_iter().collect();
+    
+    // 寻找包含数字的这一段
+    let parts: Vec<&str> = model_lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '.').collect();
+    for part in parts.iter().rev() {
+        if part.chars().any(|c| c.is_ascii_digit()) {
+            // 剥离前面的字母（例如 m2.5 -> 2.5）
+            let clean_part: String = part.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+            let subparts: Vec<&str> = clean_part.split('.').collect();
+            if subparts.len() >= 2 {
+                let major = subparts[0].parse::<f64>().unwrap_or(0.0);
+                let minor = subparts[1].parse::<f64>().unwrap_or(0.0);
+                return (major, minor);
+            } else if let Ok(major) = clean_part.parse::<f64>() {
+                return (major, 0.0);
+            }
         }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
+    }
+    (0.0, 0.0)
+}
+
+/// 判断用户的版本请求是否与候选模型版本兼容
+/// - 如果用户未请求具体版本（版本为 0.0, 0.0），则与所有版本兼容
+/// - 主版本号必须完全一致
+/// - 子版本号必须一致，除非用户请求的子版本号为 0.0（代表匹配该主版本下的任何模型，例如 claude-opus-4 匹配 4.8）
+fn is_version_compatible(input_ver: (f64, f64), cand_ver: (f64, f64)) -> bool {
+    if input_ver == (0.0, 0.0) {
+        return true;
+    }
+    if input_ver.0 != cand_ver.0 {
+        return false;
+    }
+    input_ver.1 == 0.0 || input_ver.1 == cand_ver.1
+}
+
+/// 提取模型名称或 ID 中的核心系列/家族关键字（第一个数字前的所有英文字母）
+/// 例如：
+/// - "claude-opus-4.8" -> "claudeopus"
+/// - "deepseek-3.2" -> "deepseek"
+/// - "minimax-m2.5" -> "minimaxm"
+/// - "qwen3-coder" -> "qwen"
+fn extract_family(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_ascii_alphabetic()).collect()
+}
+
+fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCatalog {
+    use crate::kiro::model::model_catalog::{KiroModelCatalog, KiroModel, TokenLimits};
+    
+    KiroModelCatalog {
+        default_model: None,
+        models: vec![
+            KiroModel {
+                model_id: "auto".to_string(),
+                model_name: "Auto".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: "Claude Opus 4.8".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(128000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(serde_json::json!({
+                    "properties": {
+                        "thinking": {},
+                        "output_config": {}
+                    }
+                })),
+            },
+            KiroModel {
+                model_id: "claude-opus-4.7".to_string(),
+                model_name: "Claude Opus 4.7".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(128000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(serde_json::json!({
+                    "properties": {
+                        "thinking": {},
+                        "output_config": {}
+                    }
+                })),
+            },
+            KiroModel {
+                model_id: "claude-opus-4.6".to_string(),
+                model_name: "Claude Opus 4.6".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(serde_json::json!({
+                    "properties": {
+                        "thinking": {},
+                        "output_config": {}
+                    }
+                })),
+            },
+            KiroModel {
+                model_id: "claude-sonnet-4.6".to_string(),
+                model_name: "Claude Sonnet 4.6".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(serde_json::json!({
+                    "properties": {
+                        "thinking": {},
+                        "output_config": {}
+                    }
+                })),
+            },
+            KiroModel {
+                model_id: "claude-opus-4.5".to_string(),
+                model_name: "Claude Opus 4.5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "claude-sonnet-4.5".to_string(),
+                model_name: "Claude Sonnet 4.5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "claude-sonnet-4".to_string(),
+                model_name: "Claude Sonnet 4".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "claude-haiku-4.5".to_string(),
+                model_name: "Claude Haiku 4.5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "deepseek-3.2".to_string(),
+                model_name: "Deepseek v3.2".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(164000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "minimax-m2.5".to_string(),
+                model_name: "MiniMax M2.5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(196000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "minimax-m2.1".to_string(),
+                model_name: "MiniMax M2.1".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(196000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "glm-5".to_string(),
+                model_name: "GLM 5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+            KiroModel {
+                model_id: "qwen3-coder-next".to_string(),
+                model_name: "Qwen3 Coder Next".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(256000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            },
+        ],
     }
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 模型映射：将 Anthropic 模型名或非 Claude 模型名智能映射到 Kiro 模型 ID
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 同 1M
-pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6"
-            || mapped == "claude-opus-4.7"  || mapped == "claude-opus-4.8" => 1_000_000,
-        _ => 200_000,
+/// # 映射逻辑 (Mapping Heuristics & Workflow)
+///
+/// 本匹配算法旨在加强对非 Claude 模型（如 DeepSeek, MiniMax, GLM, Qwen）以及复杂输入格式的兼容。
+/// 映射流程如下：
+///
+/// 1. **提取上下文限定后缀 (Context Suffix)**:
+///    检测输入末尾是否携带 `[Xm]` 或 `[XM]`（表示 X Million context 窗口限制，其中 X 可以是 1 到 10 之间的任何整数或浮点数，如 `1.5`）。
+///    若存在，剥离后缀，并将上下文需求转换为对应数量的 tokens（`X * 1,000,000`）。后续只在 `max_input_tokens >= X * 1,000,000` 的模型中进行匹配。
+///
+/// 2. **清理冗余后缀 (Cleanup)**:
+///    剥离 `-thinking` 后缀以及形如 `-20251101` (8位数字) 的发布日期后缀。
+///
+/// 3. **版本兼容性检查 (Version Compatibility)**:
+///    如果输入中包含明确的版本号（如 `"3.2"` 或 `"4.5"`），匹配到的候选模型版本必须与其兼容。
+///    - 若用户未指定任何版本（如输入 `"deepseek"` 或 `"minimax"`），则与所有版本兼容。
+///    - 若指定了主版本号，主版本号必须完全一致。
+///    - 若指定了子版本号且不为 `0.0`，则子版本号 must be identical；若为 `0.0`（例如 `"claude-opus-4"`），则可匹配任意子版本。
+///
+/// 4. **第一阶段：精确匹配 (Stage 1: Exact Match)**:
+///    将剥离后缀后的输入和目录中各模型的 `model_id` 与 `model_name` 分别进行规范化（转小写、移除非数字字母的符号和空格）。
+///    如果规范化后完全一致，并且版本兼容，则计为匹配。若有多个匹配（如多版本），按版本号由新到旧排序，返回最新版本。
+///
+/// 5. **第二阶段：模糊子串/前缀匹配 (Stage 2: Fuzzy Substring Match)**:
+///    检查规范化后的输入与模型 ID 或模型名称之间是否存在包含关系。
+///    如果包含且版本兼容，则计为匹配。按版本由新到旧排序，返回最新版本。
+///
+/// 6. **第三阶段：核心品牌家族匹配 (Stage 3: Family/Brand Keyword Match)**:
+///    对于只带前缀的输入（如 `"deepseek"`, `"minimax"`, `"qwen"`），或者由于名称变化（如 `"deepseek-chat"` 与 `"deepseek-3.2"`）
+///    而无法在 Stage 1 或 2 匹配的模型，提取其核心家族前缀（如 `"deepseek"`, `"minimaxm"`, `"qwen"`）。
+///    如果输入与候选模型的家族前缀相互包含，且版本兼容，则计为匹配。按版本排序，返回最新版。
+///
+/// 7. **未识别模型降级 (Fallback)**:
+///    若上述阶段均未找到匹配，或者符合所请求上下文限制的模型列表为空，打印警告并安全降级返回 `"auto"`。
+///
+/// # 映射举例 (Examples)
+///
+/// - **规范化与空格/大小写匹配**:
+///   - 输入 `"Deepseek v3.2"` 或 `"  DEEPSEEK    V3.2  "` ➡️ 规范化为 `"deepseekv32"`，精确匹配到 `"deepseek-3.2"`。
+///   - 输入 `"Claude Opus 4.8"` ➡️ 规范化为 `"claudeopus48"`，精确匹配到 `"claude-opus-4.8"`。
+///
+/// - **只带前缀匹配最新版**:
+///   - 输入 `"deepseek"` ➡️ 模糊匹配/家族匹配成功，在 candidates 中选择最新的 `"deepseek-3.2"`。
+///   - 输入 `"minimax"` ➡️ 家族匹配 `"minimaxm"`，从候选 `["minimax-m2.5", "minimax-m2.1"]` 中按版本排序选择最新的 `"minimax-m2.5"`。
+///
+/// - **非 Claude 模型多名称健壮匹配**:
+///   - 输入 `"deepseek-chat"` ➡️ 家族提取为 `"deepseek"`，成功匹配并挑选最新版 `"deepseek-3.2"`。
+///
+/// - **[Xm]/[XM] 上下文限制过滤与 fallback**:
+///   - 输入 `"claude-opus[1m]"` ➡️ 提取 1M 标记，过滤出 1M 候选集，匹配并返回最新版 `"claude-opus-4.8"`。
+///   - 输入 `"claude-opus[1.5m]"` ➡️ 提取 1.5M 标记，过滤出具有 >= 1.5M 上下文的候选集，匹配并返回最新版 `"claude-opus-5.0"` (支持 2M 上下文)。
+///   - 输入 `"claude-opus-4.5[1m]"` ➡️ 提取 1M 标记，要求 1M context 且版本必须兼容 `"4.5"`。但 Opus 4.5 仅支持 200k 上下文（非 1M），故在 1M 候选集中没有匹配的 4.5 版本，安全降级返回 `"auto"`。
+///   - 输入 `"deepseek[1.5m]"` ➡️ 因元数据中没有满足 1.5M 以上上下文的 deepseek 模型，无可用候选，安全降级返回 `"auto"`。
+pub fn map_model(model: &str) -> Option<String> {
+    let model_lower = model.trim().to_lowercase();
+    
+    // 1. 判断并提取类似 [1m] / [1.5m] / [2m] 等上下文限制后缀（支持最大 10m）
+    let mut require_tokens = None;
+    let mut clean_model = model_lower.clone();
+    if clean_model.ends_with(']') {
+        if let Some(start_idx) = clean_model.rfind('[') {
+            let inner = &clean_model[start_idx + 1..clean_model.len() - 1].trim();
+            if inner.ends_with('m') {
+                let num_str = &inner[..inner.len() - 1].trim();
+                if let Ok(val) = num_str.parse::<f64>() {
+                    // 限制最大为 10.0m
+                    if val > 0.0 && val <= 10.0 {
+                        require_tokens = Some((val * 1_000_000.0).round() as i64);
+                        clean_model = clean_model[..start_idx].trim().to_string();
+                    }
+                }
+            }
+        }
     }
+    
+    // 2. 清理其他后缀（移除末尾的 -thinking 和类似于 -20251101 的日期后缀）
+    if clean_model.ends_with("-thinking") {
+        clean_model = clean_model[..clean_model.len() - 9].trim().to_string();
+    }
+    if clean_model.len() >= 9 {
+        let suffix = &clean_model[clean_model.len() - 9..];
+        if suffix.starts_with('-') && suffix[1..].chars().all(|c| c.is_ascii_digit()) {
+            clean_model = clean_model[..clean_model.len() - 9].trim().to_string();
+        }
+    }
+
+    // 3. 获取当前激活的模型目录，若未加载则使用 fallback 静态目录
+    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+    let catalog = guard.as_ref().cloned().unwrap_or_else(get_catalog_fallback);
+
+    // 4. 对候选模型进行上下文过滤
+    let candidates: Vec<&crate::kiro::model::model_catalog::KiroModel> = catalog.models.iter()
+        .filter(|m| {
+            if let Some(req_tokens) = require_tokens {
+                m.token_limits.as_ref()
+                    .and_then(|limits| limits.max_input_tokens)
+                    .map(|tokens| tokens as i64 >= req_tokens)
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // 如果候选集为空，说明不存在支持的模型
+    if candidates.is_empty() {
+        if let Some(req_tokens) = require_tokens {
+            tracing::warn!("元数据目录中没有符合 {} 上下文限制的模型，映射降级为 'auto'", req_tokens);
+        } else {
+            tracing::warn!("元数据目录中候选模型为空，映射降级为 'auto'");
+        }
+        return Some("auto".to_string());
+    }
+
+    let norm_clean = normalize_string(&clean_model);
+    let input_version = extract_version(&clean_model);
+
+    // 5. 第一阶段：精确匹配（规范化后完全一致，且版本兼容）
+    let mut exact_matches = Vec::new();
+    for m in &candidates {
+        let norm_id = normalize_string(&m.model_id);
+        let norm_name = normalize_string(&m.model_name);
+        if norm_clean == norm_id || norm_clean == norm_name {
+            let cand_version = extract_version(&m.model_id);
+            if is_version_compatible(input_version, cand_version) {
+                exact_matches.push(*m);
+            }
+        }
+    }
+    if !exact_matches.is_empty() {
+        exact_matches.sort_by(|a, b| {
+            let va = extract_version(&a.model_id);
+            let vb = extract_version(&b.model_id);
+            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return Some(exact_matches[0].model_id.clone());
+    }
+
+    // 6. 第二阶段：模糊前缀/子串匹配（包含关系，且版本兼容）
+    let mut fuzzy_matches = Vec::new();
+    for m in &candidates {
+        let norm_id = normalize_string(&m.model_id);
+        let norm_name = normalize_string(&m.model_name);
+        if norm_clean.contains(&norm_id) || norm_id.contains(&norm_clean) ||
+           norm_clean.contains(&norm_name) || norm_name.contains(&norm_clean) {
+            let cand_version = extract_version(&m.model_id);
+            if is_version_compatible(input_version, cand_version) {
+                fuzzy_matches.push(*m);
+            }
+        }
+    }
+    if !fuzzy_matches.is_empty() {
+        fuzzy_matches.sort_by(|a, b| {
+            let va = extract_version(&a.model_id);
+            let vb = extract_version(&b.model_id);
+            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return Some(fuzzy_matches[0].model_id.clone());
+    }
+
+    // 7. 第三阶段：核心系列/家族匹配（提取品牌词，且版本兼容）
+    let input_family = extract_family(&clean_model);
+    if !input_family.is_empty() && input_family != "auto" {
+        let mut family_matches = Vec::new();
+        for m in &candidates {
+            let cand_family_id = extract_family(&m.model_id);
+            let cand_family_name = extract_family(&m.model_name);
+            
+            if cand_family_id.contains(&input_family) || input_family.contains(&cand_family_id) ||
+               cand_family_name.contains(&input_family) || input_family.contains(&cand_family_name) {
+                let cand_version = extract_version(&m.model_id);
+                if is_version_compatible(input_version, cand_version) {
+                    family_matches.push(*m);
+                }
+            }
+        }
+        if !family_matches.is_empty() {
+            family_matches.sort_by(|a, b| {
+                let va = extract_version(&a.model_id);
+                let vb = extract_version(&b.model_id);
+                vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return Some(family_matches[0].model_id.clone());
+        }
+    }
+
+    // 8. 未识别模型降级为 "auto"
+    tracing::warn!("无法在候选模型列表中匹配到模型 '{}'，将默认映射为 'auto'", model);
+    Some("auto".to_string())
+}
+
+/// 根据模型名称返回对应的上下文窗口大小
+pub fn get_context_window_size(model: &str) -> i32 {
+    if let Some(mapped_id) = map_model(model) {
+        let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+        if let Some(catalog) = &*guard {
+            for m in &catalog.models {
+                if m.model_id == mapped_id {
+                    if let Some(limits) = &m.token_limits {
+                        if let Some(max_input) = limits.max_input_tokens {
+                            return max_input;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    200_000
 }
 
 /// 转换结果
@@ -939,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        assert_eq!(map_model("gpt-4"), Some("auto".to_string()));
     }
 
     #[test]
@@ -1785,5 +2244,196 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_dynamic_model_catalog_mapping() {
+        use crate::kiro::model::model_catalog::{KiroModelCatalog, KiroModel, TokenLimits, GLOBAL_MODEL_CATALOG};
+
+        // 构造虚拟模型目录，包含所有测试可能用到的核心模型，避免并发测试时导致竞态报错
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![
+                KiroModel {
+                    model_id: "auto".to_string(),
+                    model_name: "Auto".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(1_000_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-opus-4.8".to_string(),
+                    model_name: "Claude Opus 4.8".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(1_000_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-opus-5.0".to_string(),
+                    model_name: "Claude Opus 5.0".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(2_000_000),
+                        max_output_tokens: Some(128000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-opus-4.6".to_string(),
+                    model_name: "Claude Opus 4.6".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(1_000_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-opus-4.5".to_string(),
+                    model_name: "Claude Opus 4.5".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(200_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-sonnet-4.5".to_string(),
+                    model_name: "Claude Sonnet 4.5".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(200_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "claude-haiku-4.5".to_string(),
+                    model_name: "Claude Haiku 4.5".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(200_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "deepseek-3.2".to_string(),
+                    model_name: "Deepseek v3.2".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(164_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "minimax-m2.5".to_string(),
+                    model_name: "MiniMax M2.5".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(196_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+                KiroModel {
+                    model_id: "minimax-m2.1".to_string(),
+                    model_name: "MiniMax M2.1".to_string(),
+                    description: None,
+                    rate_multiplier: None,
+                    rate_unit: None,
+                    supported_input_types: None,
+                    token_limits: Some(TokenLimits {
+                        max_input_tokens: Some(196_000),
+                        max_output_tokens: Some(64000),
+                    }),
+                    prompt_caching: None,
+                    additional_model_request_fields_schema: None,
+                },
+            ],
+        };
+
+        // 写入全局 catalog
+        {
+            let mut guard = GLOBAL_MODEL_CATALOG.write().unwrap();
+            *guard = Some(catalog);
+        }
+
+        // 1. 测试精确与大小写规范化比对
+        assert_eq!(map_model("claude-opus-4.8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(map_model("CLAUDE OPUS 4.8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(map_model("Claude Opus 4.8"), Some("claude-opus-4.8".to_string()));
+
+        // 2. 测试带空格与大小写的模型名称匹配
+        assert_eq!(map_model("Deepseek v3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("deepseek"), Some("deepseek-3.2".to_string()));
+
+        // 3. 测试前缀匹配选择最新版本 (m2.5 > m2.1)
+        assert_eq!(map_model("minimax"), Some("minimax-m2.5".to_string()));
+
+        // 4. 测试 [Xm] / [XM] 上下文限制匹配
+        assert_eq!(map_model("claude-opus[1m]"), Some("claude-opus-5.0".to_string())); // Opus 5.0 是最新版本且支持 2.0M (>= 1M)
+        assert_eq!(map_model("claude-opus[1.5m]"), Some("claude-opus-5.0".to_string())); // 5.0 支持 2.0M (>= 1.5M)
+        assert_eq!(map_model("claude-opus[2m]"), Some("claude-opus-5.0".to_string())); // 5.0 支持 2.0M (>= 2M)
+        assert_eq!(map_model("claude-opus[2.5m]"), Some("auto".to_string())); // 没有符合 >= 2.5M 上下文的 opus 模型
+        // claude-opus-4.5 只有 200k 上下文，如果带 [1m] 后缀且写死了特定版本，由于版本不支持 1M 则退化为 auto
+        assert_eq!(map_model("claude-opus-4.5[1m]"), Some("auto".to_string()));
+        // deepseek 没有 1M 以上上下文的模型，如果强行带 [1m] 应该退化为 auto
+        assert_eq!(map_model("deepseek[1m]"), Some("auto".to_string()));
+
+        // 5. 测试上下文窗口获取
+        assert_eq!(get_context_window_size("claude-opus-5.0"), 2_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4.5"), 200_000);
+
+        // 6. 清理全局状态以免影响其他测试
+        {
+            let mut guard = GLOBAL_MODEL_CATALOG.write().unwrap();
+            *guard = None;
+        }
     }
 }

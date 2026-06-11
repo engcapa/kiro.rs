@@ -22,7 +22,7 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod converter;
+pub mod converter;
 mod handlers;
 mod middleware;
 mod router;

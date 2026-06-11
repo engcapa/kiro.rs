@@ -14,3 +14,4 @@ pub mod events;
 pub mod requests;
 pub mod token_refresh;
 pub mod usage_limits;
+pub mod model_catalog;

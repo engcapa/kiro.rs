@@ -330,7 +330,7 @@ pub(crate) async fn get_usage_limits(
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
     let os_name = &config.system_version;
@@ -2039,6 +2039,97 @@ impl MultiTokenManager {
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
+
+    /// 获取最新的 Kiro 模型目录元数据
+    pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
+        let ctx = self.acquire_context(None).await?;
+        let credentials = &ctx.credentials;
+        let token = &ctx.token;
+        let region = credentials.effective_api_region(&self.config);
+        let host = format!("management.{}.kiro.dev", region);
+        let url = format!("https://{}/", host);
+
+        let machine_id = machine_id::generate_from_credentials(credentials, &self.config);
+        let kiro_version = &self.config.kiro_version;
+        let os_name = &self.config.system_version;
+        let node_version = &self.config.node_version;
+
+        let user_agent = format!(
+            "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kirocontrolplanebearer#1.0.0 m/N,E KiroIDE-{}-{}",
+            os_name, node_version, kiro_version, machine_id
+        );
+        let amz_user_agent = format!(
+            "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+            kiro_version, machine_id
+        );
+
+        let client = build_client(self.proxy.as_ref(), 10, self.config.tls_backend)?;
+
+        let mut body = serde_json::json!({
+            "origin": "AI_EDITOR"
+        });
+        if let Some(profile_arn) = &credentials.profile_arn {
+            body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+        }
+
+        let response = client
+            .post(&url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", "KiroControlPlaneBearerService.ListAvailableModels")
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("获取模型目录失败: {} {}", status, body_text);
+        }
+
+        let catalog: crate::kiro::model::model_catalog::KiroModelCatalog = response.json().await?;
+        Ok(catalog)
+    }
+
+    /// 刷新全局模型目录元数据（有最少 5 分钟的冷却时间限制，防止频繁刷新）
+    pub async fn refresh_model_catalog(&self) -> anyhow::Result<()> {
+        // 检查冷却时间，防止频繁被触发导致流量过大和日志刷屏
+        if let Ok(time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.read() {
+            if let Some(last_refresh) = *time_guard {
+                if last_refresh.elapsed() < std::time::Duration::from_secs(300) {
+                    tracing::debug!("模型元数据最近已刷新过，忽略本次刷新请求");
+                    return Ok(());
+                }
+            }
+        }
+
+        match self.fetch_model_catalog().await {
+            Ok(catalog) => {
+                {
+                    let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
+                    *guard = Some(catalog);
+                }
+                
+                // 更新最后刷新时间
+                if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
+                    *time_guard = Some(std::time::Instant::now());
+                }
+                
+                tracing::info!("动态模型元数据刷新成功");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("动态模型元数据刷新失败: {}", e);
+                Err(e)
+            }
+        }
+    }
 }
 
 impl Drop for MultiTokenManager {
@@ -2763,9 +2854,9 @@ mod tests {
 
         // 凭据.region 不参与 api_region 回退链
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "runtime.us-west-2.kiro.dev");
     }
 
     #[test]
@@ -2778,9 +2869,9 @@ mod tests {
         credentials.api_region = Some("eu-central-1".to_string());
 
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+        assert_eq!(api_host, "runtime.eu-central-1.kiro.dev");
     }
 
     #[test]
