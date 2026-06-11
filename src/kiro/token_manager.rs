@@ -342,9 +342,11 @@ pub(crate) async fn get_usage_limits(
         host
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    // profileArn 是可选的，对于 API Key 凭据无需发送
+    if !credentials.is_api_key_credential() {
+        if let Some(profile_arn) = &credentials.profile_arn {
+            url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+        }
     }
 
     // 构建 User-Agent headers
@@ -2071,8 +2073,10 @@ impl MultiTokenManager {
         let mut body = serde_json::json!({
             "origin": "AI_EDITOR"
         });
-        if let Some(profile_arn) = &credentials.profile_arn {
-            body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+        if !credentials.is_api_key_credential() {
+            if let Some(profile_arn) = &credentials.profile_arn {
+                body["profileArn"] = serde_json::Value::String(profile_arn.clone());
+            }
         }
 
         let response = client
