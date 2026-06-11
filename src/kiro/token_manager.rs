@@ -330,7 +330,7 @@ pub(crate) async fn get_usage_limits(
 
     // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("management.{}.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
     let os_name = &config.system_version;
@@ -2763,9 +2763,9 @@ mod tests {
 
         // 凭据.region 不参与 api_region 回退链
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+        assert_eq!(api_host, "runtime.us-west-2.kiro.dev");
     }
 
     #[test]
@@ -2778,9 +2778,9 @@ mod tests {
         credentials.api_region = Some("eu-central-1".to_string());
 
         let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        let api_host = format!("runtime.{}.kiro.dev", api_region);
 
-        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+        assert_eq!(api_host, "runtime.eu-central-1.kiro.dev");
     }
 
     #[test]
