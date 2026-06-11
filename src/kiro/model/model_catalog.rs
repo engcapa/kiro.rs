@@ -45,3 +45,6 @@ pub struct KiroModelCatalog {
 
 pub static GLOBAL_MODEL_CATALOG: LazyLock<RwLock<Option<KiroModelCatalog>>> =
     LazyLock::new(|| RwLock::new(None));
+
+pub static LAST_CATALOG_REFRESH: LazyLock<RwLock<Option<std::time::Instant>>> =
+    LazyLock::new(|| RwLock::new(None));

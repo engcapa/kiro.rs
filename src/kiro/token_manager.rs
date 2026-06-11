@@ -2097,12 +2097,30 @@ impl MultiTokenManager {
         Ok(catalog)
     }
 
-    /// 刷新全局模型目录元数据
+    /// 刷新全局模型目录元数据（有最少 5 分钟的冷却时间限制，防止频繁刷新）
     pub async fn refresh_model_catalog(&self) -> anyhow::Result<()> {
+        // 检查冷却时间，防止频繁被触发导致流量过大和日志刷屏
+        if let Ok(time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.read() {
+            if let Some(last_refresh) = *time_guard {
+                if last_refresh.elapsed() < std::time::Duration::from_secs(300) {
+                    tracing::debug!("模型元数据最近已刷新过，忽略本次刷新请求");
+                    return Ok(());
+                }
+            }
+        }
+
         match self.fetch_model_catalog().await {
             Ok(catalog) => {
-                let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
-                *guard = Some(catalog);
+                {
+                    let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
+                    *guard = Some(catalog);
+                }
+                
+                // 更新最后刷新时间
+                if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
+                    *time_guard = Some(std::time::Instant::now());
+                }
+                
                 tracing::info!("动态模型元数据刷新成功");
                 Ok(())
             }
