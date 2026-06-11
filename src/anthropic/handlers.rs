@@ -324,11 +324,12 @@ pub async fn post_messages(
     };
 
     let turn = (payload.messages.len() + 1) / 2;
+    let _ = std::fs::create_dir_all("test-output");
     if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
-        let _ = std::fs::write(format!("kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
+        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
     }
     if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
-        let _ = std::fs::write(format!("kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+        let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
     }
 
     tracing::debug!("Kiro request body: {}", request_body);
@@ -540,7 +541,8 @@ async fn handle_non_stream_request(
         .map(|len| (len + 2) / 2)
         .unwrap_or(1);
 
-    let _ = std::fs::write(format!("kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+    let _ = std::fs::create_dir_all("test-output");
+    let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -702,8 +704,9 @@ async fn handle_non_stream_request(
 
 
 
+    let _ = std::fs::create_dir_all("test-output");
     if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
-        let _ = std::fs::write(format!("kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
     }
 
     (StatusCode::OK, Json(response_body)).into_response()
