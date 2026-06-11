@@ -120,6 +120,17 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+
+        // 如果是启用凭据，异步触发模型目录刷新（强制刷新，绕过冷却）
+        if !disabled {
+            let tm = self.token_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tm.refresh_model_catalog_ext(true).await {
+                    tracing::warn!("启用凭据后刷新模型目录失败: {}", e);
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -134,7 +145,17 @@ impl AdminService {
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+
+        // 异步触发模型目录刷新（强制刷新，绕过冷却）
+        let tm = self.token_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tm.refresh_model_catalog_ext(true).await {
+                tracing::warn!("重置并启用凭据后刷新模型目录失败: {}", e);
+            }
+        });
+
+        Ok(())
     }
 
     /// 获取凭据余额（带缓存）
@@ -253,6 +274,14 @@ impl AdminService {
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
+
+        // 添加凭据后，异步触发模型目录刷新（强制刷新，绕过冷却）
+        let tm = self.token_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tm.refresh_model_catalog_ext(true).await {
+                tracing::warn!("添加凭据后刷新模型目录失败: {}", e);
+            }
+        });
 
         Ok(AddCredentialResponse {
             success: true,
