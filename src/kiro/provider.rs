@@ -134,7 +134,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, false).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -160,6 +160,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                catalog: None,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -289,10 +290,17 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // 请求是否需要 thinking：handler 已据并集 schema 构建 additionalModelRequestFields，
+        // 其中含 thinking 即视为需要 thinking，用于选择阶段排除 schema 不支持的凭据。
+        let require_thinking = Self::request_requires_thinking(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), require_thinking)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -312,11 +320,14 @@ impl KiroProvider {
                 }
             };
 
+            // 选中凭据的真实模型目录，供 transform_api_body 按其 schema 收紧 thinking/effort
+            let catalog = self.token_manager.catalog_for(ctx.id);
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                catalog,
             };
 
             let url = endpoint.api_url(&rctx);
@@ -504,6 +515,22 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 判断请求体是否需要 thinking
+    ///
+    /// handler 已据并集 schema 在 `additionalModelRequestFields` 中下发 `thinking`，
+    /// 故请求体根部存在该字段即视为需要 thinking。用于选择阶段排除 schema 不支持的凭据。
+    fn request_requires_thinking(request_body: &str) -> bool {
+        use serde_json::Value;
+        serde_json::from_str::<Value>(request_body)
+            .ok()
+            .and_then(|j| {
+                j.get("additionalModelRequestFields")
+                    .and_then(|f| f.get("thinking"))
+                    .map(|_| true)
+            })
+            .unwrap_or(false)
     }
 
     fn retry_delay(attempt: usize) -> Duration {

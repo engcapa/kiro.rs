@@ -750,13 +750,18 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
-fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
+pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
     // 1. 获取映射后的模型 ID
     let mapped_id = crate::anthropic::converter::map_model(&payload.model)?;
     
-    // 2. 在全局模型元数据目录中寻找
-    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
-    if let Some(catalog) = &*guard {
+    // 2. 取模型元数据目录：优先全局动态目录，未加载时回退到与 map_model 一致的静态目录，
+    //    保证 headless / 启动初期目录未就绪时也能正确下发 thinking/effort
+    let catalog = {
+        let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+        guard.as_ref().cloned()
+    }
+    .unwrap_or_else(crate::anthropic::converter::get_catalog_fallback);
+    {
         let model_meta = catalog.models.iter().find(|m| m.model_id == mapped_id)?;
         
         // 获取对应的扩展字段 schema properties
@@ -843,36 +848,6 @@ fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serd
         }
         return None;
     }
-
-    // 单元测试/未加载元数据时的硬编码备用逻辑
-    if mapped_id == "claude-sonnet-4.5" || mapped_id == "claude-opus-4.5" {
-        // claude-sonnet-4.5 和 claude-opus-4.5 在 catalog 中不支持 thinking
-        return None;
-    }
-
-    if let Some(ref t) = payload.thinking {
-        if t.is_enabled() {
-            let effort = if t.thinking_type == "adaptive" {
-                payload
-                    .output_config
-                    .as_ref()
-                    .map(|c| c.effort.clone())
-                    .unwrap_or_else(|| "high".to_string())
-            } else {
-                if t.budget_tokens >= 4000 {
-                    "max".to_string()
-                } else {
-                    "high".to_string()
-                }
-            };
-            return Some(serde_json::json!({
-                "output_config": {
-                    "effort": effort
-                }
-            }));
-        }
-    }
-    None
 }
 
 /// POST /v1/messages/count_tokens

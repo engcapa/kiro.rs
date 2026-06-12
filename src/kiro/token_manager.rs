@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -23,6 +24,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::model::model_catalog::{CredentialModelIndex, KiroModelCatalog, merge_catalogs};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -416,6 +418,11 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 该凭据的真实模型目录（per-credential，刷新时按各自 region/profileArn 拉取）
+    /// `Arc` 让服务期读取为廉价克隆。`None` 表示尚未成功拉取，回退到并集/fallback。
+    catalog: Option<Arc<KiroModelCatalog>>,
+    /// 由 `catalog` 预计算的模型支持索引，供选择热路径 O(1) 过滤
+    index: Option<CredentialModelIndex>,
 }
 
 /// 禁用原因
@@ -561,6 +568,27 @@ pub struct CallContext {
     pub token: String,
 }
 
+/// 判断某凭据是否真实支持目标模型（含 thinking 要求）。
+///
+/// - `model`：已映射的规范 model_id（来自请求体 modelId）；`None` 表示无模型提示 → 放行。
+/// - 凭据已加载索引（`index=Some`）：精确 O(1) 集合查（权威）。
+/// - 凭据索引未就绪（`index=None`，如启动初期或控制平面暂不可达）：放行，
+///   但保留旧的 opus 订阅启发式作为兜底（无 catalog 时仍能挡掉 Free 凭据跑 opus）。
+fn credential_supports(entry: &CredentialEntry, model: Option<&str>, require_thinking: bool) -> bool {
+    let Some(model) = model else { return true };
+    match &entry.index {
+        Some(ix) => ix.supports(model) && (!require_thinking || ix.supports_thinking(model)),
+        None => {
+            // 索引未就绪：沿用旧行为，仅对 opus 做订阅等级粗判
+            if model.to_lowercase().contains("opus") && !entry.credentials.supports_opus() {
+                false
+            } else {
+                true
+            }
+        }
+    }
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -613,6 +641,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    catalog: None,
+                    index: None,
                 }
             })
             .collect();
@@ -717,6 +747,29 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 获取指定凭据当前的模型目录（per-credential）。
+    ///
+    /// 返回 `Arc` 克隆（廉价）。`None` 表示该凭据目录尚未就绪，调用方应回退到
+    /// 并集（`GLOBAL_MODEL_CATALOG`）或静态 fallback。
+    pub fn catalog_for(&self, id: u64) -> Option<Arc<KiroModelCatalog>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.catalog.clone())
+    }
+
+    /// 测试辅助：直接为指定凭据注入 catalog 与索引（绕过网络刷新）
+    #[cfg(test)]
+    fn set_catalog_for_test(&self, id: u64, catalog: KiroModelCatalog) {
+        let index = CredentialModelIndex::from_catalog(&catalog);
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
+            e.catalog = Some(Arc::new(catalog));
+            e.index = Some(index);
+        }
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - round_robin 模式：按凭据列表顺序轮询所有未禁用凭据
@@ -724,36 +777,27 @@ impl MultiTokenManager {
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    /// - `model`: 可选的已映射模型 id，用于过滤真实支持该模型的凭据
+    /// - `require_thinking`: 请求是否需要 thinking（需要时排除 schema 不支持 thinking 的凭据）
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        require_thinking: bool,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
             let current_id = *self.current_id.lock();
-            return Self::select_round_robin_entry(&entries, current_id)
+            return Self::select_round_robin_entry(&entries, current_id, model, require_thinking)
                 .map(|entry| (entry.id, entry.credentials.clone()));
         }
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
-        // 过滤可用凭据
+        // 过滤可用凭据：未禁用 且 真实支持该模型（含 thinking 要求）
         let available: Vec<_> = entries
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
+            .filter(|e| !e.disabled && credential_supports(e, model, require_thinking))
             .collect();
 
         if available.is_empty() {
@@ -778,10 +822,12 @@ impl MultiTokenManager {
         }
     }
 
-    fn select_round_robin_entry(
-        entries: &[CredentialEntry],
+    fn select_round_robin_entry<'a>(
+        entries: &'a [CredentialEntry],
         current_id: u64,
-    ) -> Option<&CredentialEntry> {
+        model: Option<&str>,
+        require_thinking: bool,
+    ) -> Option<&'a CredentialEntry> {
         if entries.is_empty() {
             return None;
         }
@@ -792,10 +838,11 @@ impl MultiTokenManager {
             .map(|idx| idx + 1)
             .unwrap_or(0);
 
+        // 在"未禁用 且 真实支持该模型"的合格子集内轮转（每凭据判据为 O(1) 索引查）
         for offset in 0..entries.len() {
             let idx = (start + offset) % entries.len();
             let entry = &entries[idx];
-            if !entry.disabled {
+            if !entry.disabled && credential_supports(entry, model, require_thinking) {
                 return Some(entry);
             }
         }
@@ -812,8 +859,13 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `model`: 可选的已映射模型 id，用于过滤真实支持该模型的凭据
+    /// - `require_thinking`: 请求是否需要 thinking
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        require_thinking: bool,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -832,13 +884,17 @@ impl MultiTokenManager {
                 let uses_current = mode.as_str() == LOAD_BALANCING_MODE_PRIORITY;
 
                 // round_robin/balanced 模式：每次请求都重新选择。
-                // priority 模式：优先使用 current_id 指向的凭据
+                // priority 模式：优先使用 current_id 指向的凭据（须同样满足模型支持过滤）
                 let current_hit = if uses_current {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && credential_supports(e, model, require_thinking)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 } else {
                     None
@@ -848,7 +904,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用，或 round_robin/balanced 模式需要重新选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, require_thinking);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -867,7 +923,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, require_thinking);
                         }
                     }
 
@@ -881,8 +937,20 @@ impl MultiTokenManager {
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let enabled = entries.iter().filter(|e| !e.disabled).count();
+                        // 区分"全禁用" vs "有可用凭据但都不支持该模型"，给出更清晰的错误
+                        if enabled > 0 {
+                            if let Some(m) = model {
+                                anyhow::bail!(
+                                    "没有启用的凭据支持模型 {}{}（可用 {}/{}）",
+                                    m,
+                                    if require_thinking { "（需 thinking）" } else { "" },
+                                    enabled,
+                                    total
+                                );
+                            }
+                        }
+                        anyhow::bail!("所有凭据均已禁用（{}/{}）", enabled, total);
                     }
                 }
             };
@@ -1865,6 +1933,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                catalog: None,
+                index: None,
             });
         }
 
@@ -2079,7 +2149,7 @@ impl MultiTokenManager {
             }
         }
 
-        let response = client
+        let mut req = client
             .post(&url)
             .header("content-type", "application/x-amz-json-1.0")
             .header("x-amz-target", "KiroControlPlaneBearerService.ListAvailableModels")
@@ -2089,7 +2159,15 @@ impl MultiTokenManager {
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close")
+            .header("Connection", "close");
+
+        // API Key 凭据必须声明 tokentype，否则控制平面会按普通 token 处理并报
+        // "Invalid profileArn."（API Key 请求体不携带 profileArn）。
+        if credentials.is_api_key_credential() {
+            req = req.header("tokentype", "API_KEY");
+        }
+
+        let response = req
             .json(&body)
             .send()
             .await?;
@@ -2106,7 +2184,7 @@ impl MultiTokenManager {
 
     /// 获取最新的 Kiro 模型目录元数据
     pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
-        let ctx = self.acquire_context(None).await?;
+        let ctx = self.acquire_context(None, false).await?;
         self.fetch_model_catalog_for_credential(ctx.id, &ctx.credentials).await
     }
 
@@ -2144,50 +2222,72 @@ impl MultiTokenManager {
             return Ok(());
         }
 
-        let mut success = false;
-        let mut last_error = None;
+        // 3. 并发拉取每个凭据各自的模型目录（per-credential，按各自 region/profileArn）
+        let results = futures::future::join_all(active_entries.iter().map(|(id, creds)| {
+            let id = *id;
+            async move {
+                tracing::info!("正在通过凭据 #{} 刷新 Kiro 模型目录元数据...", id);
+                (id, self.fetch_model_catalog_for_credential(id, creds).await)
+            }
+        }))
+        .await;
 
-        for (id, creds) in active_entries {
-            tracing::info!("正在通过凭据 #{} 刷新 Kiro 模型目录元数据...", id);
-            match self.fetch_model_catalog_for_credential(id, &creds).await {
+        // 4. 写回各 entry 的 catalog/index。
+        //    失败不再禁用凭据：控制平面（management.*）与推理（runtime.*）解耦，
+        //    控制平面暂不可达不应让一个仍能推理的凭据报废；沿用上次目录。
+        let mut got_any = false;
+        let mut last_error = None;
+        for (id, res) in results {
+            match res {
                 Ok(catalog) => {
-                    {
-                        let mut guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap();
-                        *guard = Some(catalog);
-                    }
-                    
-                    // 更新最后刷新时间
-                    if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
-                        *time_guard = Some(std::time::Instant::now());
-                    }
-                    
-                    tracing::info!("通过凭据 #{} 动态模型元数据刷新成功", id);
-                    success = true;
-                    break; // 只要有一个成功，刷新就完成了！
-                }
-                Err(e) => {
-                    tracing::error!("通过凭据 #{} 刷新模型元数据失败: {}。该凭据将被自动禁用！", id, e);
-                    // 刷新失败，禁用该凭据并保存
+                    let model_count = catalog.models.len();
+                    let index = CredentialModelIndex::from_catalog(&catalog);
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.disabled = true;
-                            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                            entry.catalog = Some(Arc::new(catalog));
+                            entry.index = Some(index);
                         }
                     }
-                    if let Err(err) = self.persist_credentials() {
-                        tracing::error!("持久化凭据更改失败: {}", err);
-                    }
+                    got_any = true;
+                    tracing::info!("凭据 #{} 模型目录刷新成功（{} 个模型）", id, model_count);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "凭据 #{} 模型目录拉取失败（保留启用，沿用上次目录）: {}",
+                        id,
+                        e
+                    );
                     last_error = Some(e);
                 }
             }
         }
 
-        if success {
+        // 5. 重算并集视图（merged）写入 GLOBAL_MODEL_CATALOG，供 handler 预选阶段使用
+        let merged = {
+            let entries = self.entries.lock();
+            let cats: Vec<KiroModelCatalog> = entries
+                .iter()
+                .filter_map(|e| e.catalog.as_ref().map(|c| (**c).clone()))
+                .collect();
+            if cats.is_empty() {
+                None
+            } else {
+                Some(merge_catalogs(&cats))
+            }
+        };
+        if let Some(m) = merged {
+            *crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.write().unwrap() = Some(m);
+        }
+
+        if got_any {
+            if let Ok(mut time_guard) = crate::kiro::model::model_catalog::LAST_CATALOG_REFRESH.write() {
+                *time_guard = Some(std::time::Instant::now());
+            }
             Ok(())
         } else {
             if let Some(err) = last_error {
-                tracing::error!("所有启用凭据刷新模型元数据均告失败，全部已被禁用: {}", err);
+                tracing::error!("所有启用凭据刷新模型元数据均告失败（凭据保持启用，沿用上次目录）: {}", err);
             }
             Ok(()) // 不返回错误，保证启动程序不会因为这个失败
         }
@@ -2601,10 +2701,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
-        assert_eq!(manager.acquire_context(None).await.unwrap().id, 2);
-        assert_eq!(manager.acquire_context(None).await.unwrap().id, 3);
-        assert_eq!(manager.acquire_context(None).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 2);
+        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 3);
+        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 1);
     }
 
     #[tokio::test]
@@ -2619,11 +2719,11 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None).await.unwrap();
+        let first = manager.acquire_context(None, false).await.unwrap();
         assert_eq!(first.id, 1);
         assert!(manager.report_failure(first.id));
 
-        let second = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None, false).await.unwrap();
         assert_eq!(second.id, 2);
     }
 
@@ -2643,16 +2743,18 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None).await.unwrap();
+        let first = manager.acquire_context(None, false).await.unwrap();
         assert_eq!(first.id, 1);
         assert!(manager.report_quota_exhausted(first.id));
 
-        let second = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None, false).await.unwrap();
         assert_eq!(second.id, 2);
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_round_robin_only_filters_disabled_credentials() {
+    async fn test_round_robin_filters_unsupported_credentials_for_opus() {
+        // 修正后的行为：round_robin 模式同样按模型支持过滤。
+        // FREE 凭据不支持 opus，opus 请求应跳过 #1 选中 #2（旧实现的 bug 是会选中 #1）。
         let config = Config::default();
         let mut free_credential = valid_credentials("token-1");
         free_credential.subscription_title = Some("KIRO FREE".to_string());
@@ -2666,8 +2768,123 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = manager.acquire_context(Some("claude-opus")).await.unwrap();
+        let ctx = manager.acquire_context(Some("claude-opus"), false).await.unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    /// 测试辅助：按 (model_id, supports_thinking) 列表构造一个 catalog
+    fn catalog_with(ids: &[(&str, bool)]) -> KiroModelCatalog {
+        use crate::kiro::model::model_catalog::{KiroModel, TokenLimits};
+        let models = ids
+            .iter()
+            .map(|(id, think)| KiroModel {
+                model_id: id.to_string(),
+                model_name: id.to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: Some(TokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64000),
+                }),
+                prompt_caching: None,
+                additional_model_request_fields_schema: if *think {
+                    Some(serde_json::json!({"properties": {"thinking": {}, "output_config": {}}}))
+                } else {
+                    None
+                },
+            })
+            .collect();
+        KiroModelCatalog { default_model: None, models }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_filters_by_per_credential_catalog() {
+        // 三个异构凭据，各自不同的真实目录
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_credentials("t1"),
+                valid_credentials("t2"),
+                valid_credentials("t3"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_catalog_for_test(1, catalog_with(&[("auto", false), ("claude-sonnet-4.5", false)]));
+        manager.set_catalog_for_test(
+            2,
+            catalog_with(&[("auto", false), ("claude-sonnet-4.6", true), ("claude-opus-4.6", true)]),
+        );
+        manager.set_catalog_for_test(3, catalog_with(&[("auto", false), ("claude-opus-4.8", true)]));
+
+        // opus-4.8 + thinking：仅 #3 支持，多次请求都应稳定落 #3
+        for _ in 0..3 {
+            let ctx = manager.acquire_context(Some("claude-opus-4.8"), true).await.unwrap();
+            assert_eq!(ctx.id, 3);
+        }
+        // sonnet-4.5（无 thinking）：仅 #1
+        let ctx = manager.acquire_context(Some("claude-sonnet-4.5"), false).await.unwrap();
         assert_eq!(ctx.id, 1);
+        // sonnet-4.6 + thinking：仅 #2
+        let ctx = manager.acquire_context(Some("claude-sonnet-4.6"), true).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        // opus-4.6 + thinking：仅 #2（#3 只有 opus-4.8）
+        let ctx = manager.acquire_context(Some("claude-opus-4.6"), true).await.unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_thinking_gate_excludes_non_thinking_credential() {
+        // 两个凭据都有 opus-4.6，但只有 #2 的 schema 支持 thinking
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![valid_credentials("t1"), valid_credentials("t2")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_catalog_for_test(1, catalog_with(&[("claude-opus-4.6", false)]));
+        manager.set_catalog_for_test(2, catalog_with(&[("claude-opus-4.6", true)]));
+
+        // 需要 thinking：排除 #1（schema 不支持 thinking），稳定落 #2
+        for _ in 0..3 {
+            let ctx = manager.acquire_context(Some("claude-opus-4.6"), true).await.unwrap();
+            assert_eq!(ctx.id, 2);
+        }
+        // 不需要 thinking：#1 也合格（两者轮转，至少能选到 #1）
+        let ids: Vec<u64> = {
+            let a = manager.acquire_context(Some("claude-opus-4.6"), false).await.unwrap().id;
+            let b = manager.acquire_context(Some("claude-opus-4.6"), false).await.unwrap().id;
+            vec![a, b]
+        };
+        assert!(ids.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_errors_when_no_credential_supports_model() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![valid_credentials("t1")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_catalog_for_test(1, catalog_with(&[("claude-sonnet-4.5", false)]));
+
+        // 请求 opus-4.8：无凭据支持 → 明确报错且提及模型名（不静默降级）
+        let err = manager
+            .acquire_context(Some("claude-opus-4.8"), false)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("claude-opus-4.8"), "err was: {}", err);
     }
 
     #[tokio::test]
@@ -2694,7 +2911,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, false).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2716,7 +2933,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, false).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2762,7 +2979,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, false).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2802,7 +3019,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, false).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2972,13 +3189,16 @@ mod tests {
             ..Default::default()
         };
         let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
-        
+
         let result = manager.refresh_model_catalog().await;
         assert!(result.is_ok());
 
-        // The credential should have been disabled and marked with TooManyFailures reason
+        // 新行为：catalog 拉取失败不再禁用凭据（控制平面 management.* 与推理 runtime.* 解耦），
+        // 凭据保持启用、沿用上次目录；运行期失败由 report_failure 路径处理。
         let entries = manager.entries.lock();
-        assert!(entries[0].disabled);
-        assert_eq!(entries[0].disabled_reason, Some(DisabledReason::TooManyFailures));
+        assert!(!entries[0].disabled);
+        assert_eq!(entries[0].disabled_reason, None);
+        // 拉取失败 => 该凭据 catalog 仍为 None
+        assert!(entries[0].catalog.is_none());
     }
 }
