@@ -134,7 +134,11 @@ fn clamp_additional_fields_in_body(
 ) -> String {
     let mut json: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(_) => return body,
+        Err(e) => {
+            // 请求体由本服务构建，理论上必为合法 JSON；解析失败属异常，记 warn 并原样发送
+            tracing::warn!("clamp: 请求体 JSON 解析失败，跳过 per-credential 收紧: {}", e);
+            return body;
+        }
     };
     // 无扩展字段 => 无需收紧
     if json.get("additionalModelRequestFields").is_none() {
@@ -148,6 +152,7 @@ fn clamp_additional_fields_in_body(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let Some(mapped_id) = mapped_id else {
+        tracing::debug!("clamp: 请求体含 additionalModelRequestFields 但缺少 modelId，跳过收紧");
         return body;
     };
 

@@ -322,6 +322,14 @@ impl KiroProvider {
 
             // 选中凭据的真实模型目录，供 transform_api_body 按其 schema 收紧 thinking/effort
             let catalog = self.token_manager.catalog_for(ctx.id);
+            if catalog.is_none() {
+                // per-credential 目录未就绪（启动初期或控制平面不可达）：跳过收紧，
+                // 沿用并集已构建的字段。记 debug 以便观测，避免 info 每请求刷屏。
+                tracing::debug!(
+                    "凭据 #{} 目录未就绪，跳过 per-credential 字段收紧，沿用并集字段",
+                    ctx.id
+                );
+            }
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,

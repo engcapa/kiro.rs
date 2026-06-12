@@ -756,11 +756,8 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
     
     // 2. 取模型元数据目录：优先全局动态目录，未加载时回退到与 map_model 一致的静态目录，
     //    保证 headless / 启动初期目录未就绪时也能正确下发 thinking/effort
-    let catalog = {
-        let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
-        guard.as_ref().cloned()
-    }
-    .unwrap_or_else(crate::anthropic::converter::get_catalog_fallback);
+    //    （进入/退出 fallback 会打印 info 日志，便于观测降级）
+    let catalog = crate::anthropic::converter::active_catalog();
     {
         let model_meta = catalog.models.iter().find(|m| m.model_id == mapped_id)?;
         

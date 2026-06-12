@@ -144,6 +144,39 @@ fn extract_family(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| c.is_ascii_alphabetic()).collect()
 }
 
+/// 标记当前是否处于「全局目录未就绪、正在使用内置 fallback」状态。
+/// 用于在进入/退出 fallback 时各打印一次 info 日志，避免每请求刷屏。
+static CATALOG_FALLBACK_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 获取当前生效的模型目录：优先全局动态目录，未加载时回退到内置静态 fallback。
+///
+/// 仅在「进入 / 退出 fallback 状态」时各打印一次 info 日志（用原子标志去重），
+/// 既能在日志里看到回退发生与恢复，又不会在 fallback 持续期间每请求刷屏。
+pub fn active_catalog() -> crate::kiro::model::model_catalog::KiroModelCatalog {
+    use std::sync::atomic::Ordering::Relaxed;
+    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+    match guard.as_ref() {
+        Some(c) => {
+            let catalog = c.clone();
+            drop(guard);
+            if CATALOG_FALLBACK_ACTIVE.swap(false, Relaxed) {
+                tracing::info!("全局模型目录已就绪，停止使用内置 fallback 目录");
+            }
+            catalog
+        }
+        None => {
+            drop(guard);
+            if !CATALOG_FALLBACK_ACTIVE.swap(true, Relaxed) {
+                tracing::info!(
+                    "全局模型目录未就绪，回退到内置 fallback 静态目录（thinking/effort 按内置白名单下发；常见于启动初期或控制平面不可达）"
+                );
+            }
+            get_catalog_fallback()
+        }
+    }
+}
+
 pub fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCatalog {
     use crate::kiro::model::model_catalog::{KiroModelCatalog, KiroModel, TokenLimits};
     
@@ -457,9 +490,8 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     }
 
-    // 3. 获取当前激活的模型目录，若未加载则使用 fallback 静态目录
-    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
-    let catalog = guard.as_ref().cloned().unwrap_or_else(get_catalog_fallback);
+    // 3. 获取当前激活的模型目录，若未加载则使用 fallback 静态目录（进入/退出回退会打印 info）
+    let catalog = active_catalog();
 
     // 4. 对候选模型进行上下文过滤
     let candidates: Vec<&crate::kiro::model::model_catalog::KiroModel> = catalog.models.iter()
@@ -579,7 +611,15 @@ pub fn clamp_additional_fields(
 ) -> Option<serde_json::Value> {
     let model = match catalog.models.iter().find(|m| m.model_id == mapped_id) {
         Some(m) => m,
-        None => return Some(existing.clone()),
+        None => {
+            // 选择阶段已按该凭据索引保证支持该模型，此处通常仅在并发刷新切换目录的
+            // 极小窗口内发生；保留原字段不动，记 warn 以便观测异常。
+            tracing::warn!(
+                "clamp: 模型 {} 不在选中凭据的目录中（可能为目录刷新竞态），保留原扩展字段不收紧",
+                mapped_id
+            );
+            return Some(existing.clone());
+        }
     };
     // schema 缺失 => 此模型不支持扩展字段 => 收紧为不下发
     let schema = model.additional_model_request_fields_schema.as_ref()?;
@@ -654,6 +694,10 @@ pub fn get_context_window_size(model: &str) -> i32 {
             }
         }
     }
+    tracing::debug!(
+        "get_context_window_size: 模型 {} 未在目录中命中 token_limits，回退默认 200000",
+        model
+    );
     200_000
 }
 
