@@ -324,12 +324,14 @@ pub async fn post_messages(
     };
 
     let turn = (payload.messages.len() + 1) / 2;
-    let _ = std::fs::create_dir_all("test-output");
-    if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
-    }
-    if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
+        }
+        if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+        }
     }
 
     tracing::debug!("Kiro request body: {}", request_body);
@@ -562,8 +564,10 @@ async fn handle_non_stream_request(
         .map(|len| (len + 2) / 2)
         .unwrap_or(1);
 
-    let _ = std::fs::create_dir_all("test-output");
-    let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+    }
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -725,9 +729,11 @@ async fn handle_non_stream_request(
 
 
 
-    let _ = std::fs::create_dir_all("test-output");
-    if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+        }
     }
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -774,97 +780,69 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
     // 1. 获取映射后的模型 ID
     let mapped_id = crate::anthropic::converter::map_model(&payload.model)?;
-    
+
     // 2. 取模型元数据目录：优先全局动态目录，未加载时回退到与 map_model 一致的静态目录，
     //    保证 headless / 启动初期目录未就绪时也能正确下发 thinking/effort
     //    （进入/退出 fallback 会打印 info 日志，便于观测降级）
     let catalog = crate::anthropic::converter::active_catalog();
     {
         let model_meta = catalog.models.iter().find(|m| m.model_id == mapped_id)?;
-        
+
         // 获取对应的扩展字段 schema properties
         let schema = model_meta.additional_model_request_fields_schema.as_ref()?;
         let schema_obj = schema.as_object()?;
         let properties = schema_obj.get("properties")?.as_object()?;
-        
-        // 判断请求中是否启用了 thinking
-        if let Some(ref t) = payload.thinking {
-            if t.is_enabled() {
-                let mut fields = serde_json::Map::new();
-                
-                // 如果 schema properties 中支持 thinking
-                if let Some(thinking_prop) = properties.get("thinking") {
-                    let mut thinking_obj = serde_json::Map::new();
-                    let thinking_type = if let Some(enum_vals) = thinking_prop.get("properties").and_then(|p| p.get("type")).and_then(|e| e.get("enum")).and_then(|ev| ev.as_array()) {
-                        let mut has_adaptive = false;
-                        for v in enum_vals {
-                            if v.as_str() == Some("adaptive") {
-                                has_adaptive = true;
+
+        // 检查 schema 是否支持 output_config (effort)
+        if !properties.contains_key("output_config") {
+            return None;
+        }
+
+        // 只传递 effort，不传递 thinking type
+        let mut fields = serde_json::Map::new();
+
+        let effort = payload
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.clone())
+            .unwrap_or_else(|| "high".to_string());
+
+        // 校验 effort 是否在 schema 允许的 enum 中
+        let effort_valid = if let Some(output_config_prop) = properties.get("output_config") {
+            if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
+                if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
+                    let mut matched = false;
+                    for val in enum_vals {
+                        if let Some(val_str) = val.as_str() {
+                            if val_str == effort {
+                                matched = true;
                                 break;
                             }
                         }
-                        if has_adaptive { "adaptive" } else { "disabled" }
-                    } else {
-                        "adaptive"
-                    };
-                    thinking_obj.insert("type".to_string(), serde_json::Value::String(thinking_type.to_string()));
-                    fields.insert("thinking".to_string(), serde_json::Value::Object(thinking_obj));
-                }
-                
-                // 如果 schema properties 中支持 output_config (effort)
-                if let Some(output_config_prop) = properties.get("output_config") {
-                    let effort = if t.thinking_type == "adaptive" {
-                        payload
-                            .output_config
-                            .as_ref()
-                            .map(|c| c.effort.clone())
-                            .unwrap_or_else(|| "high".to_string())
-                    } else {
-                        if t.budget_tokens >= 4000 {
-                            "max".to_string()
-                        } else {
-                            "high".to_string()
-                        }
-                    };
-                    
-                    // 校验 effort 是否在 schema 允许的 enum 中
-                    let effort_valid = if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
-                        if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
-                            let mut matched = false;
-                            for val in enum_vals {
-                                if let Some(val_str) = val.as_str() {
-                                    if val_str == effort {
-                                        matched = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if matched {
-                                effort
-                            } else {
-                                effort_prop.get("default")
-                                    .and_then(|d| d.as_str())
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| "high".to_string())
-                            }
-                        } else {
-                            effort
-                        }
-                    } else {
+                    }
+                    if matched {
                         effort
-                    };
-                    
-                    let mut output_config_obj = serde_json::Map::new();
-                    output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
-                    fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+                    } else {
+                        effort_prop.get("default")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "high".to_string())
+                    }
+                } else {
+                    effort
                 }
-                
-                if !fields.is_empty() {
-                    return Some(serde_json::Value::Object(fields));
-                }
+            } else {
+                effort
             }
-        }
-        return None;
+        } else {
+            effort
+        };
+
+        let mut output_config_obj = serde_json::Map::new();
+        output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
+        fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+
+        Some(serde_json::Value::Object(fields))
     }
 }
 

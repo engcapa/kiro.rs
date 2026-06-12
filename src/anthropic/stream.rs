@@ -465,7 +465,11 @@ impl StreamContext {
 
     /// Process reasoning content event
     fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
-        if text.is_empty() {
+        // Even if text is empty, we may still need to create the thinking block
+        // to send the signature later. Check if we have a signature waiting.
+        let has_pending_signature = self.signature.is_some() && text.is_empty();
+
+        if text.is_empty() && !has_pending_signature {
             return Vec::new();
         }
 
