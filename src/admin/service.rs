@@ -403,6 +403,125 @@ impl AdminService {
         }
     }
 
+    /// 导出模型目录到 docs 目录
+    pub async fn export_model_catalog_to_docs(&self) -> anyhow::Result<()> {
+        let catalog = self.token_manager.fetch_model_catalog().await?;
+
+        let docs_dir = PathBuf::from("docs");
+        std::fs::create_dir_all(&docs_dir)?;
+
+        // 保存 JSON 格式
+        let json_path = docs_dir.join("model_catalog.json");
+        let json_content = serde_json::to_string_pretty(&catalog)?;
+        std::fs::write(&json_path, json_content)?;
+        tracing::info!("模型目录已导出到 {}", json_path.display());
+
+        // 生成 Markdown 格式的人类可读文档
+        let md_path = docs_dir.join("model_catalog.md");
+        let mut md = String::from("# Kiro 模型目录\n\n");
+        md.push_str(&format!(
+            "> 自动生成于 {}\n\n",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+
+        if let Some(ref default) = catalog.default_model {
+            md.push_str(&format!("**默认模型**: `{}`\n\n", default.model_id));
+        }
+
+        md.push_str(&format!("**模型数量**: {}\n\n", catalog.models.len()));
+
+        md.push_str("---\n\n");
+
+        for model in &catalog.models {
+            md.push_str(&format!("## {}\n\n", model.model_id));
+            md.push_str(&format!("**名称**: {}\n\n", model.model_name));
+
+            if let Some(ref desc) = model.description {
+                md.push_str(&format!("**描述**: {}\n\n", desc));
+            }
+
+            if let Some(ref limits) = model.token_limits {
+                md.push_str("**Token 限制**:\n\n");
+                if let Some(max_in) = limits.max_input_tokens {
+                    md.push_str(&format!("- 最大输入: {} tokens\n", max_in));
+                }
+                if let Some(max_out) = limits.max_output_tokens {
+                    md.push_str(&format!("- 最大输出: {} tokens\n", max_out));
+                }
+                md.push('\n');
+            }
+
+            if let Some(ref caching) = model.prompt_caching {
+                md.push_str("**Prompt Caching**:\n\n");
+                if let Some(supports) = caching.supports_prompt_caching {
+                    md.push_str(&format!("- 支持: {}\n", supports));
+                }
+                if let Some(min) = caching.minimum_tokens_per_cache_checkpoint {
+                    md.push_str(&format!("- 最小 tokens/检查点: {}\n", min));
+                }
+                if let Some(max) = caching.maximum_cache_checkpoints_per_request {
+                    md.push_str(&format!("- 最大检查点/请求: {}\n", max));
+                }
+                md.push('\n');
+            }
+
+            if let Some(ref rate) = model.rate_multiplier {
+                md.push_str(&format!("**费率倍数**: {}x\n\n", rate));
+            }
+
+            // Schema 信息
+            if let Some(ref schema) = model.additional_model_request_fields_schema {
+                md.push_str("**额外请求字段 Schema**:\n\n");
+                if let Some(obj) = schema.as_object() {
+                    if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+                        for (key, value) in props {
+                            md.push_str(&format!("### `{}`\n\n", key));
+                            if let Some(prop_obj) = value.as_object() {
+                                if let Some(prop_type) = prop_obj.get("type") {
+                                    md.push_str(&format!("- **类型**: {}\n", prop_type));
+                                }
+                                if let Some(enum_vals) = prop_obj
+                                    .get("properties")
+                                    .and_then(|p| p.as_object())
+                                    .and_then(|p| p.get("type"))
+                                    .and_then(|t| t.get("enum"))
+                                    .and_then(|e| e.as_array())
+                                {
+                                    let vals: Vec<String> = enum_vals
+                                        .iter()
+                                        .filter_map(|v| v.as_str().map(|s| format!("`{}`", s)))
+                                        .collect();
+                                    if !vals.is_empty() {
+                                        md.push_str(&format!("- **支持的值**: {}\n", vals.join(", ")));
+                                    }
+                                }
+                                if let Some(default_val) = prop_obj
+                                    .get("properties")
+                                    .and_then(|p| p.as_object())
+                                    .and_then(|p| p.get("type"))
+                                    .and_then(|t| t.get("default"))
+                                {
+                                    md.push_str(&format!(
+                                        "- **默认值**: `{}`\n",
+                                        default_val
+                                    ));
+                                }
+                            }
+                            md.push('\n');
+                        }
+                    }
+                }
+            }
+
+            md.push_str("---\n\n");
+        }
+
+        std::fs::write(&md_path, &md)?;
+        tracing::info!("模型目录文档已导出到 {}", md_path.display());
+
+        Ok(())
+    }
+
     // ============ 错误分类 ============
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）

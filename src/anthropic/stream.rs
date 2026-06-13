@@ -465,7 +465,11 @@ impl StreamContext {
 
     /// Process reasoning content event
     fn process_reasoning_content(&mut self, text: &str) -> Vec<SseEvent> {
-        if text.is_empty() {
+        // Even if text is empty, we may still need to create the thinking block
+        // to send the signature later. Check if we have a signature waiting.
+        let has_pending_signature = self.signature.is_some() && text.is_empty();
+
+        if text.is_empty() && !has_pending_signature {
             return Vec::new();
         }
 
@@ -646,19 +650,11 @@ impl StreamContext {
 
         self.state_manager.set_has_tool_use(true);
 
-        // If we are still in thinking block, close it first
-        if self.in_thinking_block {
-            self.in_thinking_block = false;
-            self.thinking_extracted = true;
-
-            if let Some(thinking_index) = self.thinking_block_index {
-                // Send empty thinking_delta and stop the block
-                events.push(self.create_thinking_delta_event(thinking_index, ""));
-                if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
-                    events.push(stop_event);
-                }
-            }
-        }
+        // 若仍处于 thinking 块中，先关闭它。必须复用 close_thinking_block()，
+        // 它会在收尾前发出 signature_delta；否则当模型「思考后直接调用工具」（中间无正文）
+        // 时，thinking 块会缺失签名，导致 Claude Code 回传该块时上游返回
+        // 400 THINKING_SIGNATURE_INVALID。
+        events.extend(self.close_thinking_block());
 
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {

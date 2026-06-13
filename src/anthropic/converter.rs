@@ -84,7 +84,7 @@ fn normalize_string(s: &str) -> String {
         .collect()
 }
 
-fn extract_version(model_id: &str) -> (f64, f64) {
+pub fn extract_version(model_id: &str) -> (f64, f64) {
     let model_lower = model_id.to_lowercase();
     
     // 特殊情况：如果是 -next 结尾的，比如 qwen3-coder-next，给予一个较高的权重
@@ -144,7 +144,40 @@ fn extract_family(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| c.is_ascii_alphabetic()).collect()
 }
 
-fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCatalog {
+/// 标记当前是否处于「全局目录未就绪、正在使用内置 fallback」状态。
+/// 用于在进入/退出 fallback 时各打印一次 info 日志，避免每请求刷屏。
+static CATALOG_FALLBACK_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 获取当前生效的模型目录：优先全局动态目录，未加载时回退到内置静态 fallback。
+///
+/// 仅在「进入 / 退出 fallback 状态」时各打印一次 info 日志（用原子标志去重），
+/// 既能在日志里看到回退发生与恢复，又不会在 fallback 持续期间每请求刷屏。
+pub fn active_catalog() -> crate::kiro::model::model_catalog::KiroModelCatalog {
+    use std::sync::atomic::Ordering::Relaxed;
+    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
+    match guard.as_ref() {
+        Some(c) => {
+            let catalog = c.clone();
+            drop(guard);
+            if CATALOG_FALLBACK_ACTIVE.swap(false, Relaxed) {
+                tracing::info!("全局模型目录已就绪，停止使用内置 fallback 目录");
+            }
+            catalog
+        }
+        None => {
+            drop(guard);
+            if !CATALOG_FALLBACK_ACTIVE.swap(true, Relaxed) {
+                tracing::info!(
+                    "全局模型目录未就绪，回退到内置 fallback 静态目录（thinking/effort 按内置白名单下发；常见于启动初期或控制平面不可达）"
+                );
+            }
+            get_catalog_fallback()
+        }
+    }
+}
+
+pub fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCatalog {
     use crate::kiro::model::model_catalog::{KiroModelCatalog, KiroModel, TokenLimits};
     
     KiroModelCatalog {
@@ -457,9 +490,8 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     }
 
-    // 3. 获取当前激活的模型目录，若未加载则使用 fallback 静态目录
-    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
-    let catalog = guard.as_ref().cloned().unwrap_or_else(get_catalog_fallback);
+    // 3. 获取当前激活的模型目录，若未加载则使用 fallback 静态目录（进入/退出回退会打印 info）
+    let catalog = active_catalog();
 
     // 4. 对候选模型进行上下文过滤
     let candidates: Vec<&crate::kiro::model::model_catalog::KiroModel> = catalog.models.iter()
@@ -562,6 +594,90 @@ pub fn map_model(model: &str) -> Option<String> {
     Some("auto".to_string())
 }
 
+/// 将已构建的 `additionalModelRequestFields` 按指定凭据 catalog 的 schema 收紧（clamp）。
+///
+/// merged 目录是各凭据的并集（超集），故按单凭据 schema 只会收紧（去掉不支持的字段、
+/// 把越界的 enum 值回退到 default），不会丢失原始意图。供 provider 在选定凭据后调用。
+///
+/// 返回：
+/// - `Some(fields)`：收紧后的字段（可能与入参相同）。
+/// - `None`：该凭据对此模型不下发任何扩展字段（schema 缺失或字段全被收紧掉）。
+///
+/// 若该 model_id 不在此凭据 catalog 中（理论上已被选择阶段过滤），返回入参克隆以免误删。
+pub fn clamp_additional_fields(
+    existing: &serde_json::Value,
+    catalog: &crate::kiro::model::model_catalog::KiroModelCatalog,
+    mapped_id: &str,
+) -> Option<serde_json::Value> {
+    let model = match catalog.models.iter().find(|m| m.model_id == mapped_id) {
+        Some(m) => m,
+        None => {
+            // 选择阶段已按该凭据索引保证支持该模型，此处通常仅在并发刷新切换目录的
+            // 极小窗口内发生；保留原字段不动，记 warn 以便观测异常。
+            tracing::warn!(
+                "clamp: 模型 {} 不在选中凭据的目录中（可能为目录刷新竞态），保留原扩展字段不收紧",
+                mapped_id
+            );
+            return Some(existing.clone());
+        }
+    };
+    // schema 缺失 => 此模型不支持扩展字段 => 收紧为不下发
+    let schema = model.additional_model_request_fields_schema.as_ref()?;
+    let props = match schema.as_object().and_then(|s| s.get("properties")).and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return None,
+    };
+    let mut out = serde_json::Map::new();
+
+    // thinking：保留 type，若不在 schema enum 内则回退 adaptive/首个枚举值
+    if let (Some(t), Some(thinking_prop)) = (existing.get("thinking"), props.get("thinking")) {
+        if let Some(type_str) = t.get("type").and_then(|v| v.as_str()) {
+            let enum_vals = thinking_prop
+                .get("properties")
+                .and_then(|p| p.get("type"))
+                .and_then(|e| e.get("enum"))
+                .and_then(|e| e.as_array());
+            let valid_type = match enum_vals {
+                Some(vals) if !vals.iter().any(|v| v.as_str() == Some(type_str)) => {
+                    if vals.iter().any(|v| v.as_str() == Some("adaptive")) {
+                        "adaptive".to_string()
+                    } else {
+                        vals.iter().filter_map(|v| v.as_str()).next().unwrap_or("disabled").to_string()
+                    }
+                }
+                _ => type_str.to_string(),
+            };
+            let mut o = serde_json::Map::new();
+            o.insert("type".to_string(), serde_json::Value::String(valid_type));
+            out.insert("thinking".to_string(), serde_json::Value::Object(o));
+        }
+    }
+
+    // output_config.effort：若不在 schema enum 内则回退 default/high
+    if let (Some(oc), Some(oc_prop)) = (existing.get("output_config"), props.get("output_config")) {
+        if let Some(effort) = oc.get("effort").and_then(|v| v.as_str()) {
+            let effort_prop = oc_prop.get("properties").and_then(|p| p.get("effort"));
+            let valid_effort = match effort_prop.and_then(|e| e.get("enum")).and_then(|e| e.as_array()) {
+                Some(vals) if !vals.iter().any(|v| v.as_str() == Some(effort)) => effort_prop
+                    .and_then(|e| e.get("default"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("high")
+                    .to_string(),
+                _ => effort.to_string(),
+            };
+            let mut o = serde_json::Map::new();
+            o.insert("effort".to_string(), serde_json::Value::String(valid_effort));
+            out.insert("output_config".to_string(), serde_json::Value::Object(o));
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(out))
+    }
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 pub fn get_context_window_size(model: &str) -> i32 {
     if let Some(mapped_id) = map_model(model) {
@@ -578,6 +694,10 @@ pub fn get_context_window_size(model: &str) -> i32 {
             }
         }
     }
+    tracing::debug!(
+        "get_context_window_size: 模型 {} 未在目录中命中 token_limits，回退默认 200000",
+        model
+    );
     200_000
 }
 
@@ -2435,5 +2555,96 @@ mod tests {
             let mut guard = GLOBAL_MODEL_CATALOG.write().unwrap();
             *guard = None;
         }
+    }
+
+    #[test]
+    fn test_clamp_additional_fields_effort_clamped_to_schema_default() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        // 该凭据 schema 的 effort enum 只含 high（无 max），default=high
+        let schema = serde_json::json!({
+            "properties": {
+                "thinking": {"properties": {"type": {"enum": ["adaptive", "disabled"]}}},
+                "output_config": {"properties": {"effort": {"enum": ["high"], "default": "high"}}}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "claude-opus-4.6".to_string(),
+                model_name: "Claude Opus 4.6".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        // 入参 effort=max（来自并集），应被收紧为 high
+        let existing = serde_json::json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        });
+        let out = clamp_additional_fields(&existing, &catalog, "claude-opus-4.6").unwrap();
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert_eq!(out["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_clamp_additional_fields_drops_when_schema_absent() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        // 该凭据对此模型无 schema（不支持扩展字段）→ 收紧为不下发（None）
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "claude-sonnet-4.5".to_string(),
+                model_name: "Claude Sonnet 4.5".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: None,
+            }],
+        };
+        let existing = serde_json::json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"}
+        });
+        assert!(clamp_additional_fields(&existing, &catalog, "claude-sonnet-4.5").is_none());
+    }
+
+    #[test]
+    fn test_clamp_additional_fields_keeps_valid_effort() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        let schema = serde_json::json!({
+            "properties": {
+                "thinking": {"properties": {"type": {"enum": ["adaptive"]}}},
+                "output_config": {"properties": {"effort": {"enum": ["high", "max"], "default": "high"}}}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "claude-opus-4.8".to_string(),
+                model_name: "Claude Opus 4.8".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        let existing = serde_json::json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        });
+        // max 在 enum 内 → 保留
+        let out = clamp_additional_fields(&existing, &catalog, "claude-opus-4.8").unwrap();
+        assert_eq!(out["output_config"]["effort"], "max");
     }
 }

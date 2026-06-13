@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
@@ -324,12 +324,14 @@ pub async fn post_messages(
     };
 
     let turn = (payload.messages.len() + 1) / 2;
-    let _ = std::fs::create_dir_all("test-output");
-    if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
-    }
-    if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        if let Ok(cc_req_json) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_req.json", turn), cc_req_json);
+        }
+        if let Ok(aws_req_json) = serde_json::to_string_pretty(&kiro_request) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_req.json", turn), aws_req_json);
+        }
     }
 
     tracing::debug!("Kiro request body: {}", request_body);
@@ -369,6 +371,10 @@ pub async fn post_messages(
 }
 
 /// 处理流式请求
+///
+/// 关键点：**立即**返回 SSE 响应头并下发 `message_start`，随后在流体内部才去
+/// `await` 上游连接，期间用 ping 保活。这样可避免高 effort（如 xhigh）下上游首字节
+/// 延迟数十秒时，客户端在「零字节、无 message_start、无 ping」的静默窗口里超时断开。
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -377,22 +383,15 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
-    };
+    let stream = create_sse_stream(
+        provider,
+        request_body.to_string(),
+        model.to_string(),
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
-    // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
-
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
-
-    // 返回 SSE 响应
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -410,96 +409,120 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 将上游错误转换为 Anthropic 流式 `error` 事件字节。
+/// 流式请求一旦发出响应头便无法再改 HTTP 状态码，故以 SSE `error` 事件下发；
+/// 分类与 `map_provider_error`（非流式路径）保持一致。
+fn provider_error_sse(err: &Error) -> Bytes {
+    let err_str = err.to_string();
+    let (etype, message) = if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        (
+            "invalid_request_error",
+            "Context window is full. Reduce conversation history, system prompt, or tools.".to_string(),
+        )
+    } else if err_str.contains("Input is too long") {
+        (
+            "invalid_request_error",
+            "Input is too long. Reduce the size of your messages.".to_string(),
+        )
+    } else {
+        ("api_error", format!("上游 API 调用失败: {}", err))
+    };
+    let payload = json!({
+        "type": "error",
+        "error": { "type": etype, "message": message }
+    });
+    Bytes::from(format!("event: error\ndata: {}\n\n", payload))
+}
+
 /// 创建 SSE 事件流
+///
+/// 流程：先发 `message_start` → 等待上游连接（期间 ping 保活）→ 处理上游事件流
+/// （期间继续 ping 保活）。上游连接失败时，由于响应头已发出无法再改 HTTP 状态码，
+/// 改为下发 SSE `error` 事件（符合 Anthropic 流式错误语义，Claude Code 能识别）。
 fn create_sse_stream(
-    response: reqwest::Response,
-    ctx: StreamContext,
-    initial_events: Vec<SseEvent>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
+    async_stream::stream! {
+        let mut ctx = StreamContext::new_with_thinking(&model, input_tokens, thinking_enabled, tool_name_map);
 
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
+        // 1) 立即下发初始事件（message_start 等），让客户端尽快拿到响应头
+        for e in ctx.generate_initial_events() {
+            yield Ok(Bytes::from(e.to_sse_string()));
+        }
 
-    let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
-
-            // 使用 select! 同时等待数据和 ping 定时器
+        // 2) 等待上游响应头期间用 ping 保活（覆盖长 TTFB 静默窗口）
+        let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping.tick().await; // 跳过立即触发的首个 tick，使首个 ping 延后一个周期
+        let connect = provider.call_api_stream(&request_body);
+        tokio::pin!(connect);
+        let response = loop {
             tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
-                    match chunk_result {
+                res = &mut connect => match res {
+                    Ok(resp) => break Some(resp),
+                    Err(e) => {
+                        tracing::error!("上游连接失败（流式，已发响应头）: {}", e);
+                        yield Ok(provider_error_sse(&e));
+                        break None;
+                    }
+                },
+                _ = ping.tick() => {
+                    yield Ok(create_ping_sse());
+                }
+            }
+        };
+        let Some(response) = response else { return };
+
+        // 3) 处理上游事件流，同时继续 ping 保活
+        let body = response.bytes_stream();
+        tokio::pin!(body);
+        let mut decoder = EventStreamDecoder::new();
+        loop {
+            tokio::select! {
+                chunk = body.next() => {
+                    match chunk {
                         Some(Ok(chunk)) => {
-                            // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
                             }
-
-                            let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                            for se in ctx.process_kiro_event(&event) {
+                                                yield Ok(Bytes::from(se.to_sse_string()));
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("解码事件失败: {}", e);
-                                    }
+                                    Err(e) => tracing::warn!("解码事件失败: {}", e),
                                 }
                             }
-
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            for se in ctx.generate_final_events() {
+                                yield Ok(Bytes::from(se.to_sse_string()));
+                            }
+                            break;
                         }
                         None => {
-                            // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            for se in ctx.generate_final_events() {
+                                yield Ok(Bytes::from(se.to_sse_string()));
+                            }
+                            break;
                         }
                     }
                 }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                _ = ping.tick() => {
+                    yield Ok(create_ping_sse());
                 }
             }
-        },
-    )
-    .flatten();
-
-    initial_stream.chain(processing_stream)
+        }
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -541,8 +564,10 @@ async fn handle_non_stream_request(
         .map(|len| (len + 2) / 2)
         .unwrap_or(1);
 
-    let _ = std::fs::create_dir_all("test-output");
-    let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        let _ = std::fs::write(format!("test-output/kiro_rs_aws_turn{}_res.txt", turn), &body_bytes);
+    }
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -704,9 +729,11 @@ async fn handle_non_stream_request(
 
 
 
-    let _ = std::fs::create_dir_all("test-output");
-    if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
-        let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+    if tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG {
+        let _ = std::fs::create_dir_all("test-output");
+        if let Ok(cc_res_json) = serde_json::to_string_pretty(&response_body) {
+            let _ = std::fs::write(format!("test-output/kiro_rs_cc_turn{}_res.json", turn), cc_res_json);
+        }
     }
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -750,129 +777,127 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
-fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
+/// 判断是否为 Claude 模型且版本 <= 4.7
+fn is_claude_model_lte_47(model_id: &str) -> bool {
+    let model_lower = model_id.to_lowercase();
+
+    // 只匹配 claude 家族的 opus/sonnet/haiku
+    if !model_lower.contains("claude") {
+        return false;
+    }
+    if !model_lower.contains("opus") && !model_lower.contains("sonnet") && !model_lower.contains("haiku") {
+        return false;
+    }
+
+    // 复用 converter 中的版本提取逻辑
+    let (major, minor) = crate::anthropic::converter::extract_version(model_id);
+
+    // Claude 4.x 版本 <= 4.7
+    if (major - 4.0).abs() < 0.001 {
+        return minor <= 7.0;
+    }
+    // 其他版本（5.x 等）按新逻辑处理（不传递 thinking）
+    false
+}
+
+pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
     // 1. 获取映射后的模型 ID
     let mapped_id = crate::anthropic::converter::map_model(&payload.model)?;
-    
-    // 2. 在全局模型元数据目录中寻找
-    let guard = crate::kiro::model::model_catalog::GLOBAL_MODEL_CATALOG.read().unwrap();
-    if let Some(catalog) = &*guard {
+
+    // 2. 取模型元数据目录：优先全局动态目录，未加载时回退到与 map_model 一致的静态目录，
+    //    保证 headless / 启动初期目录未就绪时也能正确下发 thinking/effort
+    //    （进入/退出 fallback 会打印 info 日志，便于观测降级）
+    let catalog = crate::anthropic::converter::active_catalog();
+    {
         let model_meta = catalog.models.iter().find(|m| m.model_id == mapped_id)?;
-        
+
         // 获取对应的扩展字段 schema properties
         let schema = model_meta.additional_model_request_fields_schema.as_ref()?;
         let schema_obj = schema.as_object()?;
         let properties = schema_obj.get("properties")?.as_object()?;
-        
-        // 判断请求中是否启用了 thinking
-        if let Some(ref t) = payload.thinking {
-            if t.is_enabled() {
-                let mut fields = serde_json::Map::new();
-                
-                // 如果 schema properties 中支持 thinking
-                if let Some(thinking_prop) = properties.get("thinking") {
-                    let mut thinking_obj = serde_json::Map::new();
-                    let thinking_type = if let Some(enum_vals) = thinking_prop.get("properties").and_then(|p| p.get("type")).and_then(|e| e.get("enum")).and_then(|ev| ev.as_array()) {
-                        let mut has_adaptive = false;
-                        for v in enum_vals {
-                            if v.as_str() == Some("adaptive") {
-                                has_adaptive = true;
+
+        // 判断是否为 Claude 模型且版本 <= 4.7
+        let use_thinking_for_legacy = is_claude_model_lte_47(&payload.model);
+
+        // 检查 schema 是否支持 output_config (effort)
+        if !properties.contains_key("output_config") {
+            return None;
+        }
+
+        let mut fields = serde_json::Map::new();
+
+        // 根据 effort 计算有效的 effort 值
+        let effort = payload
+            .output_config
+            .as_ref()
+            .map(|c| c.effort.clone())
+            .unwrap_or_else(|| "high".to_string());
+
+        // 校验 effort 是否在 schema 允许的 enum 中
+        let effort_valid = if let Some(output_config_prop) = properties.get("output_config") {
+            if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
+                if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
+                    let mut matched = false;
+                    for val in enum_vals {
+                        if let Some(val_str) = val.as_str() {
+                            if val_str == effort {
+                                matched = true;
                                 break;
                             }
                         }
-                        if has_adaptive { "adaptive" } else { "disabled" }
+                    }
+                    if matched {
+                        effort.clone()
+                    } else {
+                        effort_prop.get("default")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "high".to_string())
+                    }
+                } else {
+                    effort.clone()
+                }
+            } else {
+                effort.clone()
+            }
+        } else {
+            effort.clone()
+        };
+
+        let mut output_config_obj = serde_json::Map::new();
+        output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
+        fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+
+        // 对于 Claude 模型 <= 4.7，同时传递 thinking type
+        if use_thinking_for_legacy && properties.contains_key("thinking") {
+            if let Some(ref t) = payload.thinking {
+                if t.is_enabled() {
+                    let mut thinking_obj = serde_json::Map::new();
+                    // 根据 schema 确定 thinking type
+                    let thinking_type = if let Some(thinking_prop) = properties.get("thinking") {
+                        if let Some(enum_vals) = thinking_prop.get("properties").and_then(|p| p.get("type")).and_then(|e| e.get("enum")).and_then(|ev| ev.as_array()) {
+                            let mut has_adaptive = false;
+                            for v in enum_vals {
+                                if v.as_str() == Some("adaptive") {
+                                    has_adaptive = true;
+                                    break;
+                                }
+                            }
+                            if has_adaptive { "adaptive" } else { "disabled" }
+                        } else {
+                            "adaptive"
+                        }
                     } else {
                         "adaptive"
                     };
                     thinking_obj.insert("type".to_string(), serde_json::Value::String(thinking_type.to_string()));
                     fields.insert("thinking".to_string(), serde_json::Value::Object(thinking_obj));
                 }
-                
-                // 如果 schema properties 中支持 output_config (effort)
-                if let Some(output_config_prop) = properties.get("output_config") {
-                    let effort = if t.thinking_type == "adaptive" {
-                        payload
-                            .output_config
-                            .as_ref()
-                            .map(|c| c.effort.clone())
-                            .unwrap_or_else(|| "high".to_string())
-                    } else {
-                        if t.budget_tokens >= 4000 {
-                            "max".to_string()
-                        } else {
-                            "high".to_string()
-                        }
-                    };
-                    
-                    // 校验 effort 是否在 schema 允许的 enum 中
-                    let effort_valid = if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
-                        if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
-                            let mut matched = false;
-                            for val in enum_vals {
-                                if let Some(val_str) = val.as_str() {
-                                    if val_str == effort {
-                                        matched = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if matched {
-                                effort
-                            } else {
-                                effort_prop.get("default")
-                                    .and_then(|d| d.as_str())
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| "high".to_string())
-                            }
-                        } else {
-                            effort
-                        }
-                    } else {
-                        effort
-                    };
-                    
-                    let mut output_config_obj = serde_json::Map::new();
-                    output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
-                    fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
-                }
-                
-                if !fields.is_empty() {
-                    return Some(serde_json::Value::Object(fields));
-                }
             }
         }
-        return None;
-    }
 
-    // 单元测试/未加载元数据时的硬编码备用逻辑
-    if mapped_id == "claude-sonnet-4.5" || mapped_id == "claude-opus-4.5" {
-        // claude-sonnet-4.5 和 claude-opus-4.5 在 catalog 中不支持 thinking
-        return None;
+        Some(serde_json::Value::Object(fields))
     }
-
-    if let Some(ref t) = payload.thinking {
-        if t.is_enabled() {
-            let effort = if t.thinking_type == "adaptive" {
-                payload
-                    .output_config
-                    .as_ref()
-                    .map(|c| c.effort.clone())
-                    .unwrap_or_else(|| "high".to_string())
-            } else {
-                if t.budget_tokens >= 4000 {
-                    "max".to_string()
-                } else {
-                    "high".to_string()
-                }
-            };
-            return Some(serde_json::json!({
-                "output_config": {
-                    "effort": effort
-                }
-            }));
-        }
-    }
-    None
 }
 
 /// POST /v1/messages/count_tokens

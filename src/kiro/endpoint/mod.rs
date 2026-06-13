@@ -68,6 +68,10 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 选中凭据的真实模型目录（per-credential）。
+    /// `Some` 时 `transform_api_body` 据其 schema 收紧 thinking/effort；
+    /// `None`（MCP 路径或目录未就绪）时不收紧。
+    pub catalog: Option<std::sync::Arc<crate::kiro::model::model_catalog::KiroModelCatalog>>,
 }
 
 /// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
