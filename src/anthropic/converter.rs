@@ -84,7 +84,7 @@ fn normalize_string(s: &str) -> String {
         .collect()
 }
 
-fn extract_version(model_id: &str) -> (f64, f64) {
+pub fn extract_version(model_id: &str) -> (f64, f64) {
     let model_lower = model_id.to_lowercase();
     
     // 特殊情况：如果是 -next 结尾的，比如 qwen3-coder-next，给予一个较高的权重

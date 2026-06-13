@@ -777,6 +777,29 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
+/// 判断是否为 Claude 模型且版本 <= 4.7
+fn is_claude_model_lte_47(model_id: &str) -> bool {
+    let model_lower = model_id.to_lowercase();
+
+    // 只匹配 claude 家族的 opus/sonnet/haiku
+    if !model_lower.contains("claude") {
+        return false;
+    }
+    if !model_lower.contains("opus") && !model_lower.contains("sonnet") && !model_lower.contains("haiku") {
+        return false;
+    }
+
+    // 复用 converter 中的版本提取逻辑
+    let (major, minor) = crate::anthropic::converter::extract_version(model_id);
+
+    // Claude 4.x 版本 <= 4.7
+    if (major - 4.0).abs() < 0.001 {
+        return minor <= 7.0;
+    }
+    // 其他版本（5.x 等）按新逻辑处理（不传递 thinking）
+    false
+}
+
 pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<serde_json::Value> {
     // 1. 获取映射后的模型 ID
     let mapped_id = crate::anthropic::converter::map_model(&payload.model)?;
@@ -793,14 +816,17 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
         let schema_obj = schema.as_object()?;
         let properties = schema_obj.get("properties")?.as_object()?;
 
+        // 判断是否为 Claude 模型且版本 <= 4.7
+        let use_thinking_for_legacy = is_claude_model_lte_47(&payload.model);
+
         // 检查 schema 是否支持 output_config (effort)
         if !properties.contains_key("output_config") {
             return None;
         }
 
-        // 只传递 effort，不传递 thinking type
         let mut fields = serde_json::Map::new();
 
+        // 根据 effort 计算有效的 effort 值
         let effort = payload
             .output_config
             .as_ref()
@@ -821,7 +847,7 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
                         }
                     }
                     if matched {
-                        effort
+                        effort.clone()
                     } else {
                         effort_prop.get("default")
                             .and_then(|d| d.as_str())
@@ -829,18 +855,46 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
                             .unwrap_or_else(|| "high".to_string())
                     }
                 } else {
-                    effort
+                    effort.clone()
                 }
             } else {
-                effort
+                effort.clone()
             }
         } else {
-            effort
+            effort.clone()
         };
 
         let mut output_config_obj = serde_json::Map::new();
         output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
         fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+
+        // 对于 Claude 模型 <= 4.7，同时传递 thinking type
+        if use_thinking_for_legacy && properties.contains_key("thinking") {
+            if let Some(ref t) = payload.thinking {
+                if t.is_enabled() {
+                    let mut thinking_obj = serde_json::Map::new();
+                    // 根据 schema 确定 thinking type
+                    let thinking_type = if let Some(thinking_prop) = properties.get("thinking") {
+                        if let Some(enum_vals) = thinking_prop.get("properties").and_then(|p| p.get("type")).and_then(|e| e.get("enum")).and_then(|ev| ev.as_array()) {
+                            let mut has_adaptive = false;
+                            for v in enum_vals {
+                                if v.as_str() == Some("adaptive") {
+                                    has_adaptive = true;
+                                    break;
+                                }
+                            }
+                            if has_adaptive { "adaptive" } else { "disabled" }
+                        } else {
+                            "adaptive"
+                        }
+                    } else {
+                        "adaptive"
+                    };
+                    thinking_obj.insert("type".to_string(), serde_json::Value::String(thinking_type.to_string()));
+                    fields.insert("thinking".to_string(), serde_json::Value::Object(thinking_obj));
+                }
+            }
+        }
 
         Some(serde_json::Value::Object(fields))
     }
