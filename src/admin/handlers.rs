@@ -140,3 +140,15 @@ pub async fn set_load_balancing_mode(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+/// POST /api/admin/catalog/export
+/// 导出模型目录到 docs 目录
+pub async fn export_model_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.export_model_catalog_to_docs().await {
+        Ok(_) => Json(SuccessResponse::new("模型目录已导出到 docs/ 目录".to_string())).into_response(),
+        Err(e) => {
+            tracing::error!("导出模型目录失败: {}", e);
+            Json(SuccessResponse::new(format!("导出失败: {}", e))).into_response()
+        }
+    }
+}

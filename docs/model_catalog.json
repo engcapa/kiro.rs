@@ -1,0 +1,489 @@
+{
+  "defaultModel": {
+    "modelId": "auto"
+  },
+  "models": [
+    {
+      "modelId": "auto",
+      "modelName": "Auto",
+      "description": "Models chosen by task for optimal usage and consistent quality",
+      "rateMultiplier": 1.0,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 1024,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "claude-opus-4.8",
+      "modelName": "Claude Opus 4.8",
+      "description": "Experimental preview of Claude Opus 4.8 model with 1M context window",
+      "rateMultiplier": 2.2,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 1024,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "maximum": 128000,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "output_config": {
+            "properties": {
+              "effort": {
+                "default": "high",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "thinking": {
+            "properties": {
+              "display": {
+                "enum": [
+                  "summarized",
+                  "omitted"
+                ],
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "adaptive",
+                  "disabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "modelId": "claude-opus-4.7",
+      "modelName": "Claude Opus 4.7",
+      "description": "Experimental preview of Claude Opus 4.7 model with 1M context window",
+      "rateMultiplier": 2.2,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 128000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 4096,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "maximum": 128000,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "output_config": {
+            "properties": {
+              "effort": {
+                "default": "xhigh",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "thinking": {
+            "properties": {
+              "display": {
+                "enum": [
+                  "summarized",
+                  "omitted"
+                ],
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "adaptive",
+                  "disabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "modelId": "claude-opus-4.6",
+      "modelName": "Claude Opus 4.6",
+      "description": "The Claude Opus 4.6 model",
+      "rateMultiplier": 2.2,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 4096,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "maximum": 64000,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "output_config": {
+            "properties": {
+              "effort": {
+                "default": "high",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "thinking": {
+            "properties": {
+              "display": {
+                "enum": [
+                  "summarized",
+                  "omitted"
+                ],
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "adaptive",
+                  "disabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "modelId": "claude-sonnet-4.6",
+      "modelName": "Claude Sonnet 4.6",
+      "description": "The latest Claude Sonnet model with 1M context window",
+      "rateMultiplier": 1.3,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 1024,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "maximum": 64000,
+            "minimum": 1024,
+            "type": "integer"
+          },
+          "output_config": {
+            "properties": {
+              "effort": {
+                "default": "high",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "thinking": {
+            "properties": {
+              "display": {
+                "enum": [
+                  "summarized",
+                  "omitted"
+                ],
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "adaptive",
+                  "disabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "modelId": "claude-opus-4.5",
+      "modelName": "Claude Opus 4.5",
+      "description": "The Claude Opus 4.5 model",
+      "rateMultiplier": 2.2,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 4096,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "claude-sonnet-4.5",
+      "modelName": "Claude Sonnet 4.5",
+      "description": "The Claude Sonnet 4.5 model",
+      "rateMultiplier": 1.3,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 1024,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "claude-sonnet-4",
+      "modelName": "Claude Sonnet 4",
+      "description": "Hybrid reasoning and coding for regular use",
+      "rateMultiplier": 1.3,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 1024,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "claude-haiku-4.5",
+      "modelName": "Claude Haiku 4.5",
+      "description": "The latest Claude Haiku model",
+      "rateMultiplier": 0.4,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": 4,
+        "minimumTokensPerCacheCheckpoint": 4096,
+        "supportsPromptCaching": true
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "deepseek-3.2",
+      "modelName": "Deepseek v3.2",
+      "description": "Experimental preview of DeepSeek V3.2",
+      "rateMultiplier": 0.25,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 164000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": null,
+        "minimumTokensPerCacheCheckpoint": null,
+        "supportsPromptCaching": false
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "minimax-m2.5",
+      "modelName": "MiniMax M2.5",
+      "description": "The MiniMax M2.5 model",
+      "rateMultiplier": 0.25,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 196000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": null,
+        "minimumTokensPerCacheCheckpoint": null,
+        "supportsPromptCaching": false
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "minimax-m2.1",
+      "modelName": "MiniMax M2.1",
+      "description": "Experimental preview of MiniMax M2.1",
+      "rateMultiplier": 0.15,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 196000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": null,
+        "minimumTokensPerCacheCheckpoint": null,
+        "supportsPromptCaching": false
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "glm-5",
+      "modelName": "GLM 5",
+      "description": "The GLM-5 model",
+      "rateMultiplier": 0.5,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": null,
+        "minimumTokensPerCacheCheckpoint": null,
+        "supportsPromptCaching": false
+      },
+      "additionalModelRequestFieldsSchema": null
+    },
+    {
+      "modelId": "qwen3-coder-next",
+      "modelName": "Qwen3 Coder Next",
+      "description": "Experimental preview of Qwen3 Coder Next",
+      "rateMultiplier": 0.05,
+      "rateUnit": "Credit",
+      "supportedInputTypes": [
+        "TEXT",
+        "IMAGE"
+      ],
+      "tokenLimits": {
+        "maxInputTokens": 256000,
+        "maxOutputTokens": 64000
+      },
+      "promptCaching": {
+        "maximumCacheCheckpointsPerRequest": null,
+        "minimumTokensPerCacheCheckpoint": null,
+        "supportsPromptCaching": false
+      },
+      "additionalModelRequestFieldsSchema": null
+    }
+  ]
+}
