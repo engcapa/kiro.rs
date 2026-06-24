@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::common::diagnostics;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
@@ -339,12 +340,12 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let outbound_body = endpoint.transform_api_body(request_body, &rctx);
 
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(outbound_body.clone())
                 .header("content-type", "application/json")
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
@@ -410,6 +411,45 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                if diagnostics::is_type_error_response(&body) {
+                    let summary = diagnostics::type_error_summary(status.as_u16(), &body);
+                    match diagnostics::write_type_error_trace(diagnostics::TypeErrorTrace {
+                        api_type,
+                        request_body: &outbound_body,
+                        response_status: status.as_u16(),
+                        response_body: &body,
+                        attempt: attempt + 1,
+                        max_retries,
+                        credential_id: ctx.id,
+                        endpoint: endpoint.name(),
+                        model: model.as_deref(),
+                        url: &url,
+                    }) {
+                        Ok(files) => {
+                            tracing::error!(
+                                error = %summary,
+                                request_json = %files.request_path.display(),
+                                response_json = %files.response_path.display(),
+                                "Kiro API 返回类型错误"
+                            );
+                            anyhow::bail!(
+                                "{} API 请求失败（类型错误，诊断文件: {}, {}）: {}",
+                                api_type,
+                                files.request_path.display(),
+                                files.response_path.display(),
+                                summary
+                            );
+                        }
+                        Err(save_error) => {
+                            tracing::error!(
+                                error = %summary,
+                                save_error = %save_error,
+                                "Kiro API 返回类型错误，诊断文件保存失败"
+                            );
+                            anyhow::bail!("{} API 请求失败（类型错误）: {}", api_type, summary);
+                        }
+                    }
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 

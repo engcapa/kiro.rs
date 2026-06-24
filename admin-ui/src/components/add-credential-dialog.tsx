@@ -20,6 +20,7 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const [name, setName] = useState('')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -37,6 +38,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const { mutate, isPending } = useAddCredential()
 
   const resetForm = () => {
+    setName('')
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
@@ -77,6 +79,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     mutate(
       {
+        name: name.trim() || undefined,
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
@@ -113,6 +116,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            {/* 认证方式 */}
+            <div className="space-y-2">
+              <label htmlFor="credentialName" className="text-sm font-medium">
+                凭据名称
+              </label>
+              <Input
+                id="credentialName"
+                placeholder="留空自动使用用户名/邮箱生成"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">

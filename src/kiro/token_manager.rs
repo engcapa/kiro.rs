@@ -65,6 +65,56 @@ fn mask_api_key(key: &str) -> String {
     }
 }
 
+fn trimmed_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn fallback_credential_name(id: u64) -> String {
+    format!("凭据 #{}", id)
+}
+
+fn credential_identity(credentials: &KiroCredentials) -> Option<&str> {
+    credentials
+        .user_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            credentials
+                .email
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn default_credential_name(id: u64, credentials: &KiroCredentials) -> String {
+    credential_identity(credentials)
+        .map(|identity| format!("{} #{}", identity, id))
+        .unwrap_or_else(|| fallback_credential_name(id))
+}
+
+fn should_auto_set_credential_name(id: u64, name: Option<&str>) -> bool {
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(name) => name == fallback_credential_name(id),
+        None => true,
+    }
+}
+
+fn ensure_credential_name(id: u64, credentials: &mut KiroCredentials) -> bool {
+    if !should_auto_set_credential_name(id, credentials.name.as_deref()) {
+        return false;
+    }
+
+    let name = default_credential_name(id, credentials);
+    if credentials.name.as_deref() == Some(name.as_str()) {
+        return false;
+    }
+
+    credentials.name = Some(name);
+    true
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -459,6 +509,8 @@ struct StatsEntry {
 pub struct CredentialEntrySnapshot {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据显示名称
+    pub name: String,
     /// 优先级
     pub priority: u32,
     /// 是否被禁用
@@ -469,6 +521,10 @@ pub struct CredentialEntrySnapshot {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Profile ARN 原文
+    pub profile_arn: Option<String>,
+    /// 导入时间
+    pub imported_at: Option<String>,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -479,6 +535,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 上游返回的用户名
+    pub user_name: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -610,6 +668,7 @@ impl MultiTokenManager {
         let mut next_id = max_existing_id + 1;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
+        let mut has_new_metadata = false;
         let config_ref = &config;
 
         let entries: Vec<CredentialEntry> = credentials
@@ -627,6 +686,13 @@ impl MultiTokenManager {
                     cred.machine_id =
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
+                }
+                if cred.imported_at.is_none() {
+                    cred.imported_at = Some(Utc::now().to_rfc3339());
+                    has_new_metadata = true;
+                }
+                if ensure_credential_name(id, &mut cred) {
+                    has_new_metadata = true;
                 }
                 CredentialEntry {
                     id,
@@ -718,11 +784,11 @@ impl MultiTokenManager {
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
-        if has_new_ids || has_new_machine_ids {
+        if has_new_ids || has_new_machine_ids || has_new_metadata {
             if let Err(e) = manager.persist_credentials() {
-                tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
+                tracing::warn!("补全凭据 ID/machineId/metadata 后持久化失败: {}", e);
             } else {
-                tracing::info!("已补全凭据 ID/machineId 并写回配置文件");
+                tracing::info!("已补全凭据 ID/machineId/metadata 并写回配置文件");
             }
         }
 
@@ -1029,8 +1095,11 @@ impl MultiTokenManager {
             });
         }
 
-        // 第一次检查（无锁）：快速判断是否需要刷新
-        let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        // 第一次检查（无锁）：快速判断是否需要刷新。没有 profileArn 的 OAuth 凭据
+        // 也刷新一次，用 refresh 响应补齐 ARN 并持久化。
+        let needs_refresh = is_token_expired(credentials)
+            || is_token_expiring_soon(credentials)
+            || credentials.profile_arn.is_none();
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
@@ -1046,7 +1115,10 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
             };
 
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+            if is_token_expired(&current_creds)
+                || is_token_expiring_soon(&current_creds)
+                || current_creds.profile_arn.is_none()
+            {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                 let new_creds =
@@ -1578,6 +1650,13 @@ impl MultiTokenManager {
                 .iter()
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
+                    name: e
+                        .credentials
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| default_credential_name(e.id, &e.credentials)),
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
@@ -1593,6 +1672,8 @@ impl MultiTokenManager {
                         })
                     },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
+                    profile_arn: e.credentials.profile_arn.clone(),
+                    imported_at: e.credentials.imported_at.clone(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {
@@ -1614,6 +1695,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    user_name: e.credentials.user_name.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1681,6 +1763,26 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据显示名称（Admin API）
+    pub fn set_name(&self, id: u64, name: String) -> anyhow::Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("凭据名称不能为空");
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.name = Some(name.to_string());
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -1724,8 +1826,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
         } else {
             // 检查是否需要刷新 token
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+            let needs_refresh = is_token_expired(&credentials)
+                || is_token_expiring_soon(&credentials)
+                || credentials.profile_arn.is_none();
 
             if needs_refresh {
                 let _guard = self.refresh_lock.lock().await;
@@ -1738,7 +1841,10 @@ impl MultiTokenManager {
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
                 };
 
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                if is_token_expired(&current_creds)
+                    || is_token_expiring_soon(&current_creds)
+                    || current_creds.profile_arn.is_none()
+                {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
@@ -1778,13 +1884,19 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
-        // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+        let subscription_title = usage_limits.subscription_title().map(str::to_string);
+        let email = usage_limits.email().map(str::to_string);
+        let user_name = usage_limits.user_name().map(str::to_string);
+
+        let changed = {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let mut changed = false;
+
+                if let Some(subscription_title) = subscription_title.as_deref() {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
                         entry.credentials.subscription_title =
@@ -1795,19 +1907,37 @@ impl MultiTokenManager {
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
-                } else {
-                    false
                 }
-            };
 
-            if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
+                if let Some(email) = trimmed_non_empty(email.clone()) {
+                    if entry.credentials.email.as_deref() != Some(email.as_str()) {
+                        entry.credentials.email = Some(email);
+                        changed = true;
+                    }
                 }
+
+                if let Some(user_name) = trimmed_non_empty(user_name.clone()) {
+                    if entry.credentials.user_name.as_deref() != Some(user_name.as_str()) {
+                        entry.credentials.user_name = Some(user_name);
+                        changed = true;
+                    }
+                }
+
+                if ensure_credential_name(id, &mut entry.credentials) {
+                    changed = true;
+                }
+
+                changed
+            } else {
+                false
+            }
+        };
+
+        if changed {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("凭据元数据更新后持久化失败（不影响本次请求）: {}", e);
             }
         }
 
@@ -1902,6 +2032,9 @@ impl MultiTokenManager {
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
+        validated_cred.imported_at = new_cred
+            .imported_at
+            .or_else(|| Some(Utc::now().to_rfc3339()));
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
@@ -1916,11 +2049,15 @@ impl MultiTokenManager {
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
-        validated_cred.email = new_cred.email;
+        validated_cred.email = trimmed_non_empty(new_cred.email);
+        validated_cred.user_name = trimmed_non_empty(new_cred.user_name);
+        validated_cred.name = trimmed_non_empty(new_cred.name);
+        ensure_credential_name(new_id, &mut validated_cred);
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.endpoint = new_cred.endpoint;
 
         {
             let mut entries = self.entries.lock();

@@ -229,9 +229,11 @@ docker-compose up
 | 字段             | 类型     | 描述                                          |
 |----------------|--------|---------------------------------------------|
 | `id`           | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）        |
+| `name`         | string | 凭据显示名称（可选；导入时可自动由用户名/邮箱和 ID 生成）             |
 | `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
 | `refreshToken` | string | OAuth 刷新令牌                                  |
-| `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
+| `profileArn`   | string | AWS Profile ARN（OAuth 凭据会在刷新/导入查询时尽量自动保存）    |
+| `importedAt`   | string | 凭据导入时间 (RFC3339)                            |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
@@ -242,6 +244,7 @@ docker-compose up
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
+| `userName`     | string | 上游用户名（可选，通常为邮箱或账号名）                         |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |

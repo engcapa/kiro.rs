@@ -9,6 +9,7 @@ export interface CredentialsStatusResponse {
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
+  name: string
   priority: number
   disabled: boolean
   failureCount: number
@@ -16,7 +17,10 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
+  profileArn?: string | null
+  importedAt?: string | null
   email?: string
+  userName?: string
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -65,8 +69,13 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetNameRequest {
+  name: string
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
+  name?: string
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string
@@ -75,6 +84,8 @@ export interface AddCredentialRequest {
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  email?: string
+  userName?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -87,5 +98,9 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
+  name: string
   email?: string
+  userName?: string
+  profileArn?: string
+  importedAt?: string
 }
