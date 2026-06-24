@@ -8,6 +8,22 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitsResponse {
+    /// 用户邮箱（部分上游响应会直接返回）
+    #[serde(default, alias = "mail")]
+    pub email: Option<String>,
+
+    /// 用户名（部分上游响应会直接返回）
+    #[serde(default, alias = "username")]
+    pub user_name: Option<String>,
+
+    /// 账号名称（部分上游响应会直接返回）
+    #[serde(default)]
+    pub account_name: Option<String>,
+
+    /// 显示名称（部分上游响应会直接返回）
+    #[serde(default)]
+    pub display_name: Option<String>,
+
     /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
     pub next_date_reset: Option<f64>,
@@ -28,6 +44,22 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 用户邮箱（部分响应会放在订阅信息里）
+    #[serde(default, alias = "mail")]
+    pub email: Option<String>,
+
+    /// 用户名（部分响应会放在订阅信息里）
+    #[serde(default, alias = "username")]
+    pub user_name: Option<String>,
+
+    /// 账号名称（部分响应会放在订阅信息里）
+    #[serde(default)]
+    pub account_name: Option<String>,
+
+    /// 显示名称（部分响应会放在订阅信息里）
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// 使用量明细
@@ -139,6 +171,32 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取上游返回的用户邮箱
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref().or_else(|| {
+            self.subscription_info
+                .as_ref()
+                .and_then(|info| info.email.as_deref())
+        })
+    }
+
+    /// 获取上游返回的用户名或显示名
+    pub fn user_name(&self) -> Option<&str> {
+        self.user_name
+            .as_deref()
+            .or(self.display_name.as_deref())
+            .or(self.account_name.as_deref())
+            .or_else(|| {
+                self.subscription_info.as_ref().and_then(|info| {
+                    info.user_name
+                        .as_deref()
+                        .or(info.display_name.as_deref())
+                        .or(info.account_name.as_deref())
+                })
+            })
+            .or_else(|| self.email())
     }
 
     /// 获取第一个使用量明细

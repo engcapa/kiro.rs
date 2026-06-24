@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -6,7 +6,8 @@ import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { CredentialCard } from '@/components/credential-card'
+import { Input } from '@/components/ui/input'
+import { CredentialsTable, type CredentialSortKey, type SortDirection } from '@/components/credentials-table'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -15,7 +16,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -29,9 +30,35 @@ const LOAD_BALANCING_LABELS: Record<LoadBalancingMode, string> = {
   balanced: '均衡负载',
 }
 
+type StatusFilter = 'all' | 'enabled' | 'disabled' | 'current' | 'failed'
+type ProfileFilter = 'all' | 'has' | 'missing'
+
 function nextLoadBalancingMode(currentMode: LoadBalancingMode): LoadBalancingMode {
   const index = LOAD_BALANCING_MODES.indexOf(currentMode)
   return LOAD_BALANCING_MODES[(index + 1) % LOAD_BALANCING_MODES.length]
+}
+
+function credentialSearchText(credential: CredentialStatusItem): string {
+  return [
+    credential.id,
+    credential.name,
+    credential.email,
+    credential.userName,
+    credential.authMethod,
+    credential.endpoint,
+    credential.profileArn,
+    credential.maskedApiKey,
+    credential.proxyUrl,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+}
+
+function dateValue(value?: string | null): number {
+  if (!value) return 0
+  const time = new Date(value).getTime()
+  return Number.isNaN(time) ? 0 : time
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -53,6 +80,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [authFilter, setAuthFilter] = useState('all')
+  const [profileFilter, setProfileFilter] = useState<ProfileFilter>('all')
+  const [sortKey, setSortKey] = useState<CredentialSortKey>('priority')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -68,21 +101,96 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
+  const allCredentials = data?.credentials || []
+
+  const authOptions = useMemo(() => {
+    return Array.from(new Set(allCredentials.map(credential => credential.authMethod).filter((value): value is string => Boolean(value)))).sort()
+  }, [allCredentials])
+
+  const filteredCredentials = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase()
+
+    return allCredentials.filter(credential => {
+      if (query && !credentialSearchText(credential).includes(query)) {
+        return false
+      }
+
+      if (statusFilter === 'enabled' && credential.disabled) return false
+      if (statusFilter === 'disabled' && !credential.disabled) return false
+      if (statusFilter === 'current' && !credential.isCurrent) return false
+      if (statusFilter === 'failed' && credential.failureCount === 0 && credential.refreshFailureCount === 0) return false
+
+      if (authFilter !== 'all' && credential.authMethod !== authFilter) {
+        return false
+      }
+
+      if (profileFilter === 'has' && !credential.hasProfileArn) return false
+      if (profileFilter === 'missing' && credential.hasProfileArn) return false
+
+      return true
+    })
+  }, [allCredentials, authFilter, profileFilter, searchTerm, statusFilter])
+
+  const sortedCredentials = useMemo(() => {
+    const getValue = (credential: CredentialStatusItem): string | number => {
+      switch (sortKey) {
+        case 'name':
+          return credential.name.toLowerCase()
+        case 'id':
+          return credential.id
+        case 'priority':
+          return credential.priority
+        case 'status':
+          return credential.disabled ? 2 : credential.isCurrent ? 0 : 1
+        case 'authMethod':
+          return credential.authMethod || ''
+        case 'endpoint':
+          return credential.endpoint || ''
+        case 'profileArn':
+          return credential.profileArn || ''
+        case 'importedAt':
+          return dateValue(credential.importedAt)
+        case 'lastUsedAt':
+          return dateValue(credential.lastUsedAt)
+        case 'successCount':
+          return credential.successCount
+        case 'failureCount':
+          return credential.failureCount + credential.refreshFailureCount
+        case 'remaining':
+          return balanceMap.get(credential.id)?.remaining ?? -1
+      }
+    }
+
+    return [...filteredCredentials].sort((a, b) => {
+      const aValue = getValue(a)
+      const bValue = getValue(b)
+      const direction = sortDirection === 'asc' ? 1 : -1
+
+      if (typeof aValue === 'number' && typeof bValue === 'number') {
+        return (aValue - bValue) * direction
+      }
+
+      return String(aValue).localeCompare(String(bValue), 'zh-CN') * direction
+    })
+  }, [balanceMap, filteredCredentials, sortDirection, sortKey])
+
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const totalPages = Math.ceil(sortedCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const currentCredentials = sortedCredentials.slice(startIndex, endIndex)
+  const currentPageIds = currentCredentials.map(credential => credential.id)
+  const allCurrentPageSelected = currentPageIds.length > 0 && currentPageIds.every(id => selectedIds.has(id))
+  const disabledCredentialCount = allCredentials.filter(credential => credential.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
+    const credential = allCredentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
 
-  // 当凭据列表变化时重置到第一页
+  // 当凭据列表或展示条件变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [authFilter, data?.credentials.length, profileFilter, searchTerm, sortDirection, sortKey, statusFilter])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -93,6 +201,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const validIds = new Set(data.credentials.map(credential => credential.id))
+
+    setSelectedIds(prev => {
+      if (prev.size === 0) {
+        return prev
+      }
+      const next = new Set<number>()
+      prev.forEach(id => {
+        if (validIds.has(id)) {
+          next.add(id)
+        }
+      })
+      return next.size === prev.size ? prev : next
+    })
 
     setBalanceMap(prev => {
       const next = new Map<number, BalanceResponse>()
@@ -150,8 +271,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedIds(newSelected)
   }
 
+  const toggleSelectCurrentPage = () => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (allCurrentPageSelected) {
+        currentPageIds.forEach(id => next.delete(id))
+      } else {
+        currentPageIds.forEach(id => next.add(id))
+      }
+      return next
+    })
+  }
+
   const deselectAll = () => {
     setSelectedIds(new Set())
+  }
+
+  const handleSort = (key: CredentialSortKey) => {
+    if (sortKey === key) {
+      setSortDirection(direction => direction === 'asc' ? 'desc' : 'asc')
+      return
+    }
+    setSortKey(key)
+    setSortDirection(key === 'importedAt' || key === 'lastUsedAt' ? 'desc' : 'asc')
   }
 
   // 批量删除（仅删除已禁用项）
@@ -162,7 +304,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
+      const credential = allCredentials.find(c => c.id === id)
       return Boolean(credential?.disabled)
     })
 
@@ -219,7 +361,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const failedIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
+      const cred = allCredentials.find(c => c.id === id)
       return cred && cred.failureCount > 0
     })
 
@@ -267,7 +409,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     const enabledIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
+      const cred = allCredentials.find(c => c.id === id)
       return cred && !cred.disabled
     })
 
@@ -306,12 +448,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    if (allCredentials.length === 0) {
       toast.error('没有可清除的凭据')
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
+    const disabledCredentials = allCredentials.filter(credential => credential.disabled)
 
     if (disabledCredentials.length === 0) {
       toast.error('没有可清除的已禁用凭据')
@@ -621,7 +763,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
@@ -633,7 +775,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -671,7 +813,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   验活中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {allCredentials.length > 0 && (
                 <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
@@ -682,7 +824,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {allCredentials.length > 0 && (
                 <Button
                   onClick={handleClearAll}
                   size="sm"
@@ -709,27 +851,75 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+
+          {allCredentials.length > 0 && (
+            <div className="grid gap-3 md:grid-cols-[minmax(240px,1fr)_150px_150px_150px]">
+              <Input
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+                placeholder="搜索名称、邮箱、用户、ARN、端点"
+                className="h-9"
+              />
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="all">全部状态</option>
+                <option value="enabled">仅启用</option>
+                <option value="disabled">仅禁用</option>
+                <option value="current">当前活跃</option>
+                <option value="failed">有异常</option>
+              </select>
+              <select
+                value={authFilter}
+                onChange={(event) => setAuthFilter(event.target.value)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="all">全部认证</option>
+                {authOptions.map(method => (
+                  <option key={method} value={method}>{method === 'api_key' ? 'API Key' : method}</option>
+                ))}
+              </select>
+              <select
+                value={profileFilter}
+                onChange={(event) => setProfileFilter(event.target.value as ProfileFilter)}
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="all">全部 ARN</option>
+                <option value="has">已有 ARN</option>
+                <option value="missing">缺失 ARN</option>
+              </select>
+            </div>
+          )}
+
+          {allCredentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
                 暂无凭据
               </CardContent>
             </Card>
+          ) : sortedCredentials.length === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-muted-foreground">
+                没有匹配当前过滤条件的凭据
+              </CardContent>
+            </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {currentCredentials.map((credential) => (
-                  <CredentialCard
-                    key={credential.id}
-                    credential={credential}
-                    onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
-                    balance={balanceMap.get(credential.id) || null}
-                    loadingBalance={loadingBalanceIds.has(credential.id)}
-                  />
-                ))}
-              </div>
+              <CredentialsTable
+                credentials={currentCredentials}
+                selectedIds={selectedIds}
+                allSelected={allCurrentPageSelected}
+                onToggleSelect={toggleSelect}
+                onToggleSelectAll={toggleSelectCurrentPage}
+                onViewBalance={handleViewBalance}
+                balanceMap={balanceMap}
+                loadingBalanceIds={loadingBalanceIds}
+                sortKey={sortKey}
+                sortDirection={sortDirection}
+                onSort={handleSort}
+              />
 
               {/* 分页控件 */}
               {totalPages > 1 && (
@@ -743,7 +933,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（共 {sortedCredentials.length} 个，全部 {allCredentials.length} 个）
                   </span>
                   <Button
                     variant="outline"

@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetNameRequest,
+        SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -50,6 +50,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/name
+/// 设置凭据名称
+pub async fn set_credential_name(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetNameRequest>,
+) -> impl IntoResponse {
+    match state.service.set_name(id, payload.name) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 名称已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

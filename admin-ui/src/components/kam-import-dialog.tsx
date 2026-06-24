@@ -30,6 +30,7 @@ interface KamAccount {
     region?: string
     authMethod?: string
     startUrl?: string
+    profileArn?: string
   }
   machineId?: string
   status?: string
@@ -70,6 +71,7 @@ function normalizeKamAccount(item: unknown): unknown {
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
 
     return {
       email,
@@ -84,6 +86,7 @@ function normalizeKamAccount(item: unknown): unknown {
         region,
         authMethod,
         startUrl,
+        profileArn,
       },
     }
   }
@@ -275,12 +278,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           }
 
           const addedCred = await addCredential({
+            name: account.nickname?.trim() || account.email?.trim() || undefined,
+            email: account.email?.trim() || undefined,
+            userName: account.nickname?.trim() || account.email?.trim() || account.userId?.trim() || undefined,
             refreshToken: token,
             authMethod,
             authRegion: cred.region?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            profileArn: cred.profileArn?.trim() || undefined,
           })
 
           addedCredId = addedCred.credentialId
@@ -416,7 +423,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1",\n    "profileArn": "..."\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1",\n        "profileArn": "..."\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

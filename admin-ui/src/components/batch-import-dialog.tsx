@@ -19,6 +19,9 @@ interface BatchImportDialogProps {
 }
 
 interface CredentialInput {
+  name?: string
+  email?: string
+  userName?: string
   refreshToken?: string
   clientId?: string
   clientSecret?: string
@@ -27,6 +30,7 @@ interface CredentialInput {
   apiRegion?: string
   priority?: number
   machineId?: string
+  profileArn?: string
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
@@ -227,6 +231,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           if (isApiKeyCred) {
             // API Key 凭据
             const addedCred = await addCredential({
+              name: cred.name?.trim() || cred.email?.trim() || cred.userName?.trim() || undefined,
+              email: cred.email?.trim() || undefined,
+              userName: cred.userName?.trim() || undefined,
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
@@ -274,6 +281,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           }
 
           const addedCred = await addCredential({
+            name: cred.name?.trim() || cred.email?.trim() || cred.userName?.trim() || undefined,
+            email: cred.email?.trim() || undefined,
+            userName: cred.userName?.trim() || undefined,
             refreshToken: token,
             authMethod,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
@@ -282,6 +292,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            profileArn: cred.profileArn?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
           })
 
@@ -422,7 +433,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"...","profileArn":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetNameRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingMode,
@@ -54,6 +55,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据名称
+export async function setCredentialName(
+  id: number,
+  name: string
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/name`,
+    { name } as SetNameRequest
   )
   return data
 }

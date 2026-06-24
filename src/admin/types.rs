@@ -24,6 +24,8 @@ pub struct CredentialsStatusResponse {
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据显示名称
+    pub name: String,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
     /// 是否被禁用
@@ -38,6 +40,10 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Profile ARN 原文
+    pub profile_arn: Option<String>,
+    /// 导入时间（RFC3339 格式）
+    pub imported_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -46,6 +52,8 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 上游返回的用户名
+    pub user_name: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -82,10 +90,21 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改凭据名称请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetNameRequest {
+    /// 新名称
+    pub name: String,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    /// 凭据名称（可选，留空时自动使用上游用户名/邮箱或凭据编号生成）
+    pub name: Option<String>,
+
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
@@ -119,6 +138,12 @@ pub struct AddCredentialRequest {
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
+
+    /// 用户名（可选，用于前端显示）
+    pub user_name: Option<String>,
+
+    /// Profile ARN（OAuth 凭据可手动提供；刷新接口返回时也会自动覆盖/补齐）
+    pub profile_arn: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
@@ -154,6 +179,17 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// 用户名（如果获取成功）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// 凭据名称
+    pub name: String,
+    /// Profile ARN（如果获取成功）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    /// 导入时间
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
 }
 
 // ============ 余额查询 ============

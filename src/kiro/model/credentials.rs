@@ -18,6 +18,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
 
+    /// 凭据显示名称（用户可编辑）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
     /// 访问令牌
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
@@ -29,6 +33,10 @@ pub struct KiroCredentials {
     /// Profile ARN
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+
+    /// 导入时间 (RFC3339 格式)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
 
     /// 过期时间 (RFC3339 格式)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +80,10 @@ pub struct KiroCredentials {
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+
+    /// 上游返回的用户名（通常为邮箱或账号名）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
 
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,9 +335,11 @@ mod tests {
     fn test_to_json() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: Some("token".to_string()),
             refresh_token: None,
             profile_arn: None,
+            imported_at: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
@@ -336,6 +350,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -441,9 +456,11 @@ mod tests {
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
+            imported_at: None,
             expires_at: None,
             auth_method: None,
             client_id: None,
@@ -454,6 +471,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -472,9 +490,11 @@ mod tests {
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
             id: None,
+            name: None,
             access_token: None,
             refresh_token: Some("test".to_string()),
             profile_arn: None,
+            imported_at: None,
             expires_at: None,
             auth_method: None,
             client_id: None,
@@ -485,6 +505,7 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -586,9 +607,11 @@ mod tests {
         // 测试序列化和反序列化的往返一致性
         let original = KiroCredentials {
             id: Some(42),
+            name: None,
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
             profile_arn: None,
+            imported_at: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
             client_id: None,
@@ -599,6 +622,7 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            user_name: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,

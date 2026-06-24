@@ -74,6 +74,7 @@ impl AdminService {
             .into_iter()
             .map(|entry| CredentialStatusItem {
                 id: entry.id,
+                name: entry.name,
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
@@ -81,10 +82,13 @@ impl AdminService {
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
+                profile_arn: entry.profile_arn,
+                imported_at: entry.imported_at,
                 refresh_token_hash: entry.refresh_token_hash,
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                user_name: entry.user_name,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -138,6 +142,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据名称
+    pub fn set_name(&self, id: u64, name: String) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_name(id, name)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -238,12 +249,12 @@ impl AdminService {
         }
 
         // 构建凭据对象
-        let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
+            name: req.name,
             access_token: None,
             refresh_token: req.refresh_token,
-            profile_arn: None,
+            imported_at: None,
             expires_at: None,
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
@@ -254,6 +265,11 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            user_name: req.user_name,
+            profile_arn: req
+                .profile_arn
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -275,6 +291,12 @@ impl AdminService {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
+        let snapshot = self.token_manager.snapshot();
+        let credential = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == credential_id);
+
         // 添加凭据后，异步触发模型目录刷新（强制刷新，绕过冷却）
         let tm = self.token_manager.clone();
         tokio::spawn(async move {
@@ -287,7 +309,13 @@ impl AdminService {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
-            email,
+            email: credential.and_then(|entry| entry.email.clone()),
+            user_name: credential.and_then(|entry| entry.user_name.clone()),
+            name: credential
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| format!("凭据 #{}", credential_id)),
+            profile_arn: credential.and_then(|entry| entry.profile_arn.clone()),
+            imported_at: credential.and_then(|entry| entry.imported_at.clone()),
         })
     }
 
@@ -585,6 +613,7 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
+            || msg.contains("缺少 profileArn")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
