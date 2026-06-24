@@ -86,6 +86,7 @@ export interface AddCredentialRequest {
   machineId?: string
   email?: string
   userName?: string
+  profileArn?: string
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string

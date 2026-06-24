@@ -254,7 +254,6 @@ impl AdminService {
             name: req.name,
             access_token: None,
             refresh_token: req.refresh_token,
-            profile_arn: None,
             imported_at: None,
             expires_at: None,
             auth_method: Some(req.auth_method),
@@ -267,6 +266,10 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             user_name: req.user_name,
+            profile_arn: req
+                .profile_arn
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -610,6 +613,7 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
+            || msg.contains("缺少 profileArn")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");

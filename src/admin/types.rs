@@ -142,6 +142,9 @@ pub struct AddCredentialRequest {
     /// 用户名（可选，用于前端显示）
     pub user_name: Option<String>,
 
+    /// Profile ARN（OAuth 凭据可手动提供；刷新接口返回时也会自动覆盖/补齐）
+    pub profile_arn: Option<String>,
+
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
 

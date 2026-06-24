@@ -123,7 +123,8 @@ IdC 认证：
    "expiresAt": "2025-12-31T02:32:45.144Z",
    "authMethod": "idc",
    "clientId": "你的clientId",
-   "clientSecret": "你的clientSecret"
+   "clientSecret": "你的clientSecret",
+   "profileArn": "arn:aws:codewhisperer:us-east-1:111112222233:profile/QWER1QAZSDFGH"
 }
 ```
 
@@ -253,6 +254,7 @@ docker-compose up
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- 如果 Token 刷新响应没有返回 `profileArn`，请在新增或导入凭据时手动提供；缺少 `profileArn` 的 OAuth 凭据不会被保存
 
 #### 单凭据格式（旧格式，向后兼容）
 

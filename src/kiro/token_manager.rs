@@ -71,6 +71,23 @@ fn trimmed_non_empty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn has_profile_arn(credentials: &KiroCredentials) -> bool {
+    credentials
+        .profile_arn
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn ensure_oauth_profile_arn(credentials: &KiroCredentials, action: &str) -> anyhow::Result<()> {
+    if !credentials.is_api_key_credential() && !has_profile_arn(credentials) {
+        bail!(
+            "OAuth 凭据缺少 profileArn，无法{}；Token 刷新成功但未返回 profileArn，请在新增或导入凭据时提供 profileArn",
+            action
+        );
+    }
+    Ok(())
+}
+
 fn fallback_credential_name(id: u64) -> String {
     format!("凭据 #{}", id)
 }
@@ -393,6 +410,8 @@ pub(crate) async fn get_usage_limits(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
         host
     );
+
+    ensure_oauth_profile_arn(credentials, "获取使用额度")?;
 
     // profileArn 是可选的，对于 API Key 凭据无需发送
     if !credentials.is_api_key_credential() {
@@ -1099,7 +1118,7 @@ impl MultiTokenManager {
         // 也刷新一次，用 refresh 响应补齐 ARN 并持久化。
         let needs_refresh = is_token_expired(credentials)
             || is_token_expiring_soon(credentials)
-            || credentials.profile_arn.is_none();
+            || !has_profile_arn(credentials);
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
@@ -1117,7 +1136,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds)
                 || is_token_expiring_soon(&current_creds)
-                || current_creds.profile_arn.is_none()
+                || !has_profile_arn(&current_creds)
             {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
@@ -1150,6 +1169,8 @@ impl MultiTokenManager {
         } else {
             credentials.clone()
         };
+
+        ensure_oauth_profile_arn(&creds, "发起 Kiro API 请求")?;
 
         let token = creds
             .access_token
@@ -1671,7 +1692,7 @@ impl MultiTokenManager {
                             }
                         })
                     },
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
+                    has_profile_arn: has_profile_arn(&e.credentials),
                     profile_arn: e.credentials.profile_arn.clone(),
                     imported_at: e.credentials.imported_at.clone(),
                     expires_at: if e.credentials.is_api_key_credential() {
@@ -1828,7 +1849,7 @@ impl MultiTokenManager {
             // 检查是否需要刷新 token
             let needs_refresh = is_token_expired(&credentials)
                 || is_token_expiring_soon(&credentials)
-                || credentials.profile_arn.is_none();
+                || !has_profile_arn(&credentials);
 
             if needs_refresh {
                 let _guard = self.refresh_lock.lock().await;
@@ -1843,7 +1864,7 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds)
                     || is_token_expiring_soon(&current_creds)
-                    || current_creds.profile_arn.is_none()
+                    || !has_profile_arn(&current_creds)
                 {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
                     let new_creds =
@@ -2023,6 +2044,12 @@ impl MultiTokenManager {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
+        let provided_profile_arn = trimmed_non_empty(new_cred.profile_arn.clone());
+        validated_cred.profile_arn = trimmed_non_empty(validated_cred.profile_arn);
+        if validated_cred.profile_arn.is_none() {
+            validated_cred.profile_arn = provided_profile_arn;
+        }
+        ensure_oauth_profile_arn(&validated_cred, "添加凭据")?;
 
         // 4. 分配新 ID
         let new_id = {
@@ -2257,6 +2284,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
         let ctx = self.try_ensure_token(id, credentials).await?;
         let token = &ctx.token;
+        let credentials = &ctx.credentials;
         let region = credentials.effective_api_region(&self.config);
         let host = format!("management.{}.kiro.dev", region);
         let url = format!("https://{}/", host);
@@ -2446,6 +2474,10 @@ mod tests {
     fn valid_credentials(token: &str) -> KiroCredentials {
         let mut credentials = KiroCredentials::default();
         credentials.access_token = Some(token.to_string());
+        credentials.profile_arn = Some(format!(
+            "arn:aws:codewhisperer:us-east-1:111112222233:profile/{}",
+            token
+        ));
         credentials.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credentials
     }
@@ -3027,12 +3059,8 @@ mod tests {
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let cred1 = valid_credentials("t1");
+        let cred2 = valid_credentials("t2");
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -3062,10 +3090,8 @@ mod tests {
         bad_cred.priority = 0;
         bad_cred.refresh_token = Some("bad".to_string());
 
-        let mut good_cred = KiroCredentials::default();
+        let mut good_cred = valid_credentials("good-token");
         good_cred.priority = 1;
-        good_cred.access_token = Some("good-token".to_string());
-        good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();

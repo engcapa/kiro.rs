@@ -30,6 +30,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
@@ -48,6 +49,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret('')
     setPriority('0')
     setMachineId('')
+    setProfileArn('')
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
@@ -89,6 +91,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
+        profileArn: isApiKey ? undefined : profileArn.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
@@ -177,6 +180,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   placeholder="请输入 Refresh Token"
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+            )}
+
+            {!isApiKey && (
+              <div className="space-y-2">
+                <label htmlFor="profileArn" className="text-sm font-medium">
+                  Profile ARN
+                </label>
+                <Input
+                  id="profileArn"
+                  placeholder="arn:aws:codewhisperer:...:profile/..."
+                  value={profileArn}
+                  onChange={(e) => setProfileArn(e.target.value)}
                   disabled={isPending}
                 />
               </div>
