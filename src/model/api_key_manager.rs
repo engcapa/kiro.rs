@@ -36,6 +36,15 @@ impl ApiKeyManager {
             .map(|entry| entry.pools.clone())
     }
 
+    /// 根据 key 值查找活跃的 API Key 条目
+    pub fn find_active_entry(&self, key: &str) -> Option<ApiKeyEntry> {
+        let config = self.config.lock();
+        config
+            .find_by_key(key)
+            .filter(|entry| !entry.disabled)
+            .cloned()
+    }
+
     /// 列出所有 API Key 条目
     pub fn list(&self) -> Vec<ApiKeyEntry> {
         let config = self.config.lock();

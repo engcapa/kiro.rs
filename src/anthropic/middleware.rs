@@ -52,6 +52,14 @@ impl AppState {
 #[derive(Debug, Clone)]
 pub struct AllowedPools(pub Vec<String>);
 
+/// 请求上下文中的 API Key 信息（由 auth middleware 注入）
+#[derive(Debug, Clone)]
+pub struct ApiKeyInfo {
+    pub name: String,
+    pub key: String,
+    pub pools: Vec<String>,
+}
+
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -60,13 +68,25 @@ pub async fn auth_middleware(
 ) -> Response {
     if let Some(key) = auth::extract_api_key(&request) {
         if auth::constant_time_eq(&key, &state.api_key) {
-            request.extensions_mut().insert(AllowedPools(vec!["default".to_string()]));
+            let info = ApiKeyInfo {
+                name: "Master Key".to_string(),
+                key: key.clone(),
+                pools: vec!["default".to_string()],
+            };
+            request.extensions_mut().insert(AllowedPools(info.pools.clone()));
+            request.extensions_mut().insert(info);
             return next.run(request).await;
         }
 
         if let Some(manager) = &state.api_key_manager {
-            if let Some(pools) = manager.find_allowed_pools(&key) {
-                request.extensions_mut().insert(AllowedPools(pools));
+            if let Some(entry) = manager.find_active_entry(&key) {
+                let info = ApiKeyInfo {
+                    name: entry.name.clone(),
+                    key,
+                    pools: entry.pools.clone(),
+                };
+                request.extensions_mut().insert(AllowedPools(entry.pools));
+                request.extensions_mut().insert(info);
                 return next.run(request).await;
             }
         }

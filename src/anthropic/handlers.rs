@@ -236,13 +236,39 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     axum::extract::Extension(allowed_pools): axum::extract::Extension<crate::anthropic::middleware::AllowedPools>,
+    axum::extract::Extension(api_key_info): axum::extract::Extension<crate::anthropic::middleware::ApiKeyInfo>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
+
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let next_credential_name = if let Some(provider) = &state.kiro_provider {
+        provider
+            .token_manager()
+            .peek_next_credential_name(
+                Some(&payload.model),
+                thinking_enabled,
+                Some(&allowed_pools.0),
+            )
+            .unwrap_or_else(|| "None".to_string())
+    } else {
+        "None".to_string()
+    };
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        api_key_name = %api_key_info.name,
+        credential_name = %next_credential_name,
+        pools = ?allowed_pools.0,
         "Received POST /v1/messages request"
     );
     // 检查 KiroProvider 是否可用
@@ -261,8 +287,6 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {

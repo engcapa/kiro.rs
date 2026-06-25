@@ -1080,6 +1080,24 @@ impl MultiTokenManager {
         }
     }
 
+    /// 预先窥视下一个会被选中的凭据名称（用于日志记录，不改变任何状态）
+    pub fn peek_next_credential_name(
+        &self,
+        model: Option<&str>,
+        require_thinking: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> Option<String> {
+        self.select_next_credential(model, require_thinking, allowed_pools)
+            .map(|(_, creds)| {
+                let name = creds.name.unwrap_or_default();
+                if name.is_empty() {
+                    creds.user_name.clone().unwrap_or_else(|| creds.email.clone().unwrap_or_default())
+                } else {
+                    name
+                }
+            })
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
     /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
