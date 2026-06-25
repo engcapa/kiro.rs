@@ -102,6 +102,14 @@ pub struct SetNameRequest {
     pub name: String,
 }
 
+/// 修改凭据所属池列表请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPoolsRequest {
+    /// 凭据所属的池列表
+    pub pools: Vec<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

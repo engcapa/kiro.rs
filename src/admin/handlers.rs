@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddApiKeyRequest, AddCredentialRequest, ApiKeyListResponse, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetNameRequest, SetPriorityRequest, SuccessResponse,
-        UpdateApiKeyRequest,
+        SetLoadBalancingModeRequest, SetNameRequest, SetPoolsRequest, SetPriorityRequest,
+        SuccessResponse, UpdateApiKeyRequest,
     },
 };
 
@@ -64,6 +64,19 @@ pub async fn set_credential_name(
 ) -> impl IntoResponse {
     match state.service.set_name(id, payload.name) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 名称已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/pools
+/// 设置凭据所属的池列表
+pub async fn set_credential_pools(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetPoolsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_pools(id, payload.pools) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 权限池已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

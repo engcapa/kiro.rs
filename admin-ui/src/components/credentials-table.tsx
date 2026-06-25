@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
   ArrowUpDown,
@@ -34,6 +34,7 @@ import {
   useSetDisabled,
   useSetName,
   useSetPriority,
+  useSetCredentialPools,
 } from '@/hooks/use-credentials'
 
 export type CredentialSortKey =
@@ -157,13 +158,39 @@ function CredentialRow({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  
+  const [editingPools, setEditingPools] = useState(false)
+  const [poolsValue, setPoolsValue] = useState((credential.pools || []).join(', '))
 
   const setDisabled = useSetDisabled()
   const setName = useSetName()
   const setPriority = useSetPriority()
+  const setCredentialPools = useSetCredentialPools()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+
+  useEffect(() => {
+    setPoolsValue((credential.pools || []).join(', '))
+  }, [credential.pools])
+
+  const handleSavePools = () => {
+    const nextPools = poolsValue
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean)
+    
+    setCredentialPools.mutate(
+      { id: credential.id, pools: nextPools },
+      {
+        onSuccess: () => {
+          toast.success('凭据资源池已更新')
+          setEditingPools(false)
+        },
+        onError: (err) => toast.error('资源池更新失败: ' + (err as Error).message),
+      }
+    )
+  }
 
   const displayName = credential.name || credential.userName || credential.email || `凭据 #${credential.id}`
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
@@ -297,18 +324,71 @@ function CredentialRow({
             {credential.userName && credential.userName !== credential.email && <span className="truncate">{credential.userName}</span>}
           </div>
         </td>
-        <td className="px-3 py-3 align-middle">
+        <td className="px-3 py-3 align-middle min-w-[180px]">
           <div className="flex flex-wrap gap-1">
-            {credential.isCurrent && <Badge variant="success">当前</Badge>}
-            {credential.disabled ? <Badge variant="destructive">禁用</Badge> : <Badge variant="outline">启用</Badge>}
-            {credential.disabledReason && <Badge variant="outline">{credential.disabledReason}</Badge>}
-            {credential.pools && credential.pools.length > 0 && (
-              <div className="flex gap-1 flex-wrap mt-1 w-full">
-                {credential.pools.map((pool) => (
-                  <Badge key={pool} variant="secondary" className="text-[10px] px-1 py-0 h-4">
-                    {pool}
-                  </Badge>
-                ))}
+            <div className="flex items-center gap-1 w-full">
+              {credential.isCurrent && <Badge variant="success">当前</Badge>}
+              {credential.disabled ? <Badge variant="destructive">禁用</Badge> : <Badge variant="outline">启用</Badge>}
+              {credential.disabledReason && <Badge variant="outline">{credential.disabledReason}</Badge>}
+            </div>
+            
+            {editingPools ? (
+              <div className="flex items-center gap-1 mt-1 w-full">
+                <Input
+                  value={poolsValue}
+                  onChange={(e) => setPoolsValue(e.target.value)}
+                  className="h-8 text-xs min-w-0 flex-1"
+                  placeholder="如: default, pro"
+                  disabled={setCredentialPools.isPending}
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0"
+                  onClick={handleSavePools}
+                  disabled={setCredentialPools.isPending}
+                >
+                  {setCredentialPools.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Check className="h-4 w-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0"
+                  onClick={() => {
+                    setEditingPools(false)
+                    setPoolsValue((credential.pools || []).join(', '))
+                  }}
+                  disabled={setCredentialPools.isPending}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 flex-wrap mt-1 w-full group/pools">
+                <div className="flex gap-1 flex-wrap flex-1">
+                  {credential.pools && credential.pools.length > 0 ? (
+                    credential.pools.map((pool) => (
+                      <Badge key={pool} variant="secondary" className="text-[10px] px-1 py-0 h-4">
+                        {pool}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground">无资源池</span>
+                  )}
+                </div>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-6 w-6 opacity-0 group-hover/pools:opacity-100 transition-opacity shrink-0"
+                  onClick={() => setEditingPools(true)}
+                  title="编辑资源池"
+                >
+                  <Pencil className="h-3 w-3" />
+                </Button>
               </div>
             )}
           </div>

@@ -162,6 +162,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 设置凭据所属的池列表
+    pub fn set_pools(&self, id: u64, pools: Vec<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_pools(id, pools)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager

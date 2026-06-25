@@ -1821,6 +1821,38 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据所属的池列表（Admin API）
+    pub fn set_pools(&self, id: u64, pools: Vec<String>) -> anyhow::Result<()> {
+        let normalized_pools: Vec<String> = pools
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .fold(Vec::new(), |mut acc, p| {
+                if !acc.contains(&p) {
+                    acc.push(p);
+                }
+                acc
+            });
+
+        let pools_to_set = if normalized_pools.is_empty() {
+            None
+        } else {
+            Some(normalized_pools)
+        };
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.pools = pools_to_set;
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {

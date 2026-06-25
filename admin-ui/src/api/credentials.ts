@@ -100,3 +100,15 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
   const { data } = await api.put<{ mode: LoadBalancingMode }>('/config/load-balancing', { mode })
   return data
 }
+
+// 设置凭据所属的池列表
+export async function setCredentialPools(
+  id: number,
+  pools: string[]
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/pools`,
+    { pools }
+  )
+  return data
+}
