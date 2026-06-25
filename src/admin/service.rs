@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::api_key_manager::ApiKeyManager;
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -34,6 +35,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    api_key_manager: Arc<ApiKeyManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -43,6 +45,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        api_key_manager: Arc<ApiKeyManager>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -53,10 +56,16 @@ impl AdminService {
 
         Self {
             token_manager,
+            api_key_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
         }
+    }
+
+    /// 获取 API Key Manager
+    pub fn api_key_manager(&self) -> &Arc<ApiKeyManager> {
+        &self.api_key_manager
     }
 
     /// 获取所有凭据状态
@@ -96,6 +105,7 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                pools: entry.pools.clone(),
             })
             .collect();
 
@@ -252,6 +262,7 @@ impl AdminService {
         let new_cred = KiroCredentials {
             id: None,
             name: req.name,
+            pools: req.pools,
             access_token: None,
             refresh_token: req.refresh_token,
             imported_at: None,

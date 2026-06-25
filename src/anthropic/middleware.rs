@@ -12,6 +12,7 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::api_key_manager::ApiKeyManager;
 
 use super::types::ErrorResponse;
 
@@ -25,15 +26,18 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// API 密钥管理器（支持多密钥和池过滤）
+    pub api_key_manager: Option<Arc<ApiKeyManager>>,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool, api_key_manager: Option<Arc<ApiKeyManager>>) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            api_key_manager,
         }
     }
 
@@ -44,19 +48,32 @@ impl AppState {
     }
 }
 
+/// 请求上下文中的允许池列表（由 auth middleware 注入）
+#[derive(Debug, Clone)]
+pub struct AllowedPools(pub Vec<String>);
+
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+    if let Some(key) = auth::extract_api_key(&request) {
+        if auth::constant_time_eq(&key, &state.api_key) {
+            request.extensions_mut().insert(AllowedPools(vec!["default".to_string()]));
+            return next.run(request).await;
+        }
+
+        if let Some(manager) = &state.api_key_manager {
+            if let Some(pools) = manager.find_allowed_pools(&key) {
+                request.extensions_mut().insert(AllowedPools(pools));
+                return next.run(request).await;
+            }
         }
     }
+
+    let error = ErrorResponse::authentication_error();
+    (StatusCode::UNAUTHORIZED, Json(error)).into_response()
 }
 
 /// CORS 中间件层

@@ -302,6 +302,15 @@ function CredentialRow({
             {credential.isCurrent && <Badge variant="success">当前</Badge>}
             {credential.disabled ? <Badge variant="destructive">禁用</Badge> : <Badge variant="outline">启用</Badge>}
             {credential.disabledReason && <Badge variant="outline">{credential.disabledReason}</Badge>}
+            {credential.pools && credential.pools.length > 0 && (
+              <div className="flex gap-1 flex-wrap mt-1 w-full">
+                {credential.pools.map((pool) => (
+                  <Badge key={pool} variant="secondary" className="text-[10px] px-1 py-0 h-4">
+                    {pool}
+                  </Badge>
+                ))}
+              </div>
+            )}
           </div>
         </td>
         <td className="px-3 py-3 align-middle">
@@ -466,7 +475,7 @@ export function CredentialsTable({
                 <Checkbox checked={allSelected} onCheckedChange={onToggleSelectAll} />
               </th>
               <SortableHeader label="名称" sortKey="name" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
-              <SortableHeader label="状态" sortKey="status" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
+              <SortableHeader label="状态与池" sortKey="status" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="认证" sortKey="authMethod" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="优先级" sortKey="priority" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="余额" sortKey="remaining" activeKey={sortKey} direction={sortDirection} onSort={onSort} />

@@ -1,4 +1,5 @@
 use kiro_rs::{admin, admin_ui, anthropic, http_client, kiro, model, token};
+use kiro_rs::model::api_key_manager::ApiKeyManager;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,11 +174,21 @@ async fn main() {
 
 
 
+    let api_keys_path = "api_keys.json"; // Default
+    let api_key_manager = match ApiKeyManager::new(api_keys_path.into()) {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(e) => {
+            tracing::warn!("Failed to load API keys manager: {}", e);
+            None
+        }
+    };
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        api_key_manager.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -194,7 +205,7 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), api_key_manager.clone().unwrap(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

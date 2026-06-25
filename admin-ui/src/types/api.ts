@@ -31,6 +31,7 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  pools: string[]
 }
 
 // 余额响应
@@ -92,6 +93,7 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  pools?: string[]
 }
 
 // 添加凭据响应
@@ -104,4 +106,29 @@ export interface AddCredentialResponse {
   userName?: string
   profileArn?: string
   importedAt?: string
+}
+
+export interface ApiKeyEntry {
+  id: number
+  name: string
+  key: string
+  pools: string[]
+  disabled: boolean
+  createdAt?: string
+}
+
+export interface AddApiKeyRequest {
+  name: string
+  pools?: string[]
+  key?: string
+}
+
+export interface UpdateApiKeyRequest {
+  name?: string
+  pools?: string[]
+  disabled?: boolean
+}
+
+export interface ApiKeyListResponse {
+  keys: ApiKeyEntry[]
 }

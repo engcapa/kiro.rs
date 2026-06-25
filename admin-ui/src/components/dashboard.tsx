@@ -17,6 +17,7 @@ import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingM
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import { ApiKeysManager } from '@/components/api-keys-manager'
 
 interface DashboardProps {
   onLogout: () => void
@@ -87,6 +88,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [sortKey, setSortKey] = useState<CredentialSortKey>('priority')
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const itemsPerPage = 12
+  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys'>('credentials')
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -761,9 +763,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
+        {/* 导航 Tabs */}
+        <div className="flex gap-4 border-b mb-6">
+          <button
+            className={`pb-2 text-lg font-semibold transition-colors ${activeTab === 'credentials' ? 'border-b-2 border-primary text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            onClick={() => setActiveTab('credentials')}
+          >
+            后端凭据 (Credentials)
+          </button>
+          <button
+            className={`pb-2 text-lg font-semibold transition-colors ${activeTab === 'api-keys' ? 'border-b-2 border-primary text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            onClick={() => setActiveTab('api-keys')}
+          >
+            前端密钥 (API Keys)
+          </button>
+        </div>
+
         {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        {activeTab === 'credentials' ? (
+          <div className="space-y-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
@@ -948,6 +967,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+        ) : (
+          <ApiKeysManager />
+        )}
       </main>
 
       {/* 余额对话框 */}

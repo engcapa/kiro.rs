@@ -235,6 +235,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<crate::anthropic::middleware::AllowedPools>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -275,7 +276,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, Some(&allowed_pools.0)).await;
     }
 
     // 转换请求
@@ -362,11 +363,12 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            Some(&allowed_pools.0),
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0)).await
     }
 }
 
@@ -382,6 +384,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    allowed_pools: Option<&[String]>,
 ) -> Response {
     let stream = create_sse_stream(
         provider,
@@ -390,6 +393,7 @@ async fn handle_stream_request(
         input_tokens,
         thinking_enabled,
         tool_name_map,
+        allowed_pools.map(|s| s.to_vec()),
     );
 
     Response::builder()
@@ -446,6 +450,7 @@ fn create_sse_stream(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    allowed_pools: Option<Vec<String>>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut ctx = StreamContext::new_with_thinking(&model, input_tokens, thinking_enabled, tool_name_map);
@@ -458,7 +463,7 @@ fn create_sse_stream(
         // 2) 等待上游响应头期间用 ping 保活（覆盖长 TTFB 静默窗口）
         let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
         ping.tick().await; // 跳过立即触发的首个 tick，使首个 ping 延后一个周期
-        let connect = provider.call_api_stream(&request_body);
+        let connect = provider.call_api_stream(&request_body, allowed_pools.as_deref());
         tokio::pin!(connect);
         let response = loop {
             tokio::select! {
@@ -535,9 +540,10 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    allowed_pools: Option<&[String]>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, allowed_pools).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
@@ -931,6 +937,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<crate::anthropic::middleware::AllowedPools>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -972,7 +979,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, Some(&allowed_pools.0)).await;
     }
 
     // 转换请求
@@ -1048,11 +1055,12 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            Some(&allowed_pools.0),
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0)).await
     }
 }
 
@@ -1067,9 +1075,10 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    allowed_pools: Option<&[String]>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, allowed_pools).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };

@@ -112,22 +112,22 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, allowed_pools).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, allowed_pools).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    pub async fn call_mcp(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_retry(request_body, allowed_pools).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -135,7 +135,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None, false).await {
+            let ctx = match self.token_manager.acquire_context(None, false, allowed_pools).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -282,6 +282,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -299,7 +300,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), require_thinking)
+                .acquire_context(model.as_deref(), require_thinking, allowed_pools)
                 .await
             {
                 Ok(c) => c,
