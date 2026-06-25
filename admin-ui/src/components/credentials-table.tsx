@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
   ArrowUpDown,
@@ -12,6 +12,7 @@ import {
   Trash2,
   Wallet,
   X,
+  Copy,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -34,6 +35,7 @@ import {
   useSetDisabled,
   useSetName,
   useSetPriority,
+  useSetCredentialPools,
 } from '@/hooks/use-credentials'
 
 export type CredentialSortKey =
@@ -110,6 +112,36 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function CopyButton({ value, title }: { value: string; title?: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      toast.success('已复制到剪贴板')
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      toast.error('复制失败')
+    }
+  }
+  return (
+    <Button
+      size="icon"
+      variant="ghost"
+      className="h-5 w-5 hover:bg-muted p-0 shrink-0 ml-1 inline-flex"
+      onClick={handleCopy}
+      title={title || "复制"}
+    >
+      {copied ? (
+        <Check className="h-3 w-3 text-green-500" />
+      ) : (
+        <Copy className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+      )}
+    </Button>
+  )
+}
+
 function SortableHeader({
   label,
   sortKey,
@@ -157,13 +189,39 @@ function CredentialRow({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  
+  const [editingPools, setEditingPools] = useState(false)
+  const [poolsValue, setPoolsValue] = useState((credential.pools || []).join(', '))
 
   const setDisabled = useSetDisabled()
   const setName = useSetName()
   const setPriority = useSetPriority()
+  const setCredentialPools = useSetCredentialPools()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+
+  useEffect(() => {
+    setPoolsValue((credential.pools || []).join(', '))
+  }, [credential.pools])
+
+  const handleSavePools = () => {
+    const nextPools = poolsValue
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean)
+    
+    setCredentialPools.mutate(
+      { id: credential.id, pools: nextPools },
+      {
+        onSuccess: () => {
+          toast.success('凭据资源池已更新')
+          setEditingPools(false)
+        },
+        onError: (err) => toast.error('资源池更新失败: ' + (err as Error).message),
+      }
+    )
+  }
 
   const displayName = credential.name || credential.userName || credential.email || `凭据 #${credential.id}`
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
@@ -291,24 +349,103 @@ function CredentialRow({
               </>
             )}
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground min-w-0 max-w-[240px]">
             <span>#{credential.id}</span>
-            {credential.email && <span className="truncate">{credential.email}</span>}
-            {credential.userName && credential.userName !== credential.email && <span className="truncate">{credential.userName}</span>}
+            {credential.email && (
+              <div className="inline-flex items-center min-w-0 max-w-[180px]">
+                <span className="truncate" title={credential.email}>{credential.email}</span>
+                <CopyButton value={credential.email} title="复制邮箱" />
+              </div>
+            )}
+            {credential.userName && credential.userName !== credential.email && (
+              <div className="inline-flex items-center min-w-0 max-w-[180px]">
+                <span className="truncate" title={credential.userName}>{credential.userName}</span>
+                <CopyButton value={credential.userName} title="复制用户名" />
+              </div>
+            )}
           </div>
         </td>
-        <td className="px-3 py-3 align-middle">
+        <td className="px-3 py-3 align-middle min-w-[180px]">
           <div className="flex flex-wrap gap-1">
-            {credential.isCurrent && <Badge variant="success">当前</Badge>}
-            {credential.disabled ? <Badge variant="destructive">禁用</Badge> : <Badge variant="outline">启用</Badge>}
-            {credential.disabledReason && <Badge variant="outline">{credential.disabledReason}</Badge>}
+            <div className="flex items-center gap-1 w-full">
+              {credential.isCurrent && <Badge variant="success">当前</Badge>}
+              {credential.disabled ? <Badge variant="destructive">禁用</Badge> : <Badge variant="outline">启用</Badge>}
+              {credential.disabledReason && <Badge variant="outline">{credential.disabledReason}</Badge>}
+            </div>
+            
+            {editingPools ? (
+              <div className="flex items-center gap-1 mt-1 w-full">
+                <Input
+                  value={poolsValue}
+                  onChange={(e) => setPoolsValue(e.target.value)}
+                  className="h-8 text-xs min-w-0 flex-1"
+                  placeholder="如: default, pro"
+                  disabled={setCredentialPools.isPending}
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0"
+                  onClick={handleSavePools}
+                  disabled={setCredentialPools.isPending}
+                >
+                  {setCredentialPools.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Check className="h-4 w-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0"
+                  onClick={() => {
+                    setEditingPools(false)
+                    setPoolsValue((credential.pools || []).join(', '))
+                  }}
+                  disabled={setCredentialPools.isPending}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 flex-wrap mt-1 w-full group/pools">
+                <div className="flex gap-1 flex-wrap flex-1">
+                  {credential.pools && credential.pools.length > 0 ? (
+                    credential.pools.map((pool) => (
+                      <Badge key={pool} variant="secondary" className="text-[10px] px-1 py-0 h-4">
+                        {pool}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-[10px] text-muted-foreground">无资源池</span>
+                  )}
+                </div>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
+                  onClick={() => setEditingPools(true)}
+                  title="编辑资源池"
+                >
+                  <Pencil className="h-3 w-3" />
+                </Button>
+              </div>
+            )}
           </div>
         </td>
         <td className="px-3 py-3 align-middle">
           <div className="flex flex-col gap-1 text-sm">
             <span>{formatAuthMethod(credential.authMethod)}</span>
             <span className="text-xs text-muted-foreground">{credential.endpoint}</span>
-            {credential.hasProxy && <span className="max-w-[180px] truncate text-xs text-muted-foreground" title={credential.proxyUrl}>代理 {credential.proxyUrl}</span>}
+            {credential.hasProxy && (
+              <div className="flex items-center gap-1 mt-0.5 min-w-0 max-w-[180px]">
+                <span className="truncate text-xs text-muted-foreground flex-1" title={credential.proxyUrl}>
+                  代理 {credential.proxyUrl}
+                </span>
+                <CopyButton value={credential.proxyUrl || ''} title="复制代理地址" />
+              </div>
+            )}
           </div>
         </td>
         <td className="px-3 py-3 align-middle">
@@ -368,9 +505,12 @@ function CredentialRow({
         </td>
         <td className="max-w-[220px] px-3 py-3 align-middle">
           {credential.profileArn ? (
-            <span className="block truncate font-mono text-xs" title={credential.profileArn}>
-              {credential.profileArn}
-            </span>
+            <div className="flex items-center justify-between min-w-0 max-w-[220px]">
+              <span className="truncate font-mono text-xs flex-1" title={credential.profileArn}>
+                {credential.profileArn}
+              </span>
+              <CopyButton value={credential.profileArn} title="复制 Profile ARN" />
+            </div>
           ) : (
             <Badge variant="warning">缺失</Badge>
           )}
@@ -466,7 +606,7 @@ export function CredentialsTable({
                 <Checkbox checked={allSelected} onCheckedChange={onToggleSelectAll} />
               </th>
               <SortableHeader label="名称" sortKey="name" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
-              <SortableHeader label="状态" sortKey="status" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
+              <SortableHeader label="状态与池" sortKey="status" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="认证" sortKey="authMethod" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="优先级" sortKey="priority" activeKey={sortKey} direction={sortDirection} onSort={onSort} />
               <SortableHeader label="余额" sortKey="remaining" activeKey={sortKey} direction={sortDirection} onSort={onSort} />

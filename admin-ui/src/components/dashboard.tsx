@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Tags } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -13,10 +13,14 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useSetCredentialPools } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { usePools } from '@/hooks/use-api-keys'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import { ApiKeysManager } from '@/components/api-keys-manager'
 
 interface DashboardProps {
   onLogout: () => void
@@ -78,6 +82,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  
+  const [batchPoolsDialogOpen, setBatchPoolsDialogOpen] = useState(false)
+  const [batchPoolsValue, setBatchPoolsValue] = useState<string[]>([])
+  const [batchPoolsInput, setBatchPoolsInput] = useState('')
+  const [batchUpdatingPools, setBatchUpdatingPools] = useState(false)
+
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const [searchTerm, setSearchTerm] = useState('')
@@ -87,6 +97,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [sortKey, setSortKey] = useState<CredentialSortKey>('priority')
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const itemsPerPage = 12
+  const [activeTab, setActiveTab] = useState<'credentials' | 'api-keys'>('credentials')
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -100,6 +111,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const setCredentialPools = useSetCredentialPools()
+  const { data: poolsData } = usePools()
+  const availablePools = poolsData || []
 
   const allCredentials = data?.credentials || []
 
@@ -398,6 +412,53 @@ export function Dashboard({ onLogout }: DashboardProps) {
       toast.warning(`成功 ${successCount} 个，失败 ${failCount} 个`)
     }
 
+    deselectAll()
+  }
+
+  // 批量修改资源池
+  const handleBatchUpdatePools = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要修改的凭据')
+      return
+    }
+
+    setBatchUpdatingPools(true)
+    let successCount = 0
+    let failCount = 0
+
+    const ids = Array.from(selectedIds)
+    for (const id of ids) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          setCredentialPools.mutate(
+            { id, pools: batchPoolsValue },
+            {
+              onSuccess: () => {
+                successCount++
+                resolve()
+              },
+              onError: (err) => {
+                failCount++
+                reject(err)
+              }
+            }
+          )
+        })
+      } catch (error) {
+        // 错误已处理
+      }
+    }
+
+    setBatchUpdatingPools(false)
+    setBatchPoolsDialogOpen(false)
+    setBatchPoolsValue([])
+    
+    if (failCount === 0) {
+      toast.success(`成功更新 ${successCount} 个凭据的资源池`)
+    } else {
+      toast.warning(`更新凭据资源池：成功 ${successCount} 个，失败 ${failCount} 个`)
+    }
+    
     deselectAll()
   }
 
@@ -761,9 +822,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         </div>
 
+        {/* 导航 Tabs */}
+        <div className="flex gap-4 border-b mb-6">
+          <button
+            className={`pb-2 text-lg font-semibold transition-colors ${activeTab === 'credentials' ? 'border-b-2 border-primary text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            onClick={() => setActiveTab('credentials')}
+          >
+            后端凭据 (Credentials)
+          </button>
+          <button
+            className={`pb-2 text-lg font-semibold transition-colors ${activeTab === 'api-keys' ? 'border-b-2 border-primary text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            onClick={() => setActiveTab('api-keys')}
+          >
+            前端密钥 (API Keys)
+          </button>
+        </div>
+
         {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        {activeTab === 'credentials' ? (
+          <div className="space-y-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
@@ -794,6 +872,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
+                  </Button>
+                  <Button onClick={() => setBatchPoolsDialogOpen(true)} size="sm" variant="outline">
+                    <Tags className="h-4 w-4 mr-2" />
+                    批量修改池
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
@@ -948,6 +1030,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+        ) : (
+          <ApiKeysManager />
+        )}
       </main>
 
       {/* 余额对话框 */}
@@ -984,6 +1069,114 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      {/* 批量修改资源池对话框 */}
+      <Dialog open={batchPoolsDialogOpen} onOpenChange={(open: boolean) => {
+        if (!open) {
+          setBatchPoolsValue([])
+          setBatchPoolsInput('')
+        }
+        setBatchPoolsDialogOpen(open)
+      }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>批量修改权限池</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-muted-foreground">
+              修改选中的 <strong>{selectedIds.size}</strong> 个凭据所属的资源池。这会<strong>替换</strong>它们原有的资源池。
+            </p>
+            
+            <div className="space-y-3">
+              <label className="text-sm font-medium">选择权限池 (Pools)</label>
+              {(() => {
+                const allOptions = Array.from(new Set([...availablePools, ...batchPoolsValue])).filter(Boolean)
+                if (allOptions.length === 0) {
+                  return <p className="text-xs text-muted-foreground">暂无可用的凭据池，请在下方新增</p>
+                }
+                return (
+                  <div className="grid grid-cols-2 gap-2 p-3 border rounded-md bg-muted/20 max-h-[160px] overflow-y-auto">
+                    {allOptions.map(pool => {
+                      const isChecked = batchPoolsValue.includes(pool)
+                      return (
+                        <div key={pool} className="flex items-center space-x-2">
+                          <Checkbox
+                            id={`batch-pool-${pool}`}
+                            checked={isChecked}
+                            onCheckedChange={() => {
+                              if (isChecked) {
+                                setBatchPoolsValue(prev => prev.filter(p => p !== pool))
+                              } else {
+                                setBatchPoolsValue(prev => [...prev, pool])
+                              }
+                            }}
+                          />
+                          <label
+                            htmlFor={`batch-pool-${pool}`}
+                            className="text-sm font-medium leading-none cursor-pointer select-none truncate"
+                            title={pool}
+                          >
+                            {pool}
+                          </label>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )
+              })()}
+
+              <div className="flex gap-2">
+                <Input
+                  value={batchPoolsInput}
+                  onChange={e => setBatchPoolsInput(e.target.value)}
+                  placeholder="输入新资源池名称"
+                  className="h-9"
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      const pool = batchPoolsInput.trim()
+                      if (pool && !batchPoolsValue.includes(pool)) {
+                        setBatchPoolsValue(prev => [...prev, pool])
+                      }
+                      setBatchPoolsInput('')
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const pool = batchPoolsInput.trim()
+                    if (pool && !batchPoolsValue.includes(pool)) {
+                      setBatchPoolsValue(prev => [...prev, pool])
+                    }
+                    setBatchPoolsInput('')
+                  }}
+                  className="h-9 whitespace-nowrap"
+                >
+                  添加新池
+                </Button>
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setBatchPoolsDialogOpen(false)}
+              disabled={batchUpdatingPools}
+            >
+              取消
+            </Button>
+            <Button
+              onClick={handleBatchUpdatePools}
+              disabled={batchUpdatingPools}
+            >
+              {batchUpdatingPools ? '正在更新...' : '确认修改'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -35,6 +35,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [pools, setPools] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
@@ -54,6 +55,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setPools('')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -96,6 +98,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
+        pools: pools.split(',').map(p => p.trim()).filter(Boolean),
       },
       {
         onSuccess: (data) => {
@@ -309,6 +312,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+              </p>
+            </div>
+
+            {/* 池 (Pools) */}
+            <div className="space-y-2">
+              <label htmlFor="pools" className="text-sm font-medium">
+                所属池 (Pools)
+              </label>
+              <Input
+                id="pools"
+                placeholder="使用逗号分隔，如: pool1,pool2"
+                value={pools}
+                onChange={(e) => setPools(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。将凭据分配到指定的池中
               </p>
             </div>
 

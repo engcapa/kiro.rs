@@ -38,8 +38,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    api_key_manager: Option<std::sync::Arc<crate::model::api_key_manager::ApiKeyManager>>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, api_key_manager);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

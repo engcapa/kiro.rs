@@ -11,6 +11,7 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  setCredentialPools,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -131,3 +132,16 @@ export function useSetLoadBalancingMode() {
     },
   })
 }
+
+// 设置凭据所属的池列表
+export function useSetCredentialPools() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, pools }: { id: number; pools: string[] }) =>
+      setCredentialPools(id, pools),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+

@@ -121,6 +121,12 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据所属的池列表（可选）
+    /// 未配置时默认为 ["default"]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pools: Option<Vec<String>>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -284,6 +290,15 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    /// 获取凭据所属的有效池列表
+    /// 如果未配置 pools，返回 ["default"]
+    pub fn effective_pools(&self) -> Vec<String> {
+        match &self.pools {
+            Some(pools) if !pools.is_empty() => pools.clone(),
+            _ => vec!["default".to_string()],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +373,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            pools: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -479,6 +495,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            pools: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -513,6 +530,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            pools: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -630,6 +648,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            pools: None,
         };
 
         let json = original.to_pretty_json().unwrap();

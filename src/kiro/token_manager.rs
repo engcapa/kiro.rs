@@ -573,6 +573,8 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 凭据所属的池列表
+    pub pools: Vec<String>,
 }
 
 /// 凭据管理器状态快照
@@ -662,6 +664,16 @@ fn credential_supports(entry: &CredentialEntry, model: Option<&str>, require_thi
             } else {
                 true
             }
+        }
+    }
+}
+
+fn pool_matches(entry: &CredentialEntry, allowed_pools: Option<&[String]>) -> bool {
+    match allowed_pools {
+        None => true, // No pool filter = allow all (backward compat)
+        Some(pools) => {
+            let cred_pools = entry.credentials.effective_pools();
+            cred_pools.iter().any(|p| pools.contains(p))
         }
     }
 }
@@ -868,6 +880,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         require_thinking: bool,
+        allowed_pools: Option<&[String]>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let mode = self.load_balancing_mode.lock().clone();
@@ -875,14 +888,14 @@ impl MultiTokenManager {
 
         if mode == LOAD_BALANCING_MODE_ROUND_ROBIN {
             let current_id = *self.current_id.lock();
-            return Self::select_round_robin_entry(&entries, current_id, model, require_thinking)
+            return Self::select_round_robin_entry(&entries, current_id, model, require_thinking, allowed_pools)
                 .map(|entry| (entry.id, entry.credentials.clone()));
         }
 
         // 过滤可用凭据：未禁用 且 真实支持该模型（含 thinking 要求）
         let available: Vec<_> = entries
             .iter()
-            .filter(|e| !e.disabled && credential_supports(e, model, require_thinking))
+            .filter(|e| !e.disabled && credential_supports(e, model, require_thinking) && pool_matches(e, allowed_pools))
             .collect();
 
         if available.is_empty() {
@@ -912,6 +925,7 @@ impl MultiTokenManager {
         current_id: u64,
         model: Option<&str>,
         require_thinking: bool,
+        allowed_pools: Option<&[String]>,
     ) -> Option<&'a CredentialEntry> {
         if entries.is_empty() {
             return None;
@@ -927,7 +941,7 @@ impl MultiTokenManager {
         for offset in 0..entries.len() {
             let idx = (start + offset) % entries.len();
             let entry = &entries[idx];
-            if !entry.disabled && credential_supports(entry, model, require_thinking) {
+            if !entry.disabled && credential_supports(entry, model, require_thinking) && pool_matches(entry, allowed_pools) {
                 return Some(entry);
             }
         }
@@ -950,6 +964,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         require_thinking: bool,
+        allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -979,6 +994,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && credential_supports(e, model, require_thinking)
+                                && pool_matches(e, allowed_pools)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 } else {
@@ -989,7 +1005,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用，或 round_robin/balanced 模式需要重新选择
-                    let mut best = self.select_next_credential(model, require_thinking);
+                    let mut best = self.select_next_credential(model, require_thinking, allowed_pools);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1008,7 +1024,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, require_thinking);
+                            best = self.select_next_credential(model, require_thinking, allowed_pools);
                         }
                     }
 
@@ -1062,6 +1078,24 @@ impl MultiTokenManager {
                 }
             }
         }
+    }
+
+    /// 预先窥视下一个会被选中的凭据名称（用于日志记录，不改变任何状态）
+    pub fn peek_next_credential_name(
+        &self,
+        model: Option<&str>,
+        require_thinking: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> Option<String> {
+        self.select_next_credential(model, require_thinking, allowed_pools)
+            .map(|(_, creds)| {
+                let name = creds.name.unwrap_or_default();
+                if name.is_empty() {
+                    creds.user_name.clone().unwrap_or_else(|| creds.email.clone().unwrap_or_default())
+                } else {
+                    name
+                }
+            })
     }
 
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
@@ -1731,6 +1765,7 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    pools: e.credentials.effective_pools(),
                 })
                 .collect(),
             current_id: visible_current_id,
@@ -1798,6 +1833,38 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.name = Some(name.to_string());
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据所属的池列表（Admin API）
+    pub fn set_pools(&self, id: u64, pools: Vec<String>) -> anyhow::Result<()> {
+        let normalized_pools: Vec<String> = pools
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .fold(Vec::new(), |mut acc, p| {
+                if !acc.contains(&p) {
+                    acc.push(p);
+                }
+                acc
+            });
+
+        let pools_to_set = if normalized_pools.is_empty() {
+            None
+        } else {
+            Some(normalized_pools)
+        };
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.pools = pools_to_set;
         }
 
         self.persist_credentials()?;
@@ -2085,6 +2152,7 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.endpoint = new_cred.endpoint;
+        validated_cred.pools = new_cred.pools;
 
         {
             let mut entries = self.entries.lock();
@@ -2349,7 +2417,7 @@ impl MultiTokenManager {
 
     /// 获取最新的 Kiro 模型目录元数据
     pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
-        let ctx = self.acquire_context(None, false).await?;
+        let ctx = self.acquire_context(None, false, None).await?;
         self.fetch_model_catalog_for_credential(ctx.id, &ctx.credentials).await
     }
 
@@ -2601,6 +2669,23 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_preserves_pools() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut api_key_cred = KiroCredentials::default();
+        api_key_cred.kiro_api_key = Some("ksk_test_key_with_pools".to_string());
+        api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.pools = Some(vec!["pro".to_string(), "backup".to_string()]);
+
+        let id = manager.add_credential(api_key_cred).await.unwrap();
+        let snapshot = manager.snapshot();
+        let added = snapshot.entries.iter().find(|entry| entry.id == id).unwrap();
+
+        assert_eq!(added.pools, vec!["pro", "backup"]);
     }
 
     #[tokio::test]
@@ -2870,10 +2955,45 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 1);
-        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 2);
-        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 3);
-        assert_eq!(manager.acquire_context(None, false).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 1);
+        assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 2);
+        assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 3);
+        assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_filters_by_allowed_pools() {
+        let config = Config::default();
+        let mut free_cred = valid_credentials("free-token");
+        free_cred.pools = Some(vec!["free".to_string()]);
+        let mut pro_cred = valid_credentials("pro-token");
+        pro_cred.pools = Some(vec!["pro".to_string(), "backup".to_string()]);
+        let manager =
+            MultiTokenManager::new(config, vec![free_cred, pro_cred], None, None, false).unwrap();
+
+        let allowed_pools = vec!["pro".to_string()];
+        let ctx = manager
+            .acquire_context(None, false, Some(&allowed_pools))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "pro-token");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_errors_when_allowed_pools_do_not_match() {
+        let config = Config::default();
+        let mut cred = valid_credentials("free-token");
+        cred.pools = Some(vec!["free".to_string()]);
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let allowed_pools = vec!["pro".to_string()];
+        let result = manager
+            .acquire_context(None, false, Some(&allowed_pools))
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -2888,11 +3008,11 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None, false).await.unwrap();
+        let first = manager.acquire_context(None, false, None).await.unwrap();
         assert_eq!(first.id, 1);
         assert!(manager.report_failure(first.id));
 
-        let second = manager.acquire_context(None, false).await.unwrap();
+        let second = manager.acquire_context(None, false, None).await.unwrap();
         assert_eq!(second.id, 2);
     }
 
@@ -2912,11 +3032,11 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None, false).await.unwrap();
+        let first = manager.acquire_context(None, false, None).await.unwrap();
         assert_eq!(first.id, 1);
         assert!(manager.report_quota_exhausted(first.id));
 
-        let second = manager.acquire_context(None, false).await.unwrap();
+        let second = manager.acquire_context(None, false, None).await.unwrap();
         assert_eq!(second.id, 2);
     }
 
@@ -2937,7 +3057,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = manager.acquire_context(Some("claude-opus"), false).await.unwrap();
+        let ctx = manager.acquire_context(Some("claude-opus"), false, None).await.unwrap();
         assert_eq!(ctx.id, 2);
     }
 
@@ -2992,18 +3112,41 @@ mod tests {
 
         // opus-4.8 + thinking：仅 #3 支持，多次请求都应稳定落 #3
         for _ in 0..3 {
-            let ctx = manager.acquire_context(Some("claude-opus-4.8"), true).await.unwrap();
+            let ctx = manager.acquire_context(Some("claude-opus-4.8"), true, None).await.unwrap();
             assert_eq!(ctx.id, 3);
         }
         // sonnet-4.5（无 thinking）：仅 #1
-        let ctx = manager.acquire_context(Some("claude-sonnet-4.5"), false).await.unwrap();
+        let ctx = manager.acquire_context(Some("claude-sonnet-4.5"), false, None).await.unwrap();
         assert_eq!(ctx.id, 1);
         // sonnet-4.6 + thinking：仅 #2
-        let ctx = manager.acquire_context(Some("claude-sonnet-4.6"), true).await.unwrap();
+        let ctx = manager.acquire_context(Some("claude-sonnet-4.6"), true, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         // opus-4.6 + thinking：仅 #2（#3 只有 opus-4.8）
-        let ctx = manager.acquire_context(Some("claude-opus-4.6"), true).await.unwrap();
+        let ctx = manager.acquire_context(Some("claude-opus-4.6"), true, None).await.unwrap();
         assert_eq!(ctx.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_supports_auto_by_default() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_credentials("t1"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // set catalog without "auto"
+        manager.set_catalog_for_test(1, catalog_with(&[("claude-sonnet-4.5", false)]));
+
+        // even if "auto" is not in the catalog, it should still be supported by default
+        let ctx = manager.acquire_context(Some("auto"), false, None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+
+        let peeked = manager.peek_next_credential_name(Some("auto"), false, None);
+        assert!(peeked.is_some());
     }
 
     #[tokio::test]
@@ -3022,13 +3165,13 @@ mod tests {
 
         // 需要 thinking：排除 #1（schema 不支持 thinking），稳定落 #2
         for _ in 0..3 {
-            let ctx = manager.acquire_context(Some("claude-opus-4.6"), true).await.unwrap();
+            let ctx = manager.acquire_context(Some("claude-opus-4.6"), true, None).await.unwrap();
             assert_eq!(ctx.id, 2);
         }
         // 不需要 thinking：#1 也合格（两者轮转，至少能选到 #1）
         let ids: Vec<u64> = {
-            let a = manager.acquire_context(Some("claude-opus-4.6"), false).await.unwrap().id;
-            let b = manager.acquire_context(Some("claude-opus-4.6"), false).await.unwrap().id;
+            let a = manager.acquire_context(Some("claude-opus-4.6"), false, None).await.unwrap().id;
+            let b = manager.acquire_context(Some("claude-opus-4.6"), false, None).await.unwrap().id;
             vec![a, b]
         };
         assert!(ids.contains(&1));
@@ -3048,7 +3191,7 @@ mod tests {
 
         // 请求 opus-4.8：无凭据支持 → 明确报错且提及模型名（不静默降级）
         let err = manager
-            .acquire_context(Some("claude-opus-4.8"), false)
+            .acquire_context(Some("claude-opus-4.8"), false, None)
             .await
             .err()
             .unwrap()
@@ -3076,7 +3219,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, false).await.unwrap();
+        let ctx = manager.acquire_context(None, false, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3096,7 +3239,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, false).await.unwrap();
+        let ctx = manager.acquire_context(None, false, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3142,7 +3285,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None, false).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, false, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -3182,7 +3325,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None, false).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, false, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

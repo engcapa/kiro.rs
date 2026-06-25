@@ -173,6 +173,13 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
+                {credential.pools && credential.pools.length > 0 && (
+                  <div className="flex gap-1 ml-auto">
+                    {credential.pools.map(pool => (
+                      <Badge key={pool} variant="secondary" className="text-[10px]">{pool}</Badge>
+                    ))}
+                  </div>
+                )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
