@@ -2102,6 +2102,7 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.endpoint = new_cred.endpoint;
+        validated_cred.pools = new_cred.pools;
 
         {
             let mut entries = self.entries.lock();
@@ -2621,6 +2622,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_credential_preserves_pools() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut api_key_cred = KiroCredentials::default();
+        api_key_cred.kiro_api_key = Some("ksk_test_key_with_pools".to_string());
+        api_key_cred.auth_method = Some("api_key".to_string());
+        api_key_cred.pools = Some(vec!["pro".to_string(), "backup".to_string()]);
+
+        let id = manager.add_credential(api_key_cred).await.unwrap();
+        let snapshot = manager.snapshot();
+        let added = snapshot.entries.iter().find(|entry| entry.id == id).unwrap();
+
+        assert_eq!(added.pools, vec!["pro", "backup"]);
+    }
+
+    #[tokio::test]
     async fn test_add_credential_reject_duplicate_api_key() {
         let config = Config::default();
 
@@ -2891,6 +2909,41 @@ mod tests {
         assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 2);
         assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 3);
         assert_eq!(manager.acquire_context(None, false, None).await.unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_filters_by_allowed_pools() {
+        let config = Config::default();
+        let mut free_cred = valid_credentials("free-token");
+        free_cred.pools = Some(vec!["free".to_string()]);
+        let mut pro_cred = valid_credentials("pro-token");
+        pro_cred.pools = Some(vec!["pro".to_string(), "backup".to_string()]);
+        let manager =
+            MultiTokenManager::new(config, vec![free_cred, pro_cred], None, None, false).unwrap();
+
+        let allowed_pools = vec!["pro".to_string()];
+        let ctx = manager
+            .acquire_context(None, false, Some(&allowed_pools))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "pro-token");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_errors_when_allowed_pools_do_not_match() {
+        let config = Config::default();
+        let mut cred = valid_credentials("free-token");
+        cred.pools = Some(vec!["free".to_string()]);
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let allowed_pools = vec!["pro".to_string()];
+        let result = manager
+            .acquire_context(None, false, Some(&allowed_pools))
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

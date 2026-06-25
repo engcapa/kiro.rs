@@ -7,11 +7,11 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, export_model_catalog, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode, reset_failure_count,
+        add_api_key, add_credential, delete_api_key, delete_credential, export_model_catalog,
+        force_refresh_token, get_all_api_keys, get_all_credentials, get_all_pools,
+        get_credential_balance, get_load_balancing_mode, reset_failure_count,
         set_credential_disabled, set_credential_name, set_credential_priority,
-        set_load_balancing_mode,
-        get_all_api_keys, add_api_key, update_api_key, delete_api_key, get_all_pools
+        set_load_balancing_mode, update_api_key,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -53,8 +53,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
         .route("/catalog/export", post(export_model_catalog))
+        .route("/api-keys", get(get_all_api_keys).post(add_api_key))
+        .route(
+            "/api-keys/{id}",
+            axum::routing::put(update_api_key).delete(delete_api_key),
+        )
         .route("/api_keys", get(get_all_api_keys).post(add_api_key))
-        .route("/api_keys/{id}", axum::routing::put(update_api_key).delete(delete_api_key))
+        .route(
+            "/api_keys/{id}",
+            axum::routing::put(update_api_key).delete(delete_api_key),
+        )
         .route("/pools", get(get_all_pools))
         .layer(middleware::from_fn_with_state(
             state.clone(),

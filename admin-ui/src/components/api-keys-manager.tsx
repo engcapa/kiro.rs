@@ -85,8 +85,8 @@ function ApiKeyCard({ apiKey }: { apiKey: ApiKeyEntry }) {
     updateApiKey.mutate(
       { id: apiKey.id, req: { name: nextName } },
       {
-        onSuccess: (res) => {
-          toast.success(res.message)
+        onSuccess: () => {
+          toast.success('API Key 名称已更新')
           setEditingName(false)
         },
         onError: (err) => toast.error('更新失败: ' + extractErrorMessage(err)),
@@ -98,7 +98,7 @@ function ApiKeyCard({ apiKey }: { apiKey: ApiKeyEntry }) {
     updateApiKey.mutate(
       { id: apiKey.id, req: { disabled: !apiKey.disabled } },
       {
-        onSuccess: (res) => toast.success(res.message),
+        onSuccess: () => toast.success(!apiKey.disabled ? 'API Key 已禁用' : 'API Key 已启用'),
         onError: (err) => toast.error('更新失败: ' + extractErrorMessage(err)),
       }
     )
@@ -233,9 +233,9 @@ function AddApiKeyDialog({ open, onOpenChange }: { open: boolean, onOpenChange: 
       },
       {
         onSuccess: (data) => {
-          toast.success(data.message)
+          toast.success('API Key 已添加')
           if (data.key) {
-            toast.info(`生成的 API Key: ${data.key}`, { duration: 10000 })
+            toast.info(`API Key: ${data.key}`, { duration: 10000 })
           }
           onOpenChange(false)
           setName('')

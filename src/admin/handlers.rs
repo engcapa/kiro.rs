@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetNameRequest,
-        SetPriorityRequest, SuccessResponse,
-        AddApiKeyRequest, UpdateApiKeyRequest, ApiKeyListResponse,
+        AddApiKeyRequest, AddCredentialRequest, ApiKeyListResponse, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetNameRequest, SetPriorityRequest, SuccessResponse,
+        UpdateApiKeyRequest,
     },
 };
 
@@ -167,57 +167,79 @@ pub async fn export_model_catalog(State(state): State<AdminState>) -> impl IntoR
     }
 }
 
-/// GET /api/admin/api_keys
+/// GET /api/admin/api-keys
 pub async fn get_all_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
     let keys = state.service.api_key_manager().list();
     Json(ApiKeyListResponse { keys })
 }
 
-/// POST /api/admin/api_keys
+/// POST /api/admin/api-keys
 pub async fn add_api_key(
     State(state): State<AdminState>,
     Json(payload): Json<AddApiKeyRequest>,
 ) -> impl IntoResponse {
-    match state.service.api_key_manager().add(
-        payload.name,
-        payload.key,
-        Some(payload.pools),
-        false
-    ) {
+    match state
+        .service
+        .api_key_manager()
+        .add(payload.name, payload.key, Some(payload.pools), false)
+    {
         Ok(entry) => Json(entry).into_response(),
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(SuccessResponse::new(e.to_string()))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(SuccessResponse::new(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
-/// PUT /api/admin/api_keys/:id
+/// PUT /api/admin/api-keys/:id
 pub async fn update_api_key(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
     Json(payload): Json<UpdateApiKeyRequest>,
 ) -> impl IntoResponse {
-    match state.service.api_key_manager().update(id, payload.name, payload.pools, payload.disabled) {
+    match state
+        .service
+        .api_key_manager()
+        .update(id, payload.name, payload.pools, payload.disabled)
+    {
         Ok(entry) => Json(entry).into_response(),
-        Err(e) => (axum::http::StatusCode::NOT_FOUND, Json(SuccessResponse::new(e.to_string()))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(SuccessResponse::new(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
-/// DELETE /api/admin/api_keys/:id
+/// DELETE /api/admin/api-keys/:id
 pub async fn delete_api_key(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.api_key_manager().delete(id) {
         Ok(_) => Json(SuccessResponse::new(format!("API Key #{} 已删除", id))).into_response(),
-        Err(e) => (axum::http::StatusCode::NOT_FOUND, Json(SuccessResponse::new(e.to_string()))).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(SuccessResponse::new(e.to_string())),
+        )
+            .into_response(),
     }
 }
 
 /// GET /api/admin/pools
 pub async fn get_all_pools(State(state): State<AdminState>) -> impl IntoResponse {
-    let credential_pools: Vec<String> = state.service.get_all_credentials().await.credentials
+    let credential_pools: Vec<String> = state
+        .service
+        .get_all_credentials()
+        .await
+        .credentials
         .into_iter()
         .flat_map(|c| c.pools)
         .collect();
-    let pools = state.service.api_key_manager().all_pool_names(&credential_pools);
+    let pools = state
+        .service
+        .api_key_manager()
+        .all_pool_names(&credential_pools);
     Json(pools)
 }

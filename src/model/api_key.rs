@@ -64,7 +64,17 @@ impl ApiKeyConfig {
             return Ok(Self::default());
         }
 
-        let config = serde_json::from_str(&content)?;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ApiKeyConfigFile {
+            Wrapped(ApiKeyConfig),
+            Array(Vec<ApiKeyEntry>),
+        }
+
+        let config = match serde_json::from_str(&content)? {
+            ApiKeyConfigFile::Wrapped(config) => config,
+            ApiKeyConfigFile::Array(keys) => ApiKeyConfig { keys },
+        };
         Ok(config)
     }
 
@@ -187,5 +197,43 @@ mod tests {
         let json = r#"{"id": 1, "name": "test", "key": "ksk_abc"}"#;
         let entry: ApiKeyEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.pools, vec!["default"]);
+    }
+
+    #[test]
+    fn test_load_array_format() {
+        let path =
+            std::env::temp_dir().join(format!("api_key_array_{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"[{"id":1,"name":"test","key":"ksk_abc","pools":["pro"]}]"#,
+        )
+        .unwrap();
+
+        let config = ApiKeyConfig::load(&path).unwrap();
+
+        assert_eq!(config.keys.len(), 1);
+        assert_eq!(config.keys[0].key, "ksk_abc");
+        assert_eq!(config.keys[0].pools, vec!["pro"]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_load_wrapped_format() {
+        let path =
+            std::env::temp_dir().join(format!("api_key_wrapped_{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"{"keys":[{"id":1,"name":"test","key":"ksk_abc"}]}"#,
+        )
+        .unwrap();
+
+        let config = ApiKeyConfig::load(&path).unwrap();
+
+        assert_eq!(config.keys.len(), 1);
+        assert_eq!(config.keys[0].key, "ksk_abc");
+        assert_eq!(config.keys[0].pools, vec!["default"]);
+
+        let _ = std::fs::remove_file(path);
     }
 }

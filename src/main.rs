@@ -172,23 +172,20 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-
-
     let api_keys_path = "api_keys.json"; // Default
-    let api_key_manager = match ApiKeyManager::new(api_keys_path.into()) {
-        Ok(manager) => Some(Arc::new(manager)),
-        Err(e) => {
-            tracing::warn!("Failed to load API keys manager: {}", e);
-            None
-        }
-    };
+    let api_key_manager = Arc::new(
+        ApiKeyManager::new(api_keys_path.into()).unwrap_or_else(|e| {
+            tracing::error!("加载 API Key 配置失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
-        api_key_manager.clone(),
+        Some(api_key_manager.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -204,8 +201,11 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), api_key_manager.clone().unwrap(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                api_key_manager.clone(),
+                endpoint_names.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

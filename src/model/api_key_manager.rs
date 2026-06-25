@@ -18,6 +18,7 @@ impl ApiKeyManager {
     /// 从文件加载并创建管理器
     pub fn new(path: PathBuf) -> anyhow::Result<Self> {
         let config = ApiKeyConfig::load(&path)?;
+        validate_config(&config)?;
         Ok(Self {
             config: Mutex::new(config),
             path,
@@ -51,10 +52,15 @@ impl ApiKeyManager {
     ) -> anyhow::Result<ApiKeyEntry> {
         let mut config = self.config.lock();
 
-        let actual_key = key.unwrap_or_else(|| ApiKeyConfig::generate_key());
-        let actual_pools = pools
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| vec!["default".to_string()]);
+        let actual_key = match key {
+            Some(key) if !key.trim().is_empty() => key.trim().to_string(),
+            Some(_) => anyhow::bail!("API Key 不能为空"),
+            None => ApiKeyConfig::generate_key(),
+        };
+        if config.keys.iter().any(|entry| entry.key == actual_key) {
+            anyhow::bail!("API Key 已存在");
+        }
+        let actual_pools = normalize_pools(pools);
 
         let entry = ApiKeyEntry {
             id: config.next_id(),
@@ -91,11 +97,7 @@ impl ApiKeyManager {
             entry.name = name;
         }
         if let Some(pools) = pools {
-            entry.pools = if pools.is_empty() {
-                vec!["default".to_string()]
-            } else {
-                pools
-            };
+            entry.pools = normalize_pools(Some(pools));
         }
         if let Some(disabled) = disabled {
             entry.disabled = disabled;
@@ -156,6 +158,42 @@ impl ApiKeyManager {
     }
 }
 
+fn normalize_pools(pools: Option<Vec<String>>) -> Vec<String> {
+    let normalized: Vec<String> = pools
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pool| pool.trim().to_string())
+        .filter(|pool| !pool.is_empty())
+        .fold(Vec::new(), |mut acc, pool| {
+            if !acc.contains(&pool) {
+                acc.push(pool);
+            }
+            acc
+        });
+
+    if normalized.is_empty() {
+        vec!["default".to_string()]
+    } else {
+        normalized
+    }
+}
+
+fn validate_config(config: &ApiKeyConfig) -> anyhow::Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for entry in &config.keys {
+        let key = entry.key.trim();
+        if key.is_empty() {
+            anyhow::bail!("API Key #{} 不能为空", entry.id);
+        }
+        if seen.iter().any(|seen_key| *seen_key == key) {
+            anyhow::bail!("API Key 已存在: {}", key);
+        }
+        seen.push(key);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +219,84 @@ mod tests {
 
         let list = manager.list();
         assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn test_add_rejects_duplicate_key() {
+        let (manager, _path) = create_temp_manager();
+
+        manager
+            .add(
+                "Test Key".to_string(),
+                Some("ksk_duplicate".to_string()),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let err = manager
+            .add(
+                "Another Key".to_string(),
+                Some("ksk_duplicate".to_string()),
+                None,
+                false,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("API Key 已存在"));
+    }
+
+    #[test]
+    fn test_load_rejects_duplicate_keys() {
+        let path =
+            std::env::temp_dir().join(format!("api_key_duplicate_{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"{"keys":[{"id":1,"name":"one","key":"ksk_duplicate"},{"id":2,"name":"two","key":"ksk_duplicate"}]}"#,
+        )
+        .unwrap();
+
+        let err = ApiKeyManager::new(path.clone()).err().unwrap().to_string();
+
+        assert!(err.contains("API Key 已存在"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_add_rejects_empty_custom_key() {
+        let (manager, _path) = create_temp_manager();
+
+        let err = manager
+            .add("Test Key".to_string(), Some("   ".to_string()), None, false)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("API Key 不能为空"));
+    }
+
+    #[test]
+    fn test_normalizes_pools() {
+        let (manager, _path) = create_temp_manager();
+
+        let entry = manager
+            .add(
+                "Test Key".to_string(),
+                None,
+                Some(vec![
+                    " pro ".to_string(),
+                    "".to_string(),
+                    "default".to_string(),
+                    "pro".to_string(),
+                ]),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(entry.pools, vec!["pro", "default"]);
     }
 
     #[test]
@@ -244,7 +360,9 @@ mod tests {
     fn test_delete() {
         let (manager, _path) = create_temp_manager();
 
-        manager.add("ToDelete".to_string(), None, None, false).unwrap();
+        manager
+            .add("ToDelete".to_string(), None, None, false)
+            .unwrap();
         assert_eq!(manager.list().len(), 1);
 
         manager.delete(1).unwrap();

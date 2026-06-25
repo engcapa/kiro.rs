@@ -1,5 +1,6 @@
 import { api } from './client'
 import type { 
+  ApiKeyEntry,
   ApiKeyListResponse, 
   AddApiKeyRequest, 
   UpdateApiKeyRequest, 
@@ -11,13 +12,13 @@ export async function getApiKeys(): Promise<ApiKeyListResponse> {
   return data
 }
 
-export async function addApiKey(req: AddApiKeyRequest): Promise<{ success: boolean; message: string; apiKeyId: number; key: string }> {
-  const { data } = await api.post('/api-keys', req)
+export async function addApiKey(req: AddApiKeyRequest): Promise<ApiKeyEntry> {
+  const { data } = await api.post<ApiKeyEntry>('/api-keys', req)
   return data
 }
 
-export async function updateApiKey(id: number, req: UpdateApiKeyRequest): Promise<SuccessResponse> {
-  const { data } = await api.put<SuccessResponse>(`/api-keys/${id}`, req)
+export async function updateApiKey(id: number, req: UpdateApiKeyRequest): Promise<ApiKeyEntry> {
+  const { data } = await api.put<ApiKeyEntry>(`/api-keys/${id}`, req)
   return data
 }
 
