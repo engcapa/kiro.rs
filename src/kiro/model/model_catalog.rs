@@ -86,12 +86,12 @@ impl CredentialModelIndex {
 
     /// 该凭据是否拥有此 model_id（精确匹配；mapped_id 已是规范 id）
     pub fn supports(&self, model_id: &str) -> bool {
-        self.model_ids.contains(model_id)
+        model_id == "auto" || self.model_ids.contains(model_id)
     }
 
     /// 该凭据是否对此 model_id 支持 thinking
     pub fn supports_thinking(&self, model_id: &str) -> bool {
-        self.thinking_ids.contains(model_id)
+        model_id == "auto" || self.thinking_ids.contains(model_id)
     }
 }
 

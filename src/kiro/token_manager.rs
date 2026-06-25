@@ -3127,6 +3127,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_acquire_context_supports_auto_by_default() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                valid_credentials("t1"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // set catalog without "auto"
+        manager.set_catalog_for_test(1, catalog_with(&[("claude-sonnet-4.5", false)]));
+
+        // even if "auto" is not in the catalog, it should still be supported by default
+        let ctx = manager.acquire_context(Some("auto"), false, None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+
+        let peeked = manager.peek_next_credential_name(Some("auto"), false, None);
+        assert!(peeked.is_some());
+    }
+
+    #[tokio::test]
     async fn test_acquire_context_thinking_gate_excludes_non_thinking_credential() {
         // 两个凭据都有 opus-4.6，但只有 #2 的 schema 支持 thinking
         let manager = MultiTokenManager::new(
