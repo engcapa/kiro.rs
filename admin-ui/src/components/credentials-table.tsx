@@ -12,6 +12,7 @@ import {
   Trash2,
   Wallet,
   X,
+  Copy,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -109,6 +110,36 @@ function formatLastUsed(lastUsedAt: string | null): string {
   if (hours < 24) return `${hours} 小时前`
   const days = Math.floor(hours / 24)
   return `${days} 天前`
+}
+
+function CopyButton({ value, title }: { value: string; title?: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      toast.success('已复制到剪贴板')
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      toast.error('复制失败')
+    }
+  }
+  return (
+    <Button
+      size="icon"
+      variant="ghost"
+      className="h-5 w-5 hover:bg-muted p-0 shrink-0 ml-1 inline-flex"
+      onClick={handleCopy}
+      title={title || "复制"}
+    >
+      {copied ? (
+        <Check className="h-3 w-3 text-green-500" />
+      ) : (
+        <Copy className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+      )}
+    </Button>
+  )
 }
 
 function SortableHeader({
@@ -318,10 +349,20 @@ function CredentialRow({
               </>
             )}
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground min-w-0 max-w-[240px]">
             <span>#{credential.id}</span>
-            {credential.email && <span className="truncate">{credential.email}</span>}
-            {credential.userName && credential.userName !== credential.email && <span className="truncate">{credential.userName}</span>}
+            {credential.email && (
+              <div className="inline-flex items-center min-w-0 max-w-[180px]">
+                <span className="truncate" title={credential.email}>{credential.email}</span>
+                <CopyButton value={credential.email} title="复制邮箱" />
+              </div>
+            )}
+            {credential.userName && credential.userName !== credential.email && (
+              <div className="inline-flex items-center min-w-0 max-w-[180px]">
+                <span className="truncate" title={credential.userName}>{credential.userName}</span>
+                <CopyButton value={credential.userName} title="复制用户名" />
+              </div>
+            )}
           </div>
         </td>
         <td className="px-3 py-3 align-middle min-w-[180px]">
@@ -383,7 +424,7 @@ function CredentialRow({
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="h-6 w-6 opacity-0 group-hover/pools:opacity-100 transition-opacity shrink-0"
+                  className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
                   onClick={() => setEditingPools(true)}
                   title="编辑资源池"
                 >
@@ -397,7 +438,14 @@ function CredentialRow({
           <div className="flex flex-col gap-1 text-sm">
             <span>{formatAuthMethod(credential.authMethod)}</span>
             <span className="text-xs text-muted-foreground">{credential.endpoint}</span>
-            {credential.hasProxy && <span className="max-w-[180px] truncate text-xs text-muted-foreground" title={credential.proxyUrl}>代理 {credential.proxyUrl}</span>}
+            {credential.hasProxy && (
+              <div className="flex items-center gap-1 mt-0.5 min-w-0 max-w-[180px]">
+                <span className="truncate text-xs text-muted-foreground flex-1" title={credential.proxyUrl}>
+                  代理 {credential.proxyUrl}
+                </span>
+                <CopyButton value={credential.proxyUrl || ''} title="复制代理地址" />
+              </div>
+            )}
           </div>
         </td>
         <td className="px-3 py-3 align-middle">
@@ -457,9 +505,12 @@ function CredentialRow({
         </td>
         <td className="max-w-[220px] px-3 py-3 align-middle">
           {credential.profileArn ? (
-            <span className="block truncate font-mono text-xs" title={credential.profileArn}>
-              {credential.profileArn}
-            </span>
+            <div className="flex items-center justify-between min-w-0 max-w-[220px]">
+              <span className="truncate font-mono text-xs flex-1" title={credential.profileArn}>
+                {credential.profileArn}
+              </span>
+              <CopyButton value={credential.profileArn} title="复制 Profile ARN" />
+            </div>
           ) : (
             <Badge variant="warning">缺失</Badge>
           )}

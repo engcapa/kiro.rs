@@ -223,22 +223,22 @@ function ApiKeyRow({
       <td className="px-4 py-3 align-middle text-right">
         <div className="flex justify-end gap-2">
           <Button
-            size="sm"
+            size="icon"
             variant="outline"
             onClick={() => onEdit(apiKey)}
-            className="h-8 px-2"
+            className="h-8 w-8"
+            title="编辑"
           >
-            <Pencil className="h-3.5 w-3.5 mr-1" />
-            编辑
+            <Pencil className="h-4 w-4" />
           </Button>
           <Button
-            size="sm"
+            size="icon"
             variant="destructive"
             onClick={() => onDeleteClick(apiKey)}
-            className="h-8 px-2"
+            className="h-8 w-8"
+            title="删除"
           >
-            <Trash2 className="h-3.5 w-3.5 mr-1" />
-            删除
+            <Trash2 className="h-4 w-4" />
           </Button>
         </div>
       </td>
