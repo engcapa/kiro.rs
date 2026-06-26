@@ -2116,6 +2116,37 @@ impl MultiTokenManager {
         if validated_cred.profile_arn.is_none() {
             validated_cred.profile_arn = provided_profile_arn;
         }
+
+        // 自愈/验证降级机制：如果仍然没有 profile_arn，尝试使用全局默认值进行 API 验证
+        if !validated_cred.is_api_key_credential() && validated_cred.profile_arn.is_none() {
+            let auth_method = validated_cred.auth_method.as_deref().unwrap_or("social");
+            let fallback_arn = if auth_method.eq_ignore_ascii_case("idc")
+                || auth_method.eq_ignore_ascii_case("builder-id")
+                || auth_method.eq_ignore_ascii_case("iam")
+            {
+                "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+            } else {
+                "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+            };
+
+            if let Some(ref token) = validated_cred.access_token {
+                let mut test_cred = validated_cred.clone();
+                test_cred.profile_arn = Some(fallback_arn.to_string());
+                let effective_proxy = test_cred.effective_proxy(self.proxy.as_ref());
+                
+                tracing::info!("凭据缺少 profileArn 且刷新未返回，尝试使用全局默认值进行验证: {}", fallback_arn);
+                match get_usage_limits(&test_cred, &self.config, token, effective_proxy.as_ref()).await {
+                    Ok(_) => {
+                        tracing::info!("使用全局默认 profileArn 验证成功，已自动绑定该 Profile ARN");
+                        validated_cred.profile_arn = Some(fallback_arn.to_string());
+                    }
+                    Err(e) => {
+                        tracing::warn!("使用全局默认 profileArn 验证失败: {}", e);
+                    }
+                }
+            }
+        }
+
         ensure_oauth_profile_arn(&validated_cred, "添加凭据")?;
 
         // 4. 分配新 ID
