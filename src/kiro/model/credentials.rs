@@ -253,14 +253,28 @@ impl KiroCredentials {
     }
 
     pub fn canonicalize_auth_method(&mut self) {
+        // 1. 规范化 auth_method
         let auth_method = match &self.auth_method {
-            Some(m) => m,
-            None => return,
+            Some(m) => m.clone(),
+            None => "social".to_string(), // 默认为 social
         };
 
-        let canonical = canonicalize_auth_method_value(auth_method);
-        if canonical != auth_method {
-            self.auth_method = Some(canonical.to_string());
+        let canonical = canonicalize_auth_method_value(&auth_method);
+        self.auth_method = Some(canonical.to_string());
+
+        // 2. 针对 OAuth 凭据自动补齐默认 profile_arn（自愈/降级机制）
+        // 借鉴自 kiro-account-manager 开源实现，解决 Builder ID 及 Social 账号缺少 profileArn 导致的 400/403 错误
+        if !self.is_api_key_credential() {
+            let has_arn = self.profile_arn.as_deref().is_some_and(|v| !v.trim().is_empty());
+            if !has_arn {
+                if canonical.eq_ignore_ascii_case("idc") {
+                    // BuilderId / Enterprise（IdC）账号的默认全局共享 profileArn
+                    self.profile_arn = Some("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX".to_string());
+                } else {
+                    // Social（Github / Google）账号的默认全局共享 profileArn
+                    self.profile_arn = Some("arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK".to_string());
+                }
+            }
         }
     }
 
