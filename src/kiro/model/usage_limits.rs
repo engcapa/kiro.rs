@@ -4,6 +4,26 @@
 
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 用户邮箱
+    #[serde(default, alias = "mail")]
+    pub email: Option<String>,
+
+    /// 用户名
+    #[serde(default, alias = "username")]
+    pub user_name: Option<String>,
+
+    /// 显示名称
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
 /// 使用额度查询响应
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +43,10 @@ pub struct UsageLimitsResponse {
     /// 显示名称（部分上游响应会直接返回）
     #[serde(default)]
     pub display_name: Option<String>,
+
+    /// 用户信息
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
 
     /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
@@ -175,11 +199,18 @@ impl UsageLimitsResponse {
 
     /// 获取上游返回的用户邮箱
     pub fn email(&self) -> Option<&str> {
-        self.email.as_deref().or_else(|| {
-            self.subscription_info
-                .as_ref()
-                .and_then(|info| info.email.as_deref())
-        })
+        self.email
+            .as_deref()
+            .or_else(|| {
+                self.user_info
+                    .as_ref()
+                    .and_then(|info| info.email.as_deref())
+            })
+            .or_else(|| {
+                self.subscription_info
+                    .as_ref()
+                    .and_then(|info| info.email.as_deref())
+            })
     }
 
     /// 获取上游返回的用户名或显示名
@@ -188,6 +219,13 @@ impl UsageLimitsResponse {
             .as_deref()
             .or(self.display_name.as_deref())
             .or(self.account_name.as_deref())
+            .or_else(|| {
+                self.user_info.as_ref().and_then(|info| {
+                    info.user_name
+                        .as_deref()
+                        .or(info.display_name.as_deref())
+                })
+            })
             .or_else(|| {
                 self.subscription_info.as_ref().and_then(|info| {
                     info.user_name

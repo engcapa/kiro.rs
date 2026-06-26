@@ -2117,31 +2117,71 @@ impl MultiTokenManager {
             validated_cred.profile_arn = provided_profile_arn;
         }
 
-        // 自愈/验证降级机制：如果仍然没有 profile_arn，尝试使用全局默认值进行 API 验证
-        if !validated_cred.is_api_key_credential() && validated_cred.profile_arn.is_none() {
-            let auth_method = validated_cred.auth_method.as_deref().unwrap_or("social");
-            let fallback_arn = if auth_method.eq_ignore_ascii_case("idc")
-                || auth_method.eq_ignore_ascii_case("builder-id")
-                || auth_method.eq_ignore_ascii_case("iam")
-            {
-                "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
-            } else {
-                "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
-            };
+        // 自愈/验证与元数据查询机制
+        if !validated_cred.is_api_key_credential() {
+            if validated_cred.profile_arn.is_none() {
+                let auth_method = validated_cred.auth_method.as_deref().unwrap_or("social");
+                let fallback_arn = if auth_method.eq_ignore_ascii_case("idc")
+                    || auth_method.eq_ignore_ascii_case("builder-id")
+                    || auth_method.eq_ignore_ascii_case("iam")
+                {
+                    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+                } else {
+                    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+                };
 
-            if let Some(ref token) = validated_cred.access_token {
-                let mut test_cred = validated_cred.clone();
-                test_cred.profile_arn = Some(fallback_arn.to_string());
-                let effective_proxy = test_cred.effective_proxy(self.proxy.as_ref());
-                
-                tracing::info!("凭据缺少 profileArn 且刷新未返回，尝试使用全局默认值进行验证: {}", fallback_arn);
-                match get_usage_limits(&test_cred, &self.config, token, effective_proxy.as_ref()).await {
-                    Ok(_) => {
-                        tracing::info!("使用全局默认 profileArn 验证成功，已自动绑定该 Profile ARN");
-                        validated_cred.profile_arn = Some(fallback_arn.to_string());
+                if let Some(ref token) = validated_cred.access_token {
+                    let mut test_cred = validated_cred.clone();
+                    test_cred.profile_arn = Some(fallback_arn.to_string());
+                    let effective_proxy = test_cred.effective_proxy(self.proxy.as_ref());
+                    
+                    tracing::info!("凭据缺少 profileArn 且刷新未返回，尝试使用全局默认值进行验证: {}", fallback_arn);
+                    match get_usage_limits(&test_cred, &self.config, token, effective_proxy.as_ref()).await {
+                        Ok(usage_limits) => {
+                            tracing::info!("使用全局默认 profileArn 验证成功，已自动绑定该 Profile ARN");
+                            validated_cred.profile_arn = Some(fallback_arn.to_string());
+                            
+                            // 提取并更新邮箱和用户名
+                            if let Some(email) = usage_limits.email().map(str::to_string) {
+                                tracing::info!("通过 getUsageLimits 成功获取邮箱: {}", email);
+                                validated_cred.email = Some(email);
+                            }
+                            if let Some(user_name) = usage_limits.user_name().map(str::to_string) {
+                                tracing::info!("通过 getUsageLimits 成功获取用户名/显示名: {}", user_name);
+                                validated_cred.user_name = Some(user_name);
+                            }
+                            if let Some(sub_title) = usage_limits.subscription_title().map(str::to_string) {
+                                validated_cred.subscription_title = Some(sub_title);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("使用全局默认 profileArn 验证失败: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("使用全局默认 profileArn 验证失败: {}", e);
+                }
+            } else {
+                // 如果本来就有 profile_arn，我们也主动调用一次 getUsageLimits 来查询邮箱和用户名，以便自动生成凭据的 name
+                if let Some(ref token) = validated_cred.access_token {
+                    let effective_proxy = validated_cred.effective_proxy(self.proxy.as_ref());
+                    tracing::info!("凭据包含 profileArn，尝试调用 getUsageLimits 查询账户信息...");
+                    match get_usage_limits(&validated_cred, &self.config, token, effective_proxy.as_ref()).await {
+                        Ok(usage_limits) => {
+                            // 提取并更新邮箱和用户名
+                            if let Some(email) = usage_limits.email().map(str::to_string) {
+                                tracing::info!("通过 getUsageLimits 成功获取邮箱: {}", email);
+                                validated_cred.email = Some(email);
+                            }
+                            if let Some(user_name) = usage_limits.user_name().map(str::to_string) {
+                                tracing::info!("通过 getUsageLimits 成功获取用户名/显示名: {}", user_name);
+                                validated_cred.user_name = Some(user_name);
+                            }
+                            if let Some(sub_title) = usage_limits.subscription_title().map(str::to_string) {
+                                validated_cred.subscription_title = Some(sub_title);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("导入凭据时查询账户信息失败: {}", e);
+                        }
                     }
                 }
             }
@@ -2174,9 +2214,9 @@ impl MultiTokenManager {
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
-        validated_cred.email = trimmed_non_empty(new_cred.email);
-        validated_cred.user_name = trimmed_non_empty(new_cred.user_name);
-        validated_cred.name = trimmed_non_empty(new_cred.name);
+        validated_cred.email = trimmed_non_empty(validated_cred.email).or_else(|| trimmed_non_empty(new_cred.email));
+        validated_cred.user_name = trimmed_non_empty(validated_cred.user_name).or_else(|| trimmed_non_empty(new_cred.user_name));
+        validated_cred.name = trimmed_non_empty(new_cred.name).or_else(|| trimmed_non_empty(validated_cred.name));
         ensure_credential_name(new_id, &mut validated_cred);
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
