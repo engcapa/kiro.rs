@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { CredentialsTable, type CredentialSortKey, type SortDirection } from '@/components/credentials-table'
 import { BalanceDialog } from '@/components/balance-dialog'
+import { CatalogDialog } from '@/components/catalog-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
@@ -68,6 +69,7 @@ function dateValue(value?: string | null): number {
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
+  const [catalogDialogOpen, setCatalogDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -262,6 +264,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
   }
+
+  const handleViewCatalog = (id: number) => {
+    setSelectedCredentialId(id)
+    setCatalogDialogOpen(true)
+  }
+
+  const catalogCredentialLabel = useMemo(() => {
+    if (selectedCredentialId == null) return undefined
+    const c = allCredentials.find((item) => item.id === selectedCredentialId)
+    if (!c) return `凭据 #${selectedCredentialId}`
+    return c.name || c.userName || c.email || `凭据 #${c.id}`
+  }, [allCredentials, selectedCredentialId])
 
   const handleRefresh = () => {
     refetch()
@@ -996,6 +1010,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 onToggleSelect={toggleSelect}
                 onToggleSelectAll={toggleSelectCurrentPage}
                 onViewBalance={handleViewBalance}
+                onViewCatalog={handleViewCatalog}
                 balanceMap={balanceMap}
                 loadingBalanceIds={loadingBalanceIds}
                 sortKey={sortKey}
@@ -1040,6 +1055,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}
         onOpenChange={setBalanceDialogOpen}
+      />
+
+      {/* 模型目录对话框 */}
+      <CatalogDialog
+        credentialId={selectedCredentialId}
+        credentialLabel={catalogCredentialLabel}
+        open={catalogDialogOpen}
+        onOpenChange={setCatalogDialogOpen}
       />
 
       {/* 添加凭据对话框 */}

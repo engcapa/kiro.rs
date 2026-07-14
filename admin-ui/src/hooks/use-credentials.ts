@@ -7,6 +7,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialCatalog,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -31,6 +32,17 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据模型目录
+export function useCredentialCatalog(id: number | null, open: boolean) {
+  return useQuery({
+    queryKey: ['credential-catalog', id],
+    queryFn: () => getCredentialCatalog(id!),
+    enabled: open && id !== null,
+    retry: false,
+    staleTime: 60_000,
   })
 }
 

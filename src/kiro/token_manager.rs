@@ -2486,6 +2486,50 @@ impl MultiTokenManager {
         Ok(catalog)
     }
 
+    /// 获取指定凭据的模型目录（Admin API）
+    ///
+    /// - `force_refresh = false`：优先返回内存缓存；无缓存时再向上游拉取并写回
+    /// - `force_refresh = true`：忽略缓存，强制向上游 `ListAvailableModels` 拉取并更新 entry
+    ///
+    /// 返回 `(catalog, from_cache)`。
+    pub async fn get_model_catalog_for(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> anyhow::Result<(crate::kiro::model::model_catalog::KiroModelCatalog, bool)> {
+        if !force_refresh {
+            if let Some(cached) = self.catalog_for(id) {
+                return Ok(((*cached).clone(), true));
+            }
+        }
+
+        // 确认凭据存在并取出副本
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let catalog = self
+            .fetch_model_catalog_for_credential(id, &credentials)
+            .await?;
+
+        // 写回 entry，保持与 refresh_model_catalog_ext 一致
+        let index = CredentialModelIndex::from_catalog(&catalog);
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.catalog = Some(Arc::new(catalog.clone()));
+                entry.index = Some(index);
+            }
+        }
+
+        Ok((catalog, false))
+    }
+
     /// 获取最新的 Kiro 模型目录元数据
     pub async fn fetch_model_catalog(&self) -> anyhow::Result<crate::kiro::model::model_catalog::KiroModelCatalog> {
         let ctx = self.acquire_context(None, false, None).await?;

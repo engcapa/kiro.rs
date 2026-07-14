@@ -2,9 +2,10 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
+use serde::Deserialize;
 
 use super::{
     middleware::AdminState,
@@ -104,6 +105,26 @@ pub async fn get_credential_balance(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CatalogQuery {
+    /// 为 true 时忽略内存缓存，强制向上游拉取
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// GET /api/admin/credentials/:id/catalog
+/// 获取指定凭据的模型目录（ListAvailableModels）
+pub async fn get_credential_catalog(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(query): Query<CatalogQuery>,
+) -> impl IntoResponse {
+    match state.service.get_credential_catalog(id, query.refresh).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -1,6 +1,7 @@
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  CredentialCatalogResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -72,6 +73,18 @@ export async function forceRefreshToken(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 获取凭据模型目录
+export async function getCredentialCatalog(
+  id: number,
+  refresh = false
+): Promise<CredentialCatalogResponse> {
+  const { data } = await api.get<CredentialCatalogResponse>(
+    `/credentials/${id}/catalog`,
+    { params: refresh ? { refresh: true } : undefined }
+  )
   return data
 }
 

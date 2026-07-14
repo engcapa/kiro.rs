@@ -208,6 +208,22 @@ pub struct AddCredentialResponse {
     pub imported_at: Option<String>,
 }
 
+// ============ 模型目录 ============
+
+/// 凭据模型目录响应（per-credential ListAvailableModels）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialCatalogResponse {
+    /// 凭据 ID
+    pub credential_id: u64,
+    /// 数据来源：`cache`（内存缓存）或 `upstream`（刚向上游拉取）
+    pub source: String,
+    /// 默认模型
+    pub default_model: Option<crate::kiro::model::model_catalog::KiroDefaultModel>,
+    /// 模型列表
+    pub models: Vec<crate::kiro::model::model_catalog::KiroModel>,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

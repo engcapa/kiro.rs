@@ -14,8 +14,9 @@ use crate::model::api_key_manager::ApiKeyManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialCatalogResponse,
+    CredentialStatusItem, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -390,6 +391,32 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 获取指定凭据的模型目录
+    ///
+    /// `force_refresh` 为 true 时忽略缓存，向上游 `ListAvailableModels` 重新拉取。
+    pub async fn get_credential_catalog(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> Result<CredentialCatalogResponse, AdminServiceError> {
+        let (catalog, from_cache) = self
+            .token_manager
+            .get_model_catalog_for(id, force_refresh)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        Ok(CredentialCatalogResponse {
+            credential_id: id,
+            source: if from_cache {
+                "cache".to_string()
+            } else {
+                "upstream".to_string()
+            },
+            default_model: catalog.default_model,
+            models: catalog.models,
+        })
     }
 
     // ============ 余额缓存持久化 ============

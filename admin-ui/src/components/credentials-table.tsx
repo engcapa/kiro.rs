@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
   ArrowUpDown,
+  BookOpen,
   Check,
   ChevronDown,
   ChevronUp,
@@ -61,6 +62,7 @@ interface CredentialsTableProps {
   onToggleSelect: (id: number) => void
   onToggleSelectAll: () => void
   onViewBalance: (id: number) => void
+  onViewCatalog: (id: number) => void
   balanceMap: Map<number, BalanceResponse>
   loadingBalanceIds: Set<number>
   sortKey: CredentialSortKey
@@ -73,6 +75,7 @@ interface CredentialRowProps {
   selected: boolean
   onToggleSelect: () => void
   onViewBalance: (id: number) => void
+  onViewCatalog: (id: number) => void
   balance: BalanceResponse | null
   loadingBalance: boolean
 }
@@ -181,6 +184,7 @@ function CredentialRow({
   selected,
   onToggleSelect,
   onViewBalance,
+  onViewCatalog,
   balance,
   loadingBalance,
 }: CredentialRowProps) {
@@ -521,11 +525,21 @@ function CredentialRow({
         <td className="whitespace-nowrap px-3 py-3 align-middle text-sm text-muted-foreground">
           {formatLastUsed(credential.lastUsedAt)}
         </td>
-        <td className="min-w-[190px] px-3 py-3 align-middle">
+        <td className="min-w-[280px] px-3 py-3 align-middle">
           <div className="flex items-center gap-1">
             <Switch checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} title="启用/禁用" />
             <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => onViewBalance(credential.id)} title="查看余额">
               <Wallet className="h-4 w-4" />
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 px-2 gap-1 shrink-0"
+              onClick={() => onViewCatalog(credential.id)}
+              title="查看该凭据可用的模型目录"
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+              <span className="text-xs">模型</span>
             </Button>
             <Button
               size="icon"
@@ -590,6 +604,7 @@ export function CredentialsTable({
   onToggleSelect,
   onToggleSelectAll,
   onViewBalance,
+  onViewCatalog,
   balanceMap,
   loadingBalanceIds,
   sortKey,
@@ -599,7 +614,7 @@ export function CredentialsTable({
   return (
     <div className="overflow-hidden rounded-md border bg-background">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[1280px] border-collapse text-sm">
+        <table className="w-full min-w-[1320px] border-collapse text-sm">
           <thead className="border-b bg-muted/45">
             <tr>
               <th className="w-10 px-3 py-2 text-left">
@@ -625,6 +640,7 @@ export function CredentialsTable({
                 selected={selectedIds.has(credential.id)}
                 onToggleSelect={() => onToggleSelect(credential.id)}
                 onViewBalance={onViewBalance}
+                onViewCatalog={onViewCatalog}
                 balance={balanceMap.get(credential.id) || null}
                 loadingBalance={loadingBalanceIds.has(credential.id)}
               />

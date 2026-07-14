@@ -45,6 +45,38 @@ export interface BalanceResponse {
   nextResetAt: number | null
 }
 
+// 模型目录（per-credential）
+export interface TokenLimits {
+  maxInputTokens?: number | null
+  maxOutputTokens?: number | null
+}
+
+export interface PromptCaching {
+  maximumCacheCheckpointsPerRequest?: number | null
+  minimumTokensPerCacheCheckpoint?: number | null
+  supportsPromptCaching?: boolean | null
+}
+
+export interface KiroModel {
+  modelId: string
+  modelName: string
+  description?: string | null
+  rateMultiplier?: number | null
+  rateUnit?: string | null
+  supportedInputTypes?: string[] | null
+  tokenLimits?: TokenLimits | null
+  promptCaching?: PromptCaching | null
+  additionalModelRequestFieldsSchema?: Record<string, unknown> | null
+}
+
+export interface CredentialCatalogResponse {
+  credentialId: number
+  /** cache = 内存缓存；upstream = 刚向上游拉取 */
+  source: 'cache' | 'upstream' | string
+  defaultModel?: { modelId: string } | null
+  models: KiroModel[]
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean
