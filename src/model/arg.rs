@@ -11,4 +11,8 @@ pub struct Args {
     /// 凭证文件路径
     #[arg(long)]
     pub credentials: Option<String>,
+
+    /// Grok Build 凭证文件路径
+    #[arg(long)]
+    pub grok_credentials: Option<String>,
 }

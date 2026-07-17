@@ -42,6 +42,7 @@
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **Grok Build / xAI**: 提供独立的 `/grok` Anthropic 兼容接口，可调用 Grok 4.5、xAI API Token 与 Grok CLI OAuth
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
@@ -57,6 +58,7 @@
 - [配置详解](#配置详解)
   - [config.json](#configjson)
   - [credentials.json](#credentialsjson)
+  - [grok_credentials.json](#grok_credentialsjson)
   - [Region 配置](#region-配置)
   - [代理配置](#代理配置)
   - [认证方式](#认证方式)
@@ -64,6 +66,7 @@
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
+  - [Grok Build 端点 (/grok)](#grok-build-端点-grok)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
@@ -137,7 +140,9 @@ IdC 认证：
 或指定配置文件路径：
 
 ```bash
-./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
+./target/release/kiro-rs -c /path/to/config.json \
+  --credentials /path/to/credentials.json \
+  --grok-credentials /path/to/grok_credentials.json
 ```
 
 ### 4. 验证
@@ -164,7 +169,8 @@ curl http://127.0.0.1:8990/v1/messages \
 docker-compose up
 ```
 
-需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
+需要将 `config.json`、`credentials.json`（使用原 Kiro 路由时）以及
+`grok_credentials.json`（使用 `/grok` 时）挂载到容器中，具体参见 `docker-compose.yml`。
 
 ## 配置详解
 
@@ -192,6 +198,8 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `round_robin` | 负载均衡模式：`round_robin`（轮询）、`priority`（按优先级）或 `balanced`（按历史成功次数均衡） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `grokDefaultModel` | string | `grok-4.5` | `/grok` 路由的默认 Grok Build 模型；请求使用 Claude 别名或 `grok-build` 时会映射到此模型 |
+| `grokBaseUrl` | string | `https://api.x.ai/v1` | Grok Build / xAI Responses API 上游地址 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -217,7 +225,9 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "round_robin",
-   "extractThinking": true
+   "extractThinking": true,
+   "grokDefaultModel": "grok-4.5",
+   "grokBaseUrl": "https://api.x.ai/v1"
 }
 ```
 
@@ -309,6 +319,53 @@ docker-compose up
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
 
+### grok_credentials.json
+
+`/grok` 与原 Kiro 路由使用**完全独立**的凭据池，默认读取当前目录的
+`grok_credentials.json`，也可通过 `--grok-credentials` 指定路径。支持单对象或数组格式。
+
+直接使用 xAI API Token：
+
+```json
+[
+  {
+    "name": "xAI API Token",
+    "accessToken": "xai-your-api-token",
+    "authMethod": "token",
+    "priority": 0,
+    "pools": ["default"]
+  }
+]
+```
+
+也可直接导入 AIClient-2-API 保存的 Grok CLI OAuth 文件；`access_token`、
+`refresh_token`、`id_token`、`expired`、`sub`、`base_url`、`token_endpoint`
+等 snake_case 字段会自动识别，并在到期前自动刷新：
+
+```json
+{
+  "access_token": "oauth-access-token",
+  "refresh_token": "oauth-refresh-token",
+  "id_token": "optional-id-token",
+  "token_type": "Bearer",
+  "expired": "2030-01-01T00:00:00Z",
+  "auth_kind": "oauth",
+  "base_url": "https://api.x.ai/v1",
+  "token_endpoint": "https://auth.x.ai/oauth/token"
+}
+```
+
+配置了 `adminApiKey` 后，可访问 `/grok/admin`，点击 **Grok OAuth 授权** 完成
+xAI Grok CLI OAuth + PKCE 登录；成功的凭据会写入 `grok_credentials.json`。OAuth
+回调固定为 `http://127.0.0.1:56121/callback`，因此授权浏览器必须和运行本服务的主机
+处于同一网络命名空间。也可直接调用 `POST /grok/api/admin/oauth/start`，轮询
+`GET /grok/api/admin/oauth/status/:state`。
+
+按 Grok Build 的路由规则，直接 xAI API Token 默认请求
+`https://api.x.ai/v1`；本服务创建的 OAuth session 凭据默认请求
+`https://cli-chat-proxy.grok.com/v1` 并附带 CLI 所需的认证标识头。导入
+AIClient-2-API 文件时若其中已有 `base_url`，会原样保留。
+
 ### Region 配置
 
 支持多级 Region 配置，分别控制 Token 刷新和 API 请求使用的区域。
@@ -398,6 +455,23 @@ RUST_LOG=debug ./target/release/kiro-rs
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
 
+### Grok Build 端点 (/grok)
+
+`/grok` 下的接口保持与根路径相同的 Anthropic 兼容请求格式和客户端 `apiKey` 认证，
+但会转换为 xAI Grok Build 的 `POST /v1/responses` 请求并将 SSE 响应转换回来。
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/grok/v1/models` | GET | 返回 Grok Build 模型列表（默认含 `grok-4.5`） |
+| `/grok/v1/messages` | POST | Anthropic Messages → xAI Responses，支持流式、工具调用、图片与 thinking |
+| `/grok/v1/messages/count_tokens` | POST | 估算请求 Token 数量 |
+| `/grok/cc/v1/messages` | POST | Claude Code 兼容路径 |
+| `/grok/cc/v1/messages/count_tokens` | POST | Token 估算 |
+
+请求模型名为 `claude-*`、`grok-build` 或为空时，会使用 `grokDefaultModel`；已是
+`grok-*` 的模型名则原样透传。`/grok` 与根路径共用客户端 API Key 和 API Key 的资源池
+授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
+
 ### Thinking 模式
 
 支持 Claude 的 extended thinking 功能：
@@ -464,6 +538,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
 
+- **Grok Build Admin（使用相同的 `adminApiKey`，但管理独立 Grok 凭据池）**
+  - `GET/POST /grok/api/admin/credentials` - 查询或导入 xAI Token / OAuth 凭据
+  - `POST /grok/api/admin/credentials/:id/verify` - 调用 xAI `/models` 校验凭据
+  - `GET /grok/api/admin/credentials/:id/balance` - OAuth 凭据查询 Grok CLI billing；API Token 返回 `/models` 验活结果
+  - `POST /grok/api/admin/oauth/start` - 发起 Grok CLI OAuth + PKCE
+  - `GET /grok/api/admin/oauth/status/:state` - 查询授权状态
+  - `GET /grok/admin` - Grok 管理页面（与 `/admin` 使用同一构建产物）
+
 ## 注意事项
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
@@ -508,6 +590,12 @@ kiro-rs/
 │   │       ├── header.rs       # 头部解析
 │   │       ├── error.rs        # 错误类型
 │   │       └── crc.rs          # CRC 校验
+│   ├── grok/                   # Grok Build / xAI Responses 与 OAuth
+│   │   ├── converter.rs         # Anthropic → Responses 请求转换
+│   │   ├── stream.rs            # Responses SSE → Anthropic SSE
+│   │   ├── token_manager.rs     # xAI Token/OAuth 凭据池
+│   │   ├── provider.rs          # xAI 上游调用与故障转移
+│   │   └── admin.rs             # /grok/api/admin 管理接口
 │   ├── admin/                  # Admin API 模块
 │   │   ├── router.rs           # 路由配置
 │   │   ├── handlers.rs         # 请求处理器

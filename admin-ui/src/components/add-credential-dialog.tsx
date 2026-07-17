@@ -20,10 +20,14 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const isGrokAdmin = typeof window !== 'undefined' && (
+    window.location.pathname === '/grok/admin'
+    || window.location.pathname.startsWith('/grok/admin/')
+  )
   const [name, setName] = useState('')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
-  const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [authMethod, setAuthMethod] = useState<AuthMethod>(() => isGrokAdmin ? 'api_key' : 'social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
@@ -43,7 +47,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setName('')
     setRefreshToken('')
     setKiroApiKey('')
-    setAuthMethod('social')
+    setAuthMethod(isGrokAdmin ? 'api_key' : 'social')
     setAuthRegion('')
     setApiRegion('')
     setClientId('')
@@ -66,7 +70,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     // 验证必填字段
     if (isApiKey) {
       if (!kiroApiKey.trim()) {
-        toast.error('请输入 Kiro API Key')
+        toast.error(isGrokAdmin ? '请输入 xAI Token' : '请输入 Kiro API Key')
         return
       }
     } else {
@@ -85,8 +89,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         name: name.trim() || undefined,
         authMethod,
+        accessToken: isGrokAdmin && isApiKey ? kiroApiKey.trim() : undefined,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
-        kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        kiroApiKey: !isGrokAdmin && isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
@@ -117,7 +122,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>添加凭据</DialogTitle>
+          <DialogTitle>{isGrokAdmin ? '添加 Grok 凭据' : '添加凭据'}</DialogTitle>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
@@ -148,22 +153,28 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 disabled={isPending}
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="social">Social</option>
-                <option value="idc">IdC/Builder-ID/IAM</option>
-                <option value="api_key">API Key</option>
+                {isGrokAdmin ? (
+                  <option value="api_key">xAI Token</option>
+                ) : (
+                  <>
+                    <option value="social">Social</option>
+                    <option value="idc">IdC/Builder-ID/IAM</option>
+                    <option value="api_key">API Key</option>
+                  </>
+                )}
               </select>
             </div>
 
-            {/* Kiro API Key (API Key 模式) */}
+            {/* API Key / xAI Token */}
             {isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="kiroApiKey" className="text-sm font-medium">
-                  Kiro API Key <span className="text-red-500">*</span>
+                  {isGrokAdmin ? 'xAI Token' : 'Kiro API Key'} <span className="text-red-500">*</span>
                 </label>
                 <Input
                   id="kiroApiKey"
                   type="password"
-                  placeholder="格式: ksk_xxxxxxxx"
+                  placeholder={isGrokAdmin ? '粘贴 xAI API Token' : '格式: ksk_xxxxxxxx'}
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
                   disabled={isPending}
@@ -172,7 +183,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             )}
 
             {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && (
+            {!isGrokAdmin && !isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>
@@ -188,7 +199,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
-            {!isApiKey && (
+            {!isGrokAdmin && !isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="profileArn" className="text-sm font-medium">
                   Profile ARN
@@ -204,7 +215,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             )}
 
             {/* Region 配置 */}
-            <div className="space-y-2">
+            {!isGrokAdmin && <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -229,10 +240,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
               </p>
-            </div>
+            </div>}
 
             {/* IdC/Builder-ID/IAM 额外字段 */}
-            {authMethod === 'idc' && (
+            {!isGrokAdmin && authMethod === 'idc' && (
               <>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">
@@ -282,7 +293,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             </div>
 
             {/* Machine ID */}
-            <div className="space-y-2">
+            {!isGrokAdmin && <div className="space-y-2">
               <label htmlFor="machineId" className="text-sm font-medium">
                 Machine ID
               </label>
@@ -296,10 +307,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
               </p>
-            </div>
+            </div>}
 
             {/* 端点 */}
-            <div className="space-y-2">
+            {!isGrokAdmin && <div className="space-y-2">
               <label htmlFor="endpoint" className="text-sm font-medium">
                 端点
               </label>
@@ -313,7 +324,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
               </p>
-            </div>
+            </div>}
 
             {/* 池 (Pools) */}
             <div className="space-y-2">

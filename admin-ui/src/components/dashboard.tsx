@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Tags } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Tags, ShieldCheck } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -11,6 +11,7 @@ import { CredentialsTable, type CredentialSortKey, type SortDirection } from '@/
 import { BalanceDialog } from '@/components/balance-dialog'
 import { CatalogDialog } from '@/components/catalog-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
+import { GrokOAuthDialog } from '@/components/grok-oauth-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
@@ -71,6 +72,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [catalogDialogOpen, setCatalogDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [grokOauthDialogOpen, setGrokOauthDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -116,6 +118,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const setCredentialPools = useSetCredentialPools()
   const { data: poolsData } = usePools()
   const availablePools = poolsData || []
+  const isGrokAdmin = typeof window !== 'undefined' && (
+    window.location.pathname === '/grok/admin'
+    || window.location.pathname.startsWith('/grok/admin/')
+  )
 
   const allCredentials = data?.credentials || []
 
@@ -933,17 +939,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
+              {isGrokAdmin ? (
+                <Button onClick={() => setGrokOauthDialogOpen(true)} size="sm" variant="outline">
+                  <ShieldCheck className="h-4 w-4 mr-2" />
+                  Grok OAuth 授权
+                </Button>
+              ) : (
+                <>
+                  <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
+                    <FileUp className="h-4 w-4 mr-2" />
+                    Kiro Account Manager 导入
+                  </Button>
+                  <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
+                    <Upload className="h-4 w-4 mr-2" />
+                    批量导入
+                  </Button>
+                </>
+              )}
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
-                添加凭据
+                {isGrokAdmin ? '添加 xAI Token' : '添加凭据'}
               </Button>
             </div>
           </div>
@@ -1069,6 +1084,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      <GrokOAuthDialog
+        open={grokOauthDialogOpen}
+        onOpenChange={setGrokOauthDialogOpen}
       />
 
       {/* 批量导入对话框 */}

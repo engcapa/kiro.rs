@@ -3,6 +3,7 @@
 /AGENTS.md
 /config.json
 /credentials.json
+/grok_credentials.json
 /.idea
 /test.json
 /admin-ui/node_modules/

@@ -912,6 +912,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -932,6 +933,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
 ]
