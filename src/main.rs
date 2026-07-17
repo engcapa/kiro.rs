@@ -216,6 +216,23 @@ async fn main() {
             }),
     );
 
+    // Grok Build 的 `/v1/models` 目录与凭据绑定：不同 OAuth 账号/API token
+    // 可见的模型、effort 菜单和 API backend 都可能不同。目录拉取失败只保留
+    // 旧值，不影响推理凭据本身。
+    tracing::info!("正在拉取 Grok 凭据模型目录...");
+    if let Err(error) = grok_provider.refresh_model_catalog(false).await {
+        tracing::warn!(%error, "启动时拉取 Grok 模型目录失败");
+    }
+    let grok_catalog_provider = grok_provider.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+            if let Err(error) = grok_catalog_provider.refresh_model_catalog(false).await {
+                tracing::warn!(%error, "定时刷新 Grok 模型目录失败（将沿用旧目录）");
+            }
+        }
+    });
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,

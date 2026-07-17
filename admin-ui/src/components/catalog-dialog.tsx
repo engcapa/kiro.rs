@@ -49,11 +49,15 @@ function schemaProperties(model: KiroModel): Record<string, unknown> | null {
 }
 
 function modelSupportsThinking(model: KiroModel): boolean {
+  if (model.supportsReasoningEffort != null) return model.supportsReasoningEffort
   const props = schemaProperties(model)
   return Boolean(props && 'thinking' in props)
 }
 
 function extractEffortLevels(model: KiroModel): string[] {
+  if (model.reasoningEfforts && model.reasoningEfforts.length > 0) {
+    return model.reasoningEfforts.map((option) => option.value)
+  }
   const props = schemaProperties(model)
   if (!props) return []
   const effort = props.effort as { enum?: unknown } | undefined
@@ -94,6 +98,7 @@ function ModelCard({ model, defaultModelId }: { model: KiroModel; defaultModelId
                 {model.rateMultiplier}x{model.rateUnit ? ` ${model.rateUnit}` : ''}
               </Badge>
             )}
+            {model.apiBackend && <Badge variant="outline">{model.apiBackend}</Badge>}
           </div>
           <div className="font-mono text-xs text-muted-foreground truncate" title={model.modelId}>
             {model.modelId}
@@ -140,6 +145,12 @@ function ModelCard({ model, defaultModelId }: { model: KiroModel; defaultModelId
                 </Button>
               </div>
             </div>
+            {model.apiBackend && (
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Grok API Backend</div>
+                <div className="font-mono text-xs">{model.apiBackend}</div>
+              </div>
+            )}
             <div>
               <div className="text-xs text-muted-foreground mb-1">Token 限制</div>
               <div>
@@ -197,6 +208,11 @@ function ModelCard({ model, defaultModelId }: { model: KiroModel; defaultModelId
                     </Badge>
                   ))}
                 </div>
+                {model.defaultReasoningEffort && (
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    默认: {model.defaultReasoningEffort}
+                  </div>
+                )}
               </div>
             )}
           </div>

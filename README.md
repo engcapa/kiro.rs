@@ -199,7 +199,7 @@ docker-compose up
 | `loadBalancingMode` | string | `round_robin` | 负载均衡模式：`round_robin`（轮询）、`priority`（按优先级）或 `balanced`（按历史成功次数均衡） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `grokDefaultModel` | string | `grok-4.5` | `/grok` 路由的默认 Grok Build 模型；请求使用 Claude 别名或 `grok-build` 时会映射到此模型 |
-| `grokBaseUrl` | string | `https://api.x.ai/v1` | Grok Build / xAI Responses API 上游地址 |
+| `grokBaseUrl` | string | `https://api.x.ai/v1` | Grok Build / xAI 默认上游根地址；真实模型目录中的 `baseUrl` 可按模型覆盖它 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -457,20 +457,30 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ### Grok Build 端点 (/grok)
 
-`/grok` 下的接口保持与根路径相同的 Anthropic 兼容请求格式和客户端 `apiKey` 认证，
-但会转换为 xAI Grok Build 的 `POST /v1/responses` 请求并将 SSE 响应转换回来。
+`/grok` 下的接口保持与根路径相同的 Anthropic 兼容请求格式和客户端 `apiKey` 认证。
+启动时及每 10 分钟会按 **每张 Grok 凭据** 拉取 xAI `/v1/models`；目录中的模型 ID、
+`baseUrl`、`apiBackend`、以及 reasoning effort 菜单决定实际请求如何转换和路由。目录
+暂不可达不会禁用该推理凭据，并会保留上一次成功的目录。
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/grok/v1/models` | GET | 返回 Grok Build 模型列表（默认含 `grok-4.5`） |
-| `/grok/v1/messages` | POST | Anthropic Messages → xAI Responses，支持流式、工具调用、图片与 thinking |
+| `/grok/v1/models` | GET | 返回所有已加载凭据目录的模型并集；目录未加载时返回 bootstrap 清单 |
+| `/grok/v1/messages` | POST | Anthropic Messages → catalog 指定的 xAI Responses / Chat Completions / Messages，支持流式、工具调用、图片与 thinking |
 | `/grok/v1/messages/count_tokens` | POST | 估算请求 Token 数量 |
 | `/grok/cc/v1/messages` | POST | Claude Code 兼容路径 |
 | `/grok/cc/v1/messages/count_tokens` | POST | Token 估算 |
 
-请求模型名为 `claude-*`、`grok-build` 或为空时，会使用 `grokDefaultModel`；已是
-`grok-*` 的模型名则原样透传。`/grok` 与根路径共用客户端 API Key 和 API Key 的资源池
-授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
+请求模型名为 `claude-*`、`grok-build` 或为空时，会使用 `grokDefaultModel`；其他模型会
+按已加载 catalog 的实际 wire model ID、显示名或唯一简写规范化（例如 catalog 中唯一的
+`grok-composer-2.5-fast` 可用 `composer2.5` 选择）。实际调用时还会再按单凭据目录过滤，
+不会把并集里存在的模型发给没有授权的账号。`/grok` 与根路径共用客户端 API Key 和 API
+Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
+
+对于 catalog 为 `responses` 的模型，代理遵循 Grok Build 的请求语义：始终发送
+`reasoning.summary: "concise"`，并把 Anthropic `thinking` 或 `output_config.effort` 映射为
+`reasoning.effort`。因此无需也不会再依赖模型名的 `-thinking` 后缀。收到的 xAI reasoning
+summary 会转换为 Anthropic `thinking` 内容块。`xhigh` 会原样保留；但若服务端给该模型提供
+了明确的 `reasoningEfforts` 菜单，则只接受菜单中声明的值。
 
 ### Thinking 模式
 
@@ -541,6 +551,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 - **Grok Build Admin（使用相同的 `adminApiKey`，但管理独立 Grok 凭据池）**
   - `GET/POST /grok/api/admin/credentials` - 查询或导入 xAI Token / OAuth 凭据
   - `POST /grok/api/admin/credentials/:id/verify` - 调用 xAI `/models` 校验凭据
+  - `GET /grok/api/admin/credentials/:id/catalog?refresh=true` - 查看或强制刷新该凭据的真实模型、backend 与 effort 菜单
   - `GET /grok/api/admin/credentials/:id/balance` - OAuth 凭据查询 Grok CLI billing；API Token 返回 `/models` 验活结果
   - `POST /grok/api/admin/oauth/start` - 发起 Grok CLI OAuth + PKCE
   - `GET /grok/api/admin/oauth/status/:state` - 查询授权状态
@@ -590,9 +601,10 @@ kiro-rs/
 │   │       ├── header.rs       # 头部解析
 │   │       ├── error.rs        # 错误类型
 │   │       └── crc.rs          # CRC 校验
-│   ├── grok/                   # Grok Build / xAI Responses 与 OAuth
-│   │   ├── converter.rs         # Anthropic → Responses 请求转换
-│   │   ├── stream.rs            # Responses SSE → Anthropic SSE
+│   ├── grok/                   # Grok Build / xAI catalog 与 OAuth
+│   │   ├── model_catalog.rs     # per-credential xAI /v1/models 目录与能力索引
+│   │   ├── converter.rs         # Anthropic → catalog 指定 backend 请求转换
+│   │   ├── stream.rs            # Responses / Chat Completions SSE → Anthropic SSE
 │   │   ├── token_manager.rs     # xAI Token/OAuth 凭据池
 │   │   ├── provider.rs          # xAI 上游调用与故障转移
 │   │   └── admin.rs             # /grok/api/admin 管理接口

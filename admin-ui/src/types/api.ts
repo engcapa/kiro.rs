@@ -67,6 +67,20 @@ export interface KiroModel {
   tokenLimits?: TokenLimits | null
   promptCaching?: PromptCaching | null
   additionalModelRequestFieldsSchema?: Record<string, unknown> | null
+  /** Grok Build catalog fields; absent for Kiro control-plane catalogs. */
+  apiBackend?: 'responses' | 'chat_completions' | 'messages' | string
+  supportedInApi?: boolean
+  supportsReasoningEffort?: boolean
+  defaultReasoningEffort?: string | null
+  reasoningEfforts?: ReasoningEffortOption[]
+}
+
+export interface ReasoningEffortOption {
+  id: string
+  value: string
+  label: string
+  description?: string | null
+  default?: boolean
 }
 
 export interface CredentialCatalogResponse {

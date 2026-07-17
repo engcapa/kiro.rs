@@ -26,8 +26,8 @@ use crate::admin::types::{
 use crate::common::auth;
 use crate::model::api_key_manager::ApiKeyManager;
 
-use super::converter::GROK_BUILD_MODELS;
 use super::credentials::GrokCredentials;
+use super::model_catalog::{GrokModelCatalog, ReasoningEffort};
 use super::oauth::{GrokOAuthService, OAuthStartResponse, OAuthStatusResponse};
 use super::provider::SharedGrokProvider;
 use super::token_manager::{GrokManagerSnapshot, SharedGrokTokenManager};
@@ -121,6 +121,11 @@ impl GrokAdminService {
         }) {
             self.token_manager.force_refresh_token_for(id).await?;
         }
+        // 新导入的凭据立即尝试拉取其真实 catalog；失败不影响凭据保存，避免
+        // `/models` 控制平面短暂不可达时让管理员重复导入。
+        if let Err(error) = self.provider.get_model_catalog_for(id, true).await {
+            tracing::warn!(credential_id = id, %error, "新增 Grok 凭据后拉取模型目录失败");
+        }
         let snapshot = self.token_manager.snapshot();
         let credential = snapshot
             .entries
@@ -180,30 +185,46 @@ impl GrokAdminService {
         })
     }
 
-    fn catalog(&self, id: u64) -> anyhow::Result<GrokCatalogResponse> {
-        if self.token_manager.credential(id).is_none() {
-            anyhow::bail!("Grok 凭据 #{} 不存在", id);
-        }
+    async fn catalog(&self, id: u64, refresh: bool) -> anyhow::Result<GrokCatalogResponse> {
+        let (catalog, from_cache) = self.provider.get_model_catalog_for(id, refresh).await?;
         Ok(GrokCatalogResponse {
             credential_id: id,
-            source: "builtin".to_string(),
+            source: if from_cache { "cache" } else { "upstream" }.to_string(),
             default_model: GrokDefaultModel {
                 model_id: self.token_manager.config().grok_default_model.clone(),
             },
-            models: GROK_BUILD_MODELS
-                .iter()
-                .map(|model_id| GrokCatalogModel {
-                    model_id: (*model_id).to_string(),
-                    model_name: (*model_id).to_string(),
-                    description: Some("xAI Grok Build / Responses API model".to_string()),
-                    token_limits: GrokTokenLimits {
-                        max_input_tokens: Some(131_072),
-                        max_output_tokens: Some(if *model_id == "grok-4.5" {
-                            32_768
-                        } else {
-                            16_384
-                        }),
-                    },
+            models: catalog
+                .models
+                .into_iter()
+                .map(|model| {
+                    let default_reasoning_effort = model
+                        .default_effort()
+                        .map(ReasoningEffort::as_str)
+                        .map(ToOwned::to_owned);
+                    GrokCatalogModel {
+                        model_id: model.model_id,
+                        model_name: model.model_name,
+                        description: model.description,
+                        token_limits: GrokTokenLimits {
+                            max_input_tokens: model.context_window,
+                            max_output_tokens: model.max_completion_tokens,
+                        },
+                        api_backend: model.api_backend.as_str().to_string(),
+                        supported_in_api: model.supported_in_api,
+                        supports_reasoning_effort: model.supports_reasoning_effort,
+                        default_reasoning_effort,
+                        reasoning_efforts: model
+                            .reasoning_efforts
+                            .into_iter()
+                            .map(|option| GrokReasoningEffortOptionResponse {
+                                id: option.id,
+                                value: option.value.as_str().to_string(),
+                                label: option.label,
+                                description: option.description,
+                                default: option.default,
+                            })
+                            .collect(),
+                    }
                 })
                 .collect(),
         })
@@ -211,9 +232,15 @@ impl GrokAdminService {
 
     fn export_catalog(&self) -> anyhow::Result<()> {
         let path = std::path::Path::new("docs/grok_model_catalog.json");
+        let catalog = self
+            .provider
+            .model_catalog()
+            .map(|catalog| (*catalog).clone())
+            .unwrap_or_else(GrokModelCatalog::bootstrap);
         let body = json!({
             "defaultModel": self.token_manager.config().grok_default_model,
-            "models": GROK_BUILD_MODELS,
+            "source": "merged-per-credential-catalog",
+            "models": catalog.models,
         });
         std::fs::write(path, serde_json::to_string_pretty(&body)?)?;
         Ok(())
@@ -409,12 +436,12 @@ async fn get_credential_catalog(
     Path(id): Path<u64>,
     Query(query): Query<CatalogQuery>,
 ) -> Response {
-    if query.refresh {
-        tracing::debug!(credential_id = id, "Grok 目录为静态内建目录，无需刷新");
+    if state.service.token_manager.credential(id).is_none() {
+        return admin_error(StatusCode::NOT_FOUND, format!("Grok 凭据 #{} 不存在", id));
     }
-    match state.service.catalog(id) {
+    match state.service.catalog(id, query.refresh).await {
         Ok(catalog) => Json(catalog).into_response(),
-        Err(error) => admin_error(StatusCode::NOT_FOUND, error.to_string()),
+        Err(error) => admin_error(StatusCode::BAD_GATEWAY, error.to_string()),
     }
 }
 
@@ -654,6 +681,11 @@ struct GrokCatalogModel {
     model_name: String,
     description: Option<String>,
     token_limits: GrokTokenLimits,
+    api_backend: String,
+    supported_in_api: bool,
+    supports_reasoning_effort: bool,
+    default_reasoning_effort: Option<String>,
+    reasoning_efforts: Vec<GrokReasoningEffortOptionResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -661,6 +693,16 @@ struct GrokCatalogModel {
 struct GrokTokenLimits {
     max_input_tokens: Option<i32>,
     max_output_tokens: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GrokReasoningEffortOptionResponse {
+    id: String,
+    value: String,
+    label: String,
+    description: Option<String>,
+    default: bool,
 }
 
 // Keep these imports visible in generated rustdoc / API signatures.

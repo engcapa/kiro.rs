@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use futures::future::join_all;
 use parking_lot::Mutex;
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
@@ -16,6 +17,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 
 use super::credentials::GrokCredentials;
+use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
 use super::token_manager::SharedGrokTokenManager;
 
 const MAX_RETRIES_PER_CREDENTIAL: usize = 2;
@@ -39,6 +41,9 @@ pub struct GrokProvider {
     global_proxy: Option<ProxyConfig>,
     tls_backend: TlsBackend,
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// `/v1/models` 定时刷新冷却。目录失败不会写入此时间，确保后续周期仍会
+    /// 重试，同时不影响运行时凭据状态。
+    catalog_refresh_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl GrokProvider {
@@ -55,6 +60,7 @@ impl GrokProvider {
             global_proxy,
             tls_backend,
             client_cache: Mutex::new(client_cache),
+            catalog_refresh_at: Mutex::new(None),
         })
     }
 
@@ -122,11 +128,17 @@ impl GrokProvider {
         request
     }
 
-    /// 发送 xAI Responses API 请求。Responses API 的非流式请求在 Grok CLI
-    /// 流程中同样以 SSE 返回，因此调用方总是接收原始 response stream。
-    pub async fn call_responses(
+    /// 按 Grok Build 模型目录指定的 backend 发送请求。
+    ///
+    /// 模型 id 和 effort 在进入重试循环前已规范化；每次选到凭据后仍会按该
+    /// 凭据自己的 catalog 再过滤，防止并集目录把 Composer/Grok 4.5 误路由
+    /// 到没有对应授权的账号。
+    pub async fn call_api(
         &self,
         body: &Value,
+        backend: GrokApiBackend,
+        model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
         let total = self.token_manager.total_count();
@@ -135,35 +147,47 @@ impl GrokProvider {
         let mut forced_refresh = HashSet::new();
 
         for attempt in 0..max_retries {
-            let context = match self.token_manager.acquire_context(allowed_pools).await {
+            let context = match self
+                .token_manager
+                .acquire_context(Some(model), reasoning_effort, Some(backend), allowed_pools)
+                .await
+            {
                 Ok(context) => context,
                 Err(error) => {
                     last_error = Some(error);
                     break;
                 }
             };
-            let url = format!(
-                "{}/responses",
-                context
-                    .credentials
-                    .effective_base_url(self.token_manager.config())
-                    .trim_end_matches('/')
-            );
+            let base_url = self
+                .token_manager
+                .model_for(context.id, model)
+                .and_then(|model| model.base_url)
+                .unwrap_or_else(|| {
+                    context
+                        .credentials
+                        .effective_base_url(self.token_manager.config())
+                        .to_string()
+                });
+            let url = endpoint_url(&base_url, backend);
             let cli_chat_proxy = is_cli_chat_proxy_url(&url);
             let session_id = body
                 .get("prompt_cache_key")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty());
             let request_id = Uuid::new_v4().to_string();
-            let model = body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let accepts_sse = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
             let mut request = self
                 .client_for(&context.credentials)?
                 .post(&url)
                 .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
+                .header(
+                    "accept",
+                    if accepts_sse {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
                 .header("connection", "keep-alive")
                 .header("x-grok-req-id", request_id)
                 .header("x-grok-model-override", model)
@@ -204,7 +228,8 @@ impl GrokProvider {
             if is_quota_exhausted(status.as_u16(), &response_body) {
                 let available = self.token_manager.report_quota_exhausted(context.id);
                 last_error = Some(anyhow::anyhow!(
-                    "xAI Responses API 配额已用尽: {} {}",
+                    "xAI {} API 配额已用尽: {} {}",
+                    backend.as_str(),
                     status,
                     response_body
                 ));
@@ -235,7 +260,8 @@ impl GrokProvider {
             if matches!(status.as_u16(), 401 | 403 | 408 | 429) || status.is_server_error() {
                 let available = self.token_manager.report_failure(context.id);
                 last_error = Some(anyhow::anyhow!(
-                    "xAI Responses API 请求失败: {} {}",
+                    "xAI {} API 请求失败: {} {}",
+                    backend.as_str(),
                     status,
                     response_body
                 ));
@@ -249,25 +275,34 @@ impl GrokProvider {
             }
 
             return Err(anyhow::anyhow!(
-                "xAI Responses API 请求失败: {} {}",
+                "xAI {} API 请求失败: {} {}",
+                backend.as_str(),
                 status,
                 response_body
             ));
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI Responses API 请求失败")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI {} API 请求失败", backend.as_str())))
     }
 
-    /// 使用对应凭据调用 xAI models endpoint，用于管理接口的 token 校验。
-    pub async fn verify_credential(&self, id: u64) -> anyhow::Result<Value> {
+    /// 已加载凭据目录的并集视图。请求实际发送时不要依赖这个结果做授权判断，
+    /// 应由 `call_api` 的 per-credential 选择再次过滤。
+    pub fn model_catalog(&self) -> Option<Arc<GrokModelCatalog>> {
+        self.token_manager.merged_catalog()
+    }
+
+    async fn fetch_models_value(
+        &self,
+        id: u64,
+        report_runtime_result: bool,
+    ) -> anyhow::Result<(Value, String)> {
         let context = self.token_manager.acquire_context_for(id).await?;
-        let url = format!(
-            "{}/models",
-            context
-                .credentials
-                .effective_base_url(self.token_manager.config())
-                .trim_end_matches('/')
-        );
+        let base_url = context
+            .credentials
+            .effective_base_url(self.token_manager.config())
+            .trim_end_matches('/')
+            .to_string();
+        let url = format!("{}/models", base_url);
         let cli_chat_proxy = is_cli_chat_proxy_url(&url);
         let request = self
             .client_for(&context.credentials)?
@@ -285,14 +320,102 @@ impl GrokProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            self.token_manager.report_failure(context.id);
-            anyhow::bail!("xAI token 校验失败: {} {}", status, body);
+            if report_runtime_result {
+                self.token_manager.report_failure(context.id);
+            }
+            anyhow::bail!("xAI /models 请求失败: {} {}", status, body);
         }
-        self.token_manager.report_success(context.id);
-        Ok(response
-            .json()
-            .await
-            .context("解析 xAI token 校验响应失败")?)
+        if report_runtime_result {
+            self.token_manager.report_success(context.id);
+        }
+        let value = response.json().await.context("解析 xAI /models 响应失败")?;
+        Ok((value, base_url))
+    }
+
+    /// 拉取并解析单凭据目录。目录是控制平面数据，失败时不得把推理凭据记为
+    /// 失败或禁用；调用方会保留上一次成功的目录。
+    async fn fetch_model_catalog_for_credential(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<GrokModelCatalog> {
+        let (value, base_url) = self.fetch_models_value(id, false).await?;
+        Ok(GrokModelCatalog::from_upstream(&value, &base_url))
+    }
+
+    /// 获取指定凭据目录。未强制刷新时优先返回内存 cache。
+    pub async fn get_model_catalog_for(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> anyhow::Result<(GrokModelCatalog, bool)> {
+        if !force_refresh {
+            if let Some(catalog) = self.token_manager.catalog_for(id) {
+                return Ok(((*catalog).clone(), true));
+            }
+        }
+        let catalog = self.fetch_model_catalog_for_credential(id).await?;
+        self.token_manager.set_model_catalog(id, catalog.clone())?;
+        Ok((catalog, false))
+    }
+
+    /// 刷新全部启用凭据的真实模型目录。与 Kiro 的 per-credential catalog
+    /// 策略一致：一个账户的 `/models` 不可达不会影响其他账户，也不会把该
+    /// 账户的运行时推理能力判定为故障。
+    pub async fn refresh_model_catalog(&self, force: bool) -> anyhow::Result<()> {
+        if !force {
+            if self
+                .catalog_refresh_at
+                .lock()
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(300))
+            {
+                tracing::debug!("Grok 模型目录最近已刷新，跳过本次刷新");
+                return Ok(());
+            }
+        }
+        let ids = self.token_manager.active_credential_ids();
+        if ids.is_empty() {
+            tracing::debug!("没有启用的 Grok 凭据，跳过模型目录刷新");
+            return Ok(());
+        }
+        let results = join_all(
+            ids.into_iter()
+                .map(|id| async move { (id, self.fetch_model_catalog_for_credential(id).await) }),
+        )
+        .await;
+        let mut got_any = false;
+        for (id, result) in results {
+            match result {
+                Ok(catalog) => {
+                    let count = catalog.models.len();
+                    if let Err(error) = self.token_manager.set_model_catalog(id, catalog) {
+                        tracing::warn!(credential_id = id, %error, "写入 Grok 模型目录失败");
+                    } else {
+                        got_any = true;
+                        tracing::info!(
+                            credential_id = id,
+                            model_count = count,
+                            "Grok 模型目录刷新成功"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(credential_id = id, %error, "Grok 模型目录拉取失败，保留凭据与旧目录");
+                }
+            }
+        }
+        if got_any {
+            *self.catalog_refresh_at.lock() = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
+
+    /// 使用对应凭据调用 xAI models endpoint，用于管理接口 token 校验，并在
+    /// 成功时顺手更新这张凭据的模型目录。
+    pub async fn verify_credential(&self, id: u64) -> anyhow::Result<Value> {
+        let (value, base_url) = self.fetch_models_value(id, true).await?;
+        let catalog = GrokModelCatalog::from_upstream(&value, &base_url);
+        self.token_manager.set_model_catalog(id, catalog)?;
+        Ok(value)
     }
 
     /// 查询 Grok CLI billing 数据。该接口不是 xAI 公共 API 的稳定契约，
@@ -308,15 +431,11 @@ impl GrokProvider {
             .header("accept", "application/json")
             .header("x-xai-token-auth", "xai-grok-cli")
             .header("x-grok-cli-version", GROK_BUILD_CLIENT_VERSION);
-        let response = Self::authenticated_request(
-            request,
-            &context.credentials,
-            &context.token,
-            true,
-        )
-        .send()
-        .await
-        .context("发送 xAI billing 请求失败")?;
+        let response =
+            Self::authenticated_request(request, &context.credentials, &context.token, true)
+                .send()
+                .await
+                .context("发送 xAI billing 请求失败")?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -330,6 +449,18 @@ impl GrokProvider {
 
 fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis((500_u64.saturating_mul(1_u64 << attempt.min(4))).min(8_000))
+}
+
+/// catalog 的 `baseUrl` 通常是 `/v1` 根路径，但为兼容私有网关也接受已经
+/// 包含 endpoint 的地址，避免拼出 `/responses/responses`。
+fn endpoint_url(base_url: &str, backend: GrokApiBackend) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let path = backend.endpoint_path();
+    if base_url.ends_with(path) {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/{path}")
+    }
 }
 
 fn is_quota_exhausted(status: u16, body: &str) -> bool {
@@ -365,5 +496,17 @@ mod tests {
             "https://cli-chat-proxy.grok.com/v1/responses"
         ));
         assert!(!is_cli_chat_proxy_url("https://api.x.ai/v1/responses"));
+    }
+
+    #[test]
+    fn builds_backend_url_once() {
+        assert_eq!(
+            endpoint_url("https://api.x.ai/v1", GrokApiBackend::ChatCompletions),
+            "https://api.x.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("https://api.x.ai/v1/responses/", GrokApiBackend::Responses),
+            "https://api.x.ai/v1/responses"
+        );
     }
 }

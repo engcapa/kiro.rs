@@ -38,8 +38,14 @@ fn parse_sse_block(block: &str) -> Option<Value> {
         .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
         .collect::<Vec<_>>()
         .join("\n");
-    if data.is_empty() || data == "[DONE]" {
+    if data.is_empty() {
         return None;
+    }
+    // Chat Completions 以 `[DONE]` 结束，而 Responses 以
+    // `response.completed` 结束。保留一个内部完成标记，非流式聚合可以同时
+    // 验证两种 backend 的终止语义。
+    if data == "[DONE]" {
+        return Some(json!({ "type": "done" }));
     }
     match serde_json::from_str(&data) {
         Ok(event) => Some(event),
@@ -121,6 +127,9 @@ impl GrokStreamContext {
     }
 
     pub fn process_event(&mut self, event: &Value) -> Vec<SseEvent> {
+        if event.get("choices").is_some() {
+            return self.process_chat_completion_event(event);
+        }
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
@@ -132,7 +141,13 @@ impl GrokStreamContext {
             "response.output_item.done" => self.process_output_item_done(event),
             "response.function_call_arguments.delta" => self.process_tool_delta(event),
             "response.function_call_arguments.done" => self.process_tool_done(event),
-            "response.completed" => self.ingest_completed_response(event.get("response").unwrap_or(event)),
+            "response.completed" => {
+                self.ingest_completed_response(event.get("response").unwrap_or(event))
+            }
+            "done" => {
+                self.completed = true;
+                Vec::new()
+            }
             "response.incomplete" => {
                 let events = self.ingest_completed_response(event.get("response").unwrap_or(event));
                 self.stop_reason = Some("max_tokens".to_string());
@@ -150,6 +165,101 @@ impl GrokStreamContext {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// OpenAI Chat Completions SSE → 与 Responses 共用的 Anthropic 状态机。
+    /// Grok Build 对 catalog 中未标 `apiBackend` 的模型会走这一分支；reasoning
+    /// 内容在 xAI/OpenAI 兼容流中通常位于 `delta.reasoning_content`。
+    fn process_chat_completion_event(&mut self, event: &Value) -> Vec<SseEvent> {
+        if event.get("usage").is_some() {
+            self.capture_response_metadata(event);
+        }
+        let mut events = Vec::new();
+        for choice in event
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(delta) = choice.get("delta") {
+                events.extend(self.process_chat_message_delta(delta, false));
+            }
+            if let Some(message) = choice.get("message") {
+                events.extend(self.process_chat_message_delta(message, true));
+            }
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                if reason == "length" {
+                    self.stop_reason = Some("max_tokens".to_string());
+                }
+                events.extend(self.stop_open_tools());
+                // 非流式 Chat Completions JSON 没有 `[DONE]`；有 finish_reason
+                // 即足以代表一个完整的 assistant turn。
+                self.completed = true;
+            }
+        }
+        if event.get("object").and_then(Value::as_str) == Some("chat.completion") {
+            self.completed = true;
+            events.extend(self.stop_open_tools());
+        }
+        events
+    }
+
+    fn process_chat_message_delta(&mut self, delta: &Value, terminal: bool) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for reasoning in chat_text_values(delta, &["reasoning_content", "reasoning"]) {
+            events.extend(self.process_thinking_delta(&json!({ "delta": reasoning })));
+        }
+        if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+            for detail in details {
+                if let Some(text) = detail
+                    .get("text")
+                    .or_else(|| detail.get("content"))
+                    .and_then(Value::as_str)
+                {
+                    events.extend(self.process_thinking_delta(&json!({ "delta": text })));
+                }
+            }
+        }
+        for text in chat_text_values(delta, &["content"]) {
+            events.extend(self.process_text_delta(&json!({ "delta": text })));
+        }
+        for (position, tool_call) in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let index = tool_call
+                .get("index")
+                .and_then(Value::as_i64)
+                .unwrap_or(position as i64);
+            let fallback_key = format!("chat_tool_{index}");
+            let raw_key = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&fallback_key);
+            let id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(raw_key);
+            let function = tool_call.get("function").unwrap_or(&Value::Null);
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !name.is_empty() {
+                events.extend(self.ensure_tool_block(raw_key, id, name));
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                events.extend(self.append_tool_arguments(raw_key, arguments));
+            }
+            if terminal {
+                events.extend(self.stop_tool(raw_key));
+            }
+        }
+        events
     }
 
     fn process_text_delta(&mut self, event: &Value) -> Vec<SseEvent> {
@@ -447,6 +557,15 @@ impl GrokStreamContext {
             .collect()
     }
 
+    fn stop_open_tools(&mut self) -> Vec<SseEvent> {
+        let keys = self.tool_order.clone();
+        let mut events = Vec::new();
+        for key in keys {
+            events.extend(self.stop_tool(&key));
+        }
+        events
+    }
+
     fn canonical_tool_key(&self, raw_key: &str) -> String {
         self.tool_aliases
             .get(raw_key)
@@ -580,6 +699,31 @@ fn function_call_identity(item: &Value, event: &Value) -> (String, String, Strin
     (item_id.to_string(), call_id.to_string(), name.to_string())
 }
 
+fn chat_text_values(delta: &Value, keys: &[&str]) -> Vec<String> {
+    let mut values = Vec::new();
+    for key in keys {
+        let Some(value) = delta.get(*key) else {
+            continue;
+        };
+        if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+            values.push(text.to_string());
+            continue;
+        }
+        if let Some(parts) = value.as_array() {
+            for part in parts {
+                if let Some(text) = part
+                    .as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                {
+                    values.push(text.to_string());
+                }
+            }
+        }
+    }
+    values
+}
+
 fn suffix_after(existing: &str, complete_or_delta: &str) -> String {
     if complete_or_delta.is_empty() {
         return String::new();
@@ -637,13 +781,15 @@ mod tests {
 
         // Grok Build can send argument deltas keyed by call_id before it sends
         // the function name in the terminal response.
-        assert!(context
-            .process_event(&json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": "call_1",
-                "delta": "{\"path\":\"a\"}"
-            }))
-            .is_empty());
+        assert!(
+            context
+                .process_event(&json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "call_1",
+                    "delta": "{\"path\":\"a\"}"
+                }))
+                .is_empty()
+        );
 
         let events = context.process_event(&json!({
             "type": "response.completed",
@@ -706,5 +852,35 @@ mod tests {
         let response = context.to_anthropic_response();
         assert_eq!(response["content"][0]["thinking"], "considering");
         assert_eq!(response["content"][1]["text"], "answer");
+    }
+
+    #[test]
+    fn converts_chat_completion_reasoning_content_and_tool_calls() {
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.process_event(&json!({
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "delta": {
+                    "reasoning_content": "plan",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{\"path\":\"a\"}" }
+                    }]
+                }
+            }]
+        }));
+        context.process_event(&json!({
+            "object": "chat.completion.chunk",
+            "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+        }));
+        context.process_event(&json!({ "type": "done" }));
+        assert!(context.completed());
+        let response = context.to_anthropic_response();
+        assert_eq!(response["content"][0]["thinking"], "plan");
+        assert_eq!(response["content"][1]["type"], "tool_use");
+        assert_eq!(response["content"][1]["name"], "read");
+        assert_eq!(response["content"][1]["input"]["path"], "a");
     }
 }

@@ -17,11 +17,11 @@ use tokio::time::interval;
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    Thinking,
 };
 use crate::token;
 
-use super::converter::{ConversionError, GROK_BUILD_MODELS, convert_request};
+use super::converter::convert_request;
+use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
 use super::stream::{GrokStreamContext, XaiSseDecoder};
 
@@ -29,23 +29,30 @@ const PING_INTERVAL_SECS: u64 = 25;
 
 /// GET /grok/v1/models
 pub async fn get_models(State(state): State<GrokAppState>) -> impl IntoResponse {
-    let model_list = GROK_BUILD_MODELS
-        .iter()
-        .map(|id| Model {
-            id: (*id).to_string(),
+    let catalog = state
+        .provider
+        .model_catalog()
+        .map(|catalog| (*catalog).clone())
+        .unwrap_or_else(GrokModelCatalog::bootstrap);
+    let model_list = catalog
+        .models
+        .into_iter()
+        .filter(|model| model.supported_in_api)
+        .map(|model| Model {
+            id: model.model_id,
             object: "model".to_string(),
             created: 1_772_000_000,
             owned_by: "xai".to_string(),
-            display_name: if *id == "grok-4.5" {
-                "Grok 4.5 (Grok Build)".to_string()
-            } else {
-                (*id).to_string()
-            },
+            display_name: model.model_name,
             model_type: "chat".to_string(),
-            max_tokens: if *id == "grok-4.5" { 32_768 } else { 16_384 },
+            max_tokens: model.max_completion_tokens.unwrap_or(16_384),
         })
         .collect::<Vec<_>>();
-    tracing::debug!(default_model = %state.default_model, "返回 Grok Build 模型列表");
+    tracing::debug!(
+        default_model = %state.default_model,
+        model_count = model_list.len(),
+        "返回 Grok Build 凭据模型目录"
+    );
     Json(ModelsResponse {
         object: "list".to_string(),
         data: model_list,
@@ -70,9 +77,8 @@ pub async fn post_messages(
     State(state): State<GrokAppState>,
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     axum::extract::Extension(api_key_info): axum::extract::Extension<ApiKeyInfo>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    override_thinking_from_model_name(&mut payload);
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
         payload.system.clone(),
@@ -94,20 +100,38 @@ pub async fn post_messages(
         "Received POST /grok/v1/messages request"
     );
 
-    let converted = match convert_request(&payload, &state.default_model) {
+    let catalog = state.provider.model_catalog();
+    let converted = match convert_request(&payload, &state.default_model, catalog.as_deref()) {
         Ok(converted) => converted,
-        Err(ConversionError::EmptyMessages) => {
+        Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new("invalid_request_error", "消息列表为空")),
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    error.to_string(),
+                )),
             )
                 .into_response();
         }
     };
 
     let mut body = converted.body;
-    // Grok CLI / xAI Responses API 的非流式也按 SSE 聚合，避免不同模型在
-    // `/responses` 上返回格式不一致；本服务再按客户端 `stream` 返回。
+    if converted.backend == GrokApiBackend::Messages {
+        // Messages backend 本身就是 Anthropic 协议，直接透传其 SSE/JSON；请求
+        // 体中的 thinking/output_config 已按 Grok Build 的 summarized 规则重建。
+        body["stream"] = Value::Bool(payload.stream);
+        return messages_backend_response(
+            state,
+            body,
+            converted.model,
+            converted.reasoning_effort,
+            payload.stream,
+            allowed_pools.0,
+        )
+        .await;
+    }
+    // Responses 和 Chat Completions 均统一向上游请求 SSE，再聚合为调用方要
+    // 求的 Anthropic 流式或非流式格式。
     body["stream"] = Value::Bool(true);
 
     if payload.stream {
@@ -117,6 +141,8 @@ pub async fn post_messages(
             converted.model,
             input_tokens,
             converted.thinking_enabled,
+            converted.backend,
+            converted.reasoning_effort,
             allowed_pools.0,
         )
         .await
@@ -127,6 +153,8 @@ pub async fn post_messages(
             converted.model,
             input_tokens,
             converted.thinking_enabled,
+            converted.backend,
+            converted.reasoning_effort,
             &allowed_pools.0,
         )
         .await
@@ -158,6 +186,8 @@ async fn stream_response(
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
+    backend: GrokApiBackend,
+    reasoning_effort: Option<ReasoningEffort>,
     allowed_pools: Vec<String>,
 ) -> Response {
     let stream = create_sse_stream(
@@ -166,6 +196,8 @@ async fn stream_response(
         model,
         input_tokens,
         thinking_enabled,
+        backend,
+        reasoning_effort,
         allowed_pools,
     );
     Response::builder()
@@ -186,17 +218,25 @@ fn create_sse_stream(
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
+    backend: GrokApiBackend,
+    reasoning_effort: Option<ReasoningEffort>,
     allowed_pools: Vec<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
-        let mut context = GrokStreamContext::new(model, input_tokens, thinking_enabled);
+        let mut context = GrokStreamContext::new(model.clone(), input_tokens, thinking_enabled);
         for event in context.initial_events() {
             yield Ok(Bytes::from(event.to_sse_string()));
         }
 
         let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
         ping.tick().await;
-        let connect = state.provider.call_responses(&body, Some(&allowed_pools));
+        let connect = state.provider.call_api(
+            &body,
+            backend,
+            &model,
+            reasoning_effort,
+            Some(&allowed_pools),
+        );
         tokio::pin!(connect);
         let response = loop {
             tokio::select! {
@@ -255,11 +295,19 @@ async fn non_stream_response(
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
+    backend: GrokApiBackend,
+    reasoning_effort: Option<ReasoningEffort>,
     allowed_pools: &[String],
 ) -> Response {
     let upstream = match state
         .provider
-        .call_responses(&body, Some(allowed_pools))
+        .call_api(
+            &body,
+            backend,
+            &model,
+            reasoning_effort,
+            Some(allowed_pools),
+        )
         .await
     {
         Ok(upstream) => upstream,
@@ -294,8 +342,14 @@ async fn non_stream_response(
     }
     if !context.completed() {
         if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
-            let response = response.get("response").unwrap_or(&response);
-            context.ingest_completed_response(response);
+            // Chat Completions 的单 JSON 响应直接带 `choices`；Responses
+            // 则继续走 output-item 聚合。
+            if response.get("choices").is_some() {
+                context.process_event(&response);
+            } else {
+                let response = response.get("response").unwrap_or(&response);
+                context.ingest_completed_response(response);
+            }
         }
     }
     if !context.completed() {
@@ -311,12 +365,112 @@ async fn non_stream_response(
     Json(context.to_anthropic_response()).into_response()
 }
 
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    if payload.model.to_ascii_lowercase().ends_with("-thinking") && payload.thinking.is_none() {
-        payload.thinking = Some(Thinking {
-            thinking_type: "enabled".to_string(),
-            budget_tokens: 20_000,
-        });
+/// catalog 标记为 `messages` 的模型已经使用 Anthropic wire protocol；请求/响应
+/// 不应先绕一层 Responses 再反向转换。只在模型、effort、display 字段处做
+/// Grok Build 语义适配，其余 SSE 原样转发给调用方。
+async fn messages_backend_response(
+    state: GrokAppState,
+    body: Value,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    stream_requested: bool,
+    allowed_pools: Vec<String>,
+) -> Response {
+    if stream_requested {
+        let stream =
+            create_messages_sse_stream(state, body, model, reasoning_effort, allowed_pools);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "构建 Grok Messages SSE 响应失败");
+                Response::new(Body::empty())
+            });
+    }
+    let upstream = match state
+        .provider
+        .call_api(
+            &body,
+            GrokApiBackend::Messages,
+            &model,
+            reasoning_effort,
+            Some(&allowed_pools),
+        )
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return map_provider_error(error),
+    };
+    match upstream.response.bytes().await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "构建 Grok Messages JSON 响应失败");
+                Response::new(Body::empty())
+            }),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                format!("读取 xAI Messages 响应失败: {error}"),
+            )),
+        )
+            .into_response(),
+    }
+}
+
+fn create_messages_sse_stream(
+    state: GrokAppState,
+    body: Value,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+    allowed_pools: Vec<String>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    async_stream::stream! {
+        let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping.tick().await;
+        let connect = state.provider.call_api(
+            &body,
+            GrokApiBackend::Messages,
+            &model,
+            reasoning_effort,
+            Some(&allowed_pools),
+        );
+        tokio::pin!(connect);
+        let response = loop {
+            tokio::select! {
+                result = &mut connect => match result {
+                    Ok(response) => break Some(response.response),
+                    Err(error) => {
+                        yield Ok(provider_error_sse(&error));
+                        break None;
+                    }
+                },
+                _ = ping.tick() => yield Ok(ping_sse()),
+            }
+        };
+        let Some(response) = response else { return };
+        let body_stream = response.bytes_stream();
+        tokio::pin!(body_stream);
+        loop {
+            tokio::select! {
+                chunk = body_stream.next() => match chunk {
+                    Some(Ok(chunk)) => yield Ok(chunk),
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "读取 xAI Messages SSE 响应失败");
+                        yield Ok(upstream_error_sse(&format!("读取 xAI Messages SSE 响应失败: {error}")));
+                        return;
+                    }
+                    None => break,
+                },
+                _ = ping.tick() => yield Ok(ping_sse()),
+            }
+        }
     }
 }
 
@@ -379,6 +533,9 @@ mod tests {
             "type": "response.failed",
             "response": { "error": { "message": "upstream failed" } }
         });
-        assert_eq!(upstream_error_message(&event).as_deref(), Some("upstream failed"));
+        assert_eq!(
+            upstream_error_message(&event).as_deref(),
+            Some("upstream failed")
+        );
     }
 }

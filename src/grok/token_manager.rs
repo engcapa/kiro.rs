@@ -14,6 +14,10 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::{Config, TlsBackend};
 
 use super::credentials::{GrokCredentials, XAI_GROK_CLI_CLIENT_ID, jwt_identity};
+use super::model_catalog::{
+    GrokApiBackend, GrokCredentialModelIndex, GrokModel, GrokModelCatalog, ReasoningEffort,
+    merge_catalogs,
+};
 
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const LOAD_BALANCING_MODE_PRIORITY: &str = "priority";
@@ -50,6 +54,11 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     success_count: u64,
     last_used_at: Option<String>,
+    /// 每张凭据从 `/v1/models` 取得的真实模型目录。目录拉取失败不能影响
+    /// 推理可用性，因此 `None` 代表未知而不是“不支持任何模型”。
+    catalog: Option<Arc<GrokModelCatalog>>,
+    /// `catalog` 的 O(1) 热路径索引，避免每次路由都线性扫描模型数组。
+    model_index: Option<GrokCredentialModelIndex>,
 }
 
 /// 管理接口使用的安全凭据快照，不包含原始 token。
@@ -172,6 +181,8 @@ impl GrokTokenManager {
                     disabled_reason: None,
                     success_count: 0,
                     last_used_at: None,
+                    catalog: None,
+                    model_index: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -275,6 +286,58 @@ impl GrokTokenManager {
             .iter()
             .find(|entry| entry.id == id)
             .map(|entry| entry.credentials.clone())
+    }
+
+    /// 返回当前可参与目录刷新（未手动/故障禁用）的凭据 id。
+    pub fn active_credential_ids(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// 读取单凭据目录。`None` 代表尚未加载或上次刷新失败，应由调用方按
+    /// “未知放行”策略处理，而不是理解为该凭据没有模型。
+    pub fn catalog_for(&self, id: u64) -> Option<Arc<GrokModelCatalog>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.catalog.clone())
+    }
+
+    /// 取得所有启用凭据的已加载目录合并后的只读视图，供 HTTP `/models` 和
+    /// 请求模型名规范化使用。真正选凭据时仍必须调用 [`Self::acquire_context`]。
+    pub fn merged_catalog(&self) -> Option<Arc<GrokModelCatalog>> {
+        let catalogs = self
+            .entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .filter_map(|entry| entry.catalog.as_ref().map(|catalog| (**catalog).clone()))
+            .collect::<Vec<_>>();
+        (!catalogs.is_empty()).then(|| Arc::new(merge_catalogs(&catalogs)))
+    }
+
+    /// 写入一张凭据最新的目录并同步重建热路径索引。
+    pub fn set_model_catalog(&self, id: u64, catalog: GrokModelCatalog) -> anyhow::Result<()> {
+        let index = GrokCredentialModelIndex::from_catalog(&catalog);
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Grok 凭据 #{} 不存在", id))?;
+        entry.catalog = Some(Arc::new(catalog));
+        entry.model_index = Some(index);
+        Ok(())
+    }
+
+    /// 返回该凭据上某个已规范化模型的真实配置（含 API backend/baseUrl）。
+    pub fn model_for(&self, id: u64, model_id: &str) -> Option<GrokModel> {
+        self.catalog_for(id)
+            .and_then(|catalog| catalog.model_by_id(model_id).cloned())
     }
 
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
@@ -409,6 +472,8 @@ impl GrokTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                catalog: None,
+                model_index: None,
             });
             id
         };
@@ -430,23 +495,32 @@ impl GrokTokenManager {
     }
 
     pub fn peek_next_credential_name(&self, allowed_pools: Option<&[String]>) -> Option<String> {
-        let id = self.choose_credential_id(allowed_pools).ok()?;
+        let id = self
+            .choose_credential_id(None, None, None, allowed_pools)
+            .ok()?;
         self.credential(id)
             .map(|credential| credential.display_name(id))
     }
 
-    /// 获得可用凭据并在 OAuth token 接近过期时自动刷新。
+    /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
+    /// 时自动刷新。目录未加载的凭据会被保守地放行，保持控制平面抖动时的服务
+    /// 可用性；目录已加载的凭据则严格按其模型能力过滤。
     pub async fn acquire_context(
         &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<GrokCallContext> {
         let attempts = self.total_count().max(1) * MAX_FAILURES_PER_CREDENTIAL as usize;
         let mut last_error = None;
         for _ in 0..attempts {
-            let id = match self.choose_credential_id(allowed_pools) {
-                Ok(id) => id,
-                Err(error) => return Err(error),
-            };
+            let id =
+                match self.choose_credential_id(model_id, reasoning_effort, backend, allowed_pools)
+                {
+                    Ok(id) => id,
+                    Err(error) => return Err(error),
+                };
             match self.acquire_context_for(id).await {
                 Ok(context) => return Ok(context),
                 Err(error) => {
@@ -684,7 +758,13 @@ impl GrokTokenManager {
         }
     }
 
-    fn choose_credential_id(&self, allowed_pools: Option<&[String]>) -> anyhow::Result<u64> {
+    fn choose_credential_id(
+        &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<u64> {
         let entries = self.entries.lock();
         if entries.is_empty() {
             bail!(
@@ -694,9 +774,25 @@ impl GrokTokenManager {
         let eligible = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !entry.disabled && pool_matches(entry, allowed_pools))
+            .filter(|(_, entry)| {
+                !entry.disabled
+                    && pool_matches(entry, allowed_pools)
+                    && credential_supports(entry, model_id, reasoning_effort, backend)
+            })
             .collect::<Vec<_>>();
         if eligible.is_empty() {
+            if let Some(model_id) = model_id {
+                let backend = backend.map(GrokApiBackend::as_str).unwrap_or("任意后端");
+                let effort = reasoning_effort
+                    .map(|effort| format!("、effort={effort}"))
+                    .unwrap_or_default();
+                bail!(
+                    "没有 Grok 凭据支持模型 {}（backend={}{}）或当前 API Key 资源池",
+                    model_id,
+                    backend,
+                    effort
+                );
+            }
             bail!("没有可用于当前 API Key 资源池的 Grok 凭据");
         }
         let mode = self.get_load_balancing_mode();
@@ -720,7 +816,10 @@ impl GrokTokenManager {
                     .map(|offset| (start + offset) % entries.len())
                     .find_map(|index| {
                         let entry = &entries[index];
-                        (!entry.disabled && pool_matches(entry, allowed_pools)).then_some(entry.id)
+                        (!entry.disabled
+                            && pool_matches(entry, allowed_pools)
+                            && credential_supports(entry, model_id, reasoning_effort, backend))
+                        .then_some(entry.id)
                     })
             }
         }
@@ -818,6 +917,23 @@ fn pool_matches(entry: &CredentialEntry, allowed_pools: Option<&[String]>) -> bo
     }
 }
 
+/// 已加载目录时严格过滤；目录尚未取得时未知放行。这样模型控制平面短暂故障
+/// 不会把本来可推理的 OAuth/API-token 凭据排除在外。
+fn credential_supports(
+    entry: &CredentialEntry,
+    model_id: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+    backend: Option<GrokApiBackend>,
+) -> bool {
+    let Some(model_id) = model_id else {
+        return true;
+    };
+    entry
+        .model_index
+        .as_ref()
+        .is_none_or(|index| index.supports(model_id, reasoning_effort, backend))
+}
+
 fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
@@ -841,6 +957,7 @@ pub type SharedGrokTokenManager = Arc<GrokTokenManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> PathBuf {
@@ -878,7 +995,10 @@ mod tests {
             },
         ]);
         let pools = vec!["two".to_string()];
-        let context = manager.acquire_context(Some(&pools)).await.unwrap();
+        let context = manager
+            .acquire_context(None, None, None, Some(&pools))
+            .await
+            .unwrap();
         assert_eq!(context.id, 2);
     }
 
@@ -893,5 +1013,74 @@ mod tests {
         assert!(manager.report_failure(1));
         assert!(!manager.report_failure(1));
         assert!(manager.snapshot().entries[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn chooses_only_credential_whose_catalog_supports_model_and_effort() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+        ]);
+        manager
+            .set_model_catalog(
+                1,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-4.5",
+                        "apiBackend":"responses",
+                        "supportsReasoningEffort":true,
+                        "reasoningEfforts":["low","medium","high"]
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+        manager
+            .set_model_catalog(
+                2,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-composer-2.5-fast",
+                        "apiBackend":"responses",
+                        "supportsReasoningEffort":true,
+                        "reasoningEfforts":["low","medium","high","xhigh"]
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+
+        let context = manager
+            .acquire_context(
+                Some("grok-composer-2.5-fast"),
+                Some(ReasoningEffort::Xhigh),
+                Some(GrokApiBackend::Responses),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.id, 2);
+
+        let error = match manager
+            .acquire_context(
+                Some("grok-4.5"),
+                Some(ReasoningEffort::Xhigh),
+                Some(GrokApiBackend::Responses),
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("unsupported effort must not select a credential"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("grok-4.5"));
     }
 }
