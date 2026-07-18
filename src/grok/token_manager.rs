@@ -134,6 +134,9 @@ pub struct GrokTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     current_id: Mutex<u64>,
     refresh_lock: AsyncMutex<()>,
+    /// 串行化 snapshot -> temp write -> rename 整个事务，防止较旧 snapshot
+    /// 在较新写入完成后才 rename，令磁盘状态倒退。
+    persist_lock: Mutex<()>,
     credentials_path: PathBuf,
     load_balancing_mode: Mutex<String>,
     reasoning_signature_codec: ReasoningSignatureCodec,
@@ -209,6 +212,7 @@ impl GrokTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(current_id),
             refresh_lock: AsyncMutex::new(()),
+            persist_lock: Mutex::new(()),
             credentials_path,
             load_balancing_mode: Mutex::new(mode),
             reasoning_signature_codec,
@@ -1146,6 +1150,7 @@ impl GrokTokenManager {
     }
 
     fn persist_credentials(&self) -> anyhow::Result<()> {
+        let _persist_guard = self.persist_lock.lock();
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -1170,10 +1175,7 @@ impl GrokTokenManager {
                 .and_then(|name| name.to_str())
                 .unwrap_or("grok_credentials.json"),
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
+            uuid::Uuid::new_v4().simple(),
         );
         let temporary_path = self
             .credentials_path
@@ -1182,12 +1184,15 @@ impl GrokTokenManager {
             .unwrap_or_else(|| PathBuf::from(&unique));
         std::fs::write(&temporary_path, json)
             .with_context(|| format!("写入临时 Grok 凭据文件失败: {}", temporary_path.display()))?;
-        std::fs::rename(&temporary_path, &self.credentials_path).with_context(|| {
-            format!(
-                "替换 Grok 凭据文件失败: {}",
-                self.credentials_path.display()
-            )
-        })?;
+        if let Err(error) = std::fs::rename(&temporary_path, &self.credentials_path) {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "替换 Grok 凭据文件失败: {}",
+                    self.credentials_path.display()
+                )
+            });
+        }
         Ok(())
     }
 }
@@ -1494,17 +1499,53 @@ mod tests {
     }
 
     #[test]
-    fn persist_credentials_uses_unique_temp_suffix_pattern() {
-        // 结构校验：源码路径生成含 pid 与 nanos，而非固定 json.tmp。
-        let source = include_str!("token_manager.rs");
-        assert!(
-            source.contains("json.tmp") == false
-                || source.contains(".tmp.{}-{}")
-                || source.contains(".tmp."),
-            "persist_credentials must use unique temp names"
+    fn concurrent_mutations_persist_the_latest_complete_snapshot() {
+        let credentials_path = temp_path("grok-concurrent-persist");
+        let credentials = (1..=8)
+            .map(|id| GrokCredentials {
+                id: Some(id),
+                access_token: Some(format!("token-{id}")),
+                name: Some(format!("initial-{id}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let manager = Arc::new(
+            GrokTokenManager::new(
+                Config::default(),
+                credentials,
+                None,
+                credentials_path.clone(),
+            )
+            .unwrap(),
         );
-        assert!(source.contains("std::process::id()"));
-        assert!(!source.contains("with_extension(\"json.tmp\")"));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let handles = (1..=8)
+            .map(|id| {
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.set_name(id, format!("final-{id}")).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let persisted: Vec<GrokCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        for id in 1..=8 {
+            let credential = persisted
+                .iter()
+                .find(|credential| credential.id == Some(id))
+                .unwrap();
+            let expected_name = format!("final-{id}");
+            assert_eq!(credential.name.as_deref(), Some(expected_name.as_str()));
+        }
+        let _ = std::fs::remove_file(&credentials_path);
+        let _ = std::fs::remove_file(credentials_path.with_extension("reasoning.key"));
     }
 
     #[test]
