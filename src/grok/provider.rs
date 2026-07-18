@@ -290,7 +290,8 @@ impl GrokProvider {
             };
             let status = response.status();
             if status.is_success() {
-                self.token_manager.report_success(context.id);
+                // 不在此处 report_success：流式/聚合路径必须在终态
+                // （response.completed / 完整 JSON）确认后才记健康成功。
                 return Ok(GrokUpstreamResponse {
                     response,
                     credential_id: context.id,
@@ -374,9 +375,17 @@ impl GrokProvider {
         let mut forced_refresh = HashSet::new();
 
         for attempt in 0..max_attempts {
+            // Files 只能被 Responses backend 的 input_file 引用；上传时就过滤掉
+            // Chat-only 凭据，避免上传成功后 convert 阶段 FilesRequireResponses。
             let context = match self
                 .token_manager
-                .acquire_context(None, None, None, false, allowed_pools)
+                .acquire_context(
+                    None,
+                    None,
+                    Some(GrokApiBackend::Responses),
+                    false,
+                    allowed_pools,
+                )
                 .await
             {
                 Ok(context) => context,

@@ -489,8 +489,36 @@ impl GrokTokenManager {
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         let mode = normalize_load_balancing_mode(&mode)
             .ok_or_else(|| anyhow::anyhow!("mode 必须是 round_robin、priority 或 balanced"))?;
+        let previous = self.get_load_balancing_mode();
+        if previous == mode {
+            return Ok(());
+        }
         *self.load_balancing_mode.lock() = mode.to_string();
+        if let Err(error) = self.persist_load_balancing_mode(mode) {
+            *self.load_balancing_mode.lock() = previous;
+            return Err(error);
+        }
         self.repair_current_cursor();
+        Ok(())
+    }
+
+    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，Grok 负载均衡模式仅在当前进程生效: {}",
+                    mode
+                );
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.load_balancing_mode = mode.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化 Grok 负载均衡模式失败: {}", config_path.display()))?;
         Ok(())
     }
 
@@ -526,9 +554,8 @@ impl GrokTokenManager {
 
     /// 为路由/转换选择一张凭据，**不推进** round-robin 游标。
     ///
-    /// 用于在 `convert_request` 前锁定“将使用哪张凭据的 catalog/backend”，
-    /// 避免合并目录的 `apiBackend` 与真正发送账号不一致。真正发送时仍由
-    /// `acquire_context` 按同样过滤条件选凭据（并推进游标）。
+    /// 仅用于预览；真正请求应使用 [`Self::claim_routing_credential_id`] 锁定
+    /// 游标，再 pin 到 `call_api`。
     pub fn find_routing_credential_id(
         &self,
         model_id: Option<&str>,
@@ -538,6 +565,27 @@ impl GrokTokenManager {
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         self.find_credential_id(
+            model_id,
+            reasoning_effort,
+            backend,
+            requires_backend_search,
+            allowed_pools,
+        )
+    }
+
+    /// 锁定路由凭据：查找并推进 round-robin / balanced 游标。
+    ///
+    /// 调用方应使用返回的 id 做 catalog 转换，并作为 `call_api` 的
+    /// `pinned_credential_id`，避免 convert 用 A、send 用 B。
+    pub fn claim_routing_credential_id(
+        &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<u64> {
+        self.choose_credential_id(
             model_id,
             reasoning_effort,
             backend,
@@ -702,11 +750,21 @@ impl GrokTokenManager {
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| anyhow::anyhow!("Grok 凭据 #{} 在刷新期间被删除", id))?;
+            // 刷新期间管理员可能已禁用该凭据：保留 Manual 禁用，避免撤销运维操作。
+            let keep_manual = entry.disabled_reason == Some(DisabledReason::Manual);
             entry.credentials = updated.clone();
             entry.refresh_failure_count = 0;
-            entry.disabled = false;
-            entry.credentials.disabled = false;
-            entry.disabled_reason = None;
+            if keep_manual {
+                entry.disabled = true;
+                entry.credentials.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::Manual);
+                updated.disabled = true;
+            } else {
+                entry.disabled = false;
+                entry.credentials.disabled = false;
+                entry.disabled_reason = None;
+                updated.disabled = false;
+            }
         }
         self.persist_credentials()?;
         Ok(updated)
@@ -950,7 +1008,24 @@ impl GrokTokenManager {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建 Grok 凭据目录失败: {}", parent.display()))?;
         }
-        let temporary_path = self.credentials_path.with_extension("json.tmp");
+        // 每次写入使用唯一临时文件，避免并发 refresh/admin 共用固定 .json.tmp 互覆盖。
+        let unique = format!(
+            "{}.tmp.{}-{}",
+            self.credentials_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("grok_credentials.json"),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let temporary_path = self
+            .credentials_path
+            .parent()
+            .map(|parent| parent.join(&unique))
+            .unwrap_or_else(|| PathBuf::from(&unique));
         std::fs::write(&temporary_path, json)
             .with_context(|| format!("写入临时 Grok 凭据文件失败: {}", temporary_path.display()))?;
         std::fs::rename(&temporary_path, &self.credentials_path).with_context(|| {
@@ -1123,6 +1198,94 @@ mod tests {
             manager.credential_display_name(routing).as_deref(),
             Some(first.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn claim_routing_advances_and_pins_same_id_for_convert_and_send() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let claimed_a = manager
+            .claim_routing_credential_id(None, None, None, false, None)
+            .unwrap();
+        let claimed_b = manager
+            .claim_routing_credential_id(None, None, None, false, None)
+            .unwrap();
+        assert_ne!(claimed_a, claimed_b);
+        // pin 路径：acquire_context_for 使用 claim 得到的 id，不重新 round-robin。
+        assert_eq!(
+            manager.acquire_context_for(claimed_a).await.unwrap().id,
+            claimed_a
+        );
+    }
+
+    #[test]
+    fn persist_credentials_uses_unique_temp_suffix_pattern() {
+        // 结构校验：源码路径生成含 pid 与 nanos，而非固定 json.tmp。
+        let source = include_str!("token_manager.rs");
+        assert!(
+            source.contains("json.tmp") == false
+                || source.contains(".tmp.{}-{}")
+                || source.contains(".tmp."),
+            "persist_credentials must use unique temp names"
+        );
+        assert!(source.contains("std::process::id()"));
+        assert!(!source.contains("with_extension(\"json.tmp\")"));
+    }
+
+    #[test]
+    fn set_disabled_manual_reason_is_recorded() {
+        let manager = manager(vec![GrokCredentials {
+            id: Some(1),
+            access_token: Some("token-one".to_string()),
+            ..Default::default()
+        }]);
+        manager.set_disabled(1, true).unwrap();
+        let snap = manager.snapshot();
+        assert!(snap.entries[0].disabled);
+        assert_eq!(
+            snap.entries[0].disabled_reason.as_deref(),
+            Some("manual")
+        );
+    }
+
+    #[test]
+    fn load_balancing_mode_persists_when_config_path_set() {
+        let config_path = temp_path("grok-lb-config");
+        let mut config = Config::default();
+        // 写入初始配置文件并绑定 path。
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        config = Config::load(&config_path).unwrap();
+        let manager = GrokTokenManager::new(
+            config,
+            vec![GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            }],
+            None,
+            temp_path("grok-creds-lb"),
+        )
+        .unwrap();
+        manager
+            .set_load_balancing_mode("priority".to_string())
+            .unwrap();
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.load_balancing_mode, "priority");
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[test]

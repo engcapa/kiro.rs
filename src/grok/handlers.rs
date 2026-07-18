@@ -469,14 +469,14 @@ pub async fn post_messages(
         }
     };
 
-    // 2) 选定路由凭据，并用**该凭据**的 catalog 做 wire 转换，保证
-    //    backend/body 与真正发送账号一致（修复合并目录 apiBackend 误导）。
-    let routing_credential_id = match file_credential_id {
+    // 2) 锁定路由凭据（推进 RR 游标），并用**该凭据**的 catalog 做 wire 转换，
+    //    再 pin 到 call_api，保证 convert 与 send 原子一致。
+    let pinned_credential_id = match file_credential_id {
         Some(id) => Some(id),
         None => state
             .provider
             .token_manager()
-            .find_routing_credential_id(
+            .claim_routing_credential_id(
                 Some(&plan.model),
                 plan.reasoning_effort,
                 plan.backend_constraint(),
@@ -485,7 +485,7 @@ pub async fn post_messages(
             )
             .ok(),
     };
-    let routing_catalog = routing_credential_id
+    let routing_catalog = pinned_credential_id
         .and_then(|id| state.provider.token_manager().catalog_for(id))
         .or_else(|| merged_catalog.clone());
     // 规范化为 wire model id，避免目标凭据 catalog 只有正式 id、没有别名。
@@ -495,7 +495,7 @@ pub async fn post_messages(
         &payload,
         &state.default_model,
         routing_catalog.as_deref(),
-        routing_credential_id,
+        pinned_credential_id,
     ) {
         Ok(converted) => converted,
         Err(error) => {
@@ -510,21 +510,12 @@ pub async fn post_messages(
         }
     };
 
-    let credential_name = routing_credential_id
+    let credential_name = pinned_credential_id
         .and_then(|id| {
             state
                 .provider
                 .token_manager()
                 .credential_display_name(id)
-        })
-        .or_else(|| {
-            state.provider.token_manager().peek_next_credential_name(
-                Some(&converted.model),
-                converted.reasoning_effort,
-                Some(converted.backend),
-                converted.uses_hosted_web_search,
-                Some(&allowed_pools.0),
-            )
         })
         .unwrap_or_else(|| "None".to_string());
     tracing::info!(
@@ -535,7 +526,7 @@ pub async fn post_messages(
         message_count = payload.messages.len(),
         api_key_name = %api_key_info.name,
         credential_name = %credential_name,
-        routing_credential_id = ?routing_credential_id,
+        pinned_credential_id = ?pinned_credential_id,
         pools = ?allowed_pools.0,
         "Received POST /grok/v1/messages request"
     );
@@ -552,7 +543,7 @@ pub async fn post_messages(
             converted.reasoning_effort,
             payload.stream,
             allowed_pools.0,
-            file_credential_id,
+            pinned_credential_id,
         )
         .await;
     }
@@ -571,7 +562,7 @@ pub async fn post_messages(
             converted.reasoning_effort,
             converted.uses_hosted_web_search,
             allowed_pools.0,
-            file_credential_id,
+            pinned_credential_id,
         )
         .await
     } else {
@@ -585,7 +576,7 @@ pub async fn post_messages(
             converted.reasoning_effort,
             converted.uses_hosted_web_search,
             &allowed_pools.0,
-            file_credential_id,
+            pinned_credential_id,
         )
         .await
     }
@@ -620,7 +611,7 @@ async fn stream_response(
     reasoning_effort: Option<ReasoningEffort>,
     uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
-    file_credential_id: Option<u64>,
+    pinned_credential_id: Option<u64>,
 ) -> Response {
     let stream = create_sse_stream(
         state,
@@ -632,7 +623,7 @@ async fn stream_response(
         reasoning_effort,
         uses_hosted_web_search,
         allowed_pools,
-        file_credential_id,
+        pinned_credential_id,
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -656,7 +647,7 @@ fn create_sse_stream(
     reasoning_effort: Option<ReasoningEffort>,
     uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
-    file_credential_id: Option<u64>,
+    pinned_credential_id: Option<u64>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut context = GrokStreamContext::new(model.clone(), input_tokens, thinking_enabled);
@@ -673,23 +664,21 @@ fn create_sse_stream(
             reasoning_effort,
             uses_hosted_web_search,
             Some(&allowed_pools),
-            file_credential_id,
+            pinned_credential_id,
         );
         tokio::pin!(connect);
+        let mut credential_id = None;
         let response = loop {
             tokio::select! {
                 result = &mut connect => match result {
                     Ok(upstream) => {
+                        credential_id = Some(upstream.credential_id);
                         context.set_credential_id(upstream.credential_id);
                         break Some(upstream.response);
                     }
                     Err(error) => {
-                        // 已发 message_start：先 error，再收尾未关闭块 / message_stop，
-                        // 避免部分客户端挂在半开 message 上。
+                        // 已发 message_start：只发 error，不发成功态 message_stop。
                         yield Ok(provider_error_sse(&error));
-                        for event in context.finish_events() {
-                            yield Ok(Bytes::from(event.to_sse_string()));
-                        }
                         break None;
                     }
                 },
@@ -699,6 +688,7 @@ fn create_sse_stream(
         let Some(response) = response else { return };
 
         let mut decoder = XaiSseDecoder::default();
+        let mut saw_upstream_error = false;
         let body_stream = response.bytes_stream();
         tokio::pin!(body_stream);
         loop {
@@ -707,10 +697,12 @@ fn create_sse_stream(
                     Some(Ok(chunk)) => {
                         for upstream_event in decoder.feed(&chunk) {
                             if let Some(message) = upstream_error_message(&upstream_event) {
-                                yield Ok(upstream_error_sse(&message));
-                                for event in context.finish_events() {
-                                    yield Ok(Bytes::from(event.to_sse_string()));
+                                saw_upstream_error = true;
+                                if let Some(id) = credential_id {
+                                    state.provider.token_manager().report_failure(id);
                                 }
+                                yield Ok(upstream_error_sse(&message));
+                                // 不发成功态 message_stop。
                                 return;
                             }
                             for event in context.process_event(&upstream_event) {
@@ -720,12 +712,12 @@ fn create_sse_stream(
                     }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "读取 xAI SSE 响应失败");
+                        if let Some(id) = credential_id {
+                            state.provider.token_manager().report_failure(id);
+                        }
                         yield Ok(upstream_error_sse(&format!(
                             "读取 xAI SSE 响应失败: {error}"
                         )));
-                        for event in context.finish_events() {
-                            yield Ok(Bytes::from(event.to_sse_string()));
-                        }
                         return;
                     }
                     None => break,
@@ -735,15 +727,31 @@ fn create_sse_stream(
         }
         for upstream_event in decoder.finish() {
             if let Some(message) = upstream_error_message(&upstream_event) {
-                yield Ok(upstream_error_sse(&message));
-                for event in context.finish_events() {
-                    yield Ok(Bytes::from(event.to_sse_string()));
+                saw_upstream_error = true;
+                if let Some(id) = credential_id {
+                    state.provider.token_manager().report_failure(id);
                 }
+                yield Ok(upstream_error_sse(&message));
                 return;
             }
             for event in context.process_event(&upstream_event) {
                 yield Ok(Bytes::from(event.to_sse_string()));
             }
+        }
+        if saw_upstream_error {
+            return;
+        }
+        if !context.completed() {
+            if let Some(id) = credential_id {
+                state.provider.token_manager().report_failure(id);
+            }
+            yield Ok(upstream_error_sse(
+                "xAI 响应在收到 response.completed / response.incomplete / [DONE] 前结束",
+            ));
+            return;
+        }
+        if let Some(id) = credential_id {
+            state.provider.token_manager().report_success(id);
         }
         for event in context.finish_events() {
             yield Ok(Bytes::from(event.to_sse_string()));
@@ -761,7 +769,7 @@ async fn non_stream_response(
     reasoning_effort: Option<ReasoningEffort>,
     uses_hosted_web_search: bool,
     allowed_pools: &[String],
-    file_credential_id: Option<u64>,
+    pinned_credential_id: Option<u64>,
 ) -> Response {
     let upstream = match state
         .provider
@@ -772,7 +780,7 @@ async fn non_stream_response(
             reasoning_effort,
             uses_hosted_web_search,
             Some(allowed_pools),
-            file_credential_id,
+            pinned_credential_id,
         )
         .await
     {
@@ -783,6 +791,7 @@ async fn non_stream_response(
     let bytes = match upstream.response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
+            state.provider.token_manager().report_failure(credential_id);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -800,6 +809,7 @@ async fn non_stream_response(
     let events = decoder.feed(&bytes);
     for event in events.into_iter().chain(decoder.finish()) {
         if let Some(message) = upstream_error_message(&event) {
+            state.provider.token_manager().report_failure(credential_id);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new("api_error", message)),
@@ -821,6 +831,7 @@ async fn non_stream_response(
         }
     }
     if !context.completed() {
+        state.provider.token_manager().report_failure(credential_id);
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -830,6 +841,7 @@ async fn non_stream_response(
         )
             .into_response();
     }
+    state.provider.token_manager().report_success(credential_id);
     Json(context.to_anthropic_response()).into_response()
 }
 
@@ -843,7 +855,7 @@ async fn messages_backend_response(
     reasoning_effort: Option<ReasoningEffort>,
     stream_requested: bool,
     allowed_pools: Vec<String>,
-    file_credential_id: Option<u64>,
+    pinned_credential_id: Option<u64>,
 ) -> Response {
     if stream_requested {
         let stream = create_messages_sse_stream(
@@ -852,7 +864,7 @@ async fn messages_backend_response(
             model,
             reasoning_effort,
             allowed_pools,
-            file_credential_id,
+            pinned_credential_id,
         );
         return Response::builder()
             .status(StatusCode::OK)
@@ -874,30 +886,37 @@ async fn messages_backend_response(
             reasoning_effort,
             false,
             Some(&allowed_pools),
-            file_credential_id,
+            pinned_credential_id,
         )
         .await
     {
         Ok(upstream) => upstream,
         Err(error) => return map_provider_error(error),
     };
+    let credential_id = upstream.credential_id;
     match upstream.response.bytes().await {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(bytes))
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "构建 Grok Messages JSON 响应失败");
-                Response::new(Body::empty())
-            }),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "api_error",
-                format!("读取 xAI Messages 响应失败: {error}"),
-            )),
-        )
-            .into_response(),
+        Ok(bytes) => {
+            state.provider.token_manager().report_success(credential_id);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "构建 Grok Messages JSON 响应失败");
+                    Response::new(Body::empty())
+                })
+        }
+        Err(error) => {
+            state.provider.token_manager().report_failure(credential_id);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("读取 xAI Messages 响应失败: {error}"),
+                )),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -907,7 +926,7 @@ fn create_messages_sse_stream(
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
     allowed_pools: Vec<String>,
-    file_credential_id: Option<u64>,
+    pinned_credential_id: Option<u64>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -919,13 +938,17 @@ fn create_messages_sse_stream(
             reasoning_effort,
             false,
             Some(&allowed_pools),
-            file_credential_id,
+            pinned_credential_id,
         );
         tokio::pin!(connect);
+        let mut credential_id = None;
         let response = loop {
             tokio::select! {
                 result = &mut connect => match result {
-                    Ok(response) => break Some(response.response),
+                    Ok(upstream) => {
+                        credential_id = Some(upstream.credential_id);
+                        break Some(upstream.response);
+                    }
                     Err(error) => {
                         yield Ok(provider_error_sse(&error));
                         break None;
@@ -937,12 +960,21 @@ fn create_messages_sse_stream(
         let Some(response) = response else { return };
         let body_stream = response.bytes_stream();
         tokio::pin!(body_stream);
+        let mut saw_bytes = false;
+        let mut read_error = false;
         loop {
             tokio::select! {
                 chunk = body_stream.next() => match chunk {
-                    Some(Ok(chunk)) => yield Ok(chunk),
+                    Some(Ok(chunk)) => {
+                        saw_bytes = true;
+                        yield Ok(chunk);
+                    }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "读取 xAI Messages SSE 响应失败");
+                        read_error = true;
+                        if let Some(id) = credential_id {
+                            state.provider.token_manager().report_failure(id);
+                        }
                         yield Ok(upstream_error_sse(&format!("读取 xAI Messages SSE 响应失败: {error}")));
                         return;
                     }
@@ -951,27 +983,84 @@ fn create_messages_sse_stream(
                 _ = ping.tick() => yield Ok(ping_sse()),
             }
         }
+        // 透传路径无法解析 Anthropic 终态；仅在读失败时记失败，正常 EOF 记成功。
+        if !read_error {
+            if let Some(id) = credential_id {
+                if saw_bytes {
+                    state.provider.token_manager().report_success(id);
+                } else {
+                    state.provider.token_manager().report_failure(id);
+                    yield Ok(upstream_error_sse("xAI Messages 流在无任何数据时结束"));
+                }
+            }
+        }
     }
 }
 
 fn map_provider_error(error: anyhow::Error) -> Response {
     let message = error.to_string();
-    let status = if message.contains("无权访问") {
+    let status = status_from_provider_message(&message);
+    (status, Json(ErrorResponse::new("api_error", message))).into_response()
+}
+
+/// 从 provider 错误文案中提取 HTTP 状态；优先识别数字状态码，再回退中文语义。
+fn status_from_provider_message(message: &str) -> StatusCode {
+    for code in [401_u16, 403, 404, 408, 413, 422, 429, 400, 500, 502, 503] {
+        let patterns = [
+            format!("请求失败: {code}"),
+            format!(": {code} "),
+            format!(" {code} "),
+            format!(" {code}\n"),
+            format!("API 请求失败: {code}"),
+        ];
+        if patterns.iter().any(|pattern| message.contains(pattern.as_str()))
+            || message.contains(&format!(": {code}"))
+                && message
+                    .split(": ")
+                    .any(|part| part.starts_with(&format!("{code} ")) || part == code.to_string())
+        {
+            // 上游 5xx 对客户端仍映射为 502。
+            return match code {
+                500 | 502 | 503 => StatusCode::BAD_GATEWAY,
+                other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
+            };
+        }
+    }
+    // reqwest::StatusCode Display 形如 "401 Unauthorized"
+    for (code, status) in [
+        (401, StatusCode::UNAUTHORIZED),
+        (403, StatusCode::FORBIDDEN),
+        (404, StatusCode::NOT_FOUND),
+        (429, StatusCode::TOO_MANY_REQUESTS),
+        (400, StatusCode::BAD_REQUEST),
+        (413, StatusCode::PAYLOAD_TOO_LARGE),
+        (422, StatusCode::UNPROCESSABLE_ENTITY),
+        (408, StatusCode::REQUEST_TIMEOUT),
+    ] {
+        if message.contains(&format!("{code} ")) || message.ends_with(&code.to_string()) {
+            // 避免把 body 里的随机数字误判：要求出现标准短语或 "请求失败"
+            if message.contains("Unauthorized")
+                || message.contains("Forbidden")
+                || message.contains("Not Found")
+                || message.contains("Too Many Requests")
+                || message.contains("Bad Request")
+                || message.contains("请求失败")
+                || message.contains("API 请求失败")
+                || message.contains("配额")
+            {
+                return status;
+            }
+        }
+    }
+    if message.contains("无权访问") {
         StatusCode::FORBIDDEN
-    } else if message.contains("视频任务不存在或已过期") || message.contains("请求失败: 404")
-    {
+    } else if message.contains("视频任务不存在或已过期") {
         StatusCode::NOT_FOUND
     } else if message.contains("没有可用") || message.contains("未配置 Grok 凭据") {
         StatusCode::SERVICE_UNAVAILABLE
-    } else if message.contains("请求失败: 400")
-        || message.contains("请求失败: 413")
-        || message.contains("请求失败: 422")
-    {
-        StatusCode::BAD_REQUEST
     } else {
         StatusCode::BAD_GATEWAY
-    };
-    (status, Json(ErrorResponse::new("api_error", message))).into_response()
+    }
 }
 
 fn file_store_error(error: FileStoreError) -> Response {
@@ -1074,19 +1163,31 @@ fn upstream_error_sse(message: &str) -> Bytes {
     ))
 }
 
+/// 仅当 error 字段为非 null 的真实错误载荷时视为失败。
+/// xAI Responses 成功事件常带 `"error": null`。
+fn is_present_error_value(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(_) => true,
+    }
+}
+
 fn upstream_error_message(event: &Value) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str);
+    let top_error = event.get("error");
+    let nested_error = event.pointer("/response/error");
     let is_error = event_type == Some("error")
         || event_type == Some("response.failed")
-        || event.get("error").is_some()
-        || event.pointer("/response/error").is_some();
+        || is_present_error_value(top_error)
+        || is_present_error_value(nested_error);
     if !is_error {
         return None;
     }
-    let error = event
-        .get("error")
-        .or_else(|| event.pointer("/response/error"))
-        .unwrap_or(event);
+    let error = match (top_error, nested_error) {
+        (Some(value), _) if !value.is_null() => value,
+        (_, Some(value)) if !value.is_null() => value,
+        _ => event,
+    };
     Some(
         error
             .get("message")
@@ -1109,6 +1210,57 @@ mod tests {
         assert_eq!(
             upstream_error_message(&event).as_deref(),
             Some("upstream failed")
+        );
+    }
+
+    #[test]
+    fn null_response_error_is_not_failure() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "error": null,
+                "output": []
+            }
+        });
+        assert_eq!(upstream_error_message(&event), None);
+    }
+
+    #[test]
+    fn top_level_null_error_is_not_failure() {
+        let event = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hi",
+            "error": null
+        });
+        assert_eq!(upstream_error_message(&event), None);
+    }
+
+    #[test]
+    fn real_error_object_still_surfaces_message() {
+        let event = serde_json::json!({
+            "type": "error",
+            "error": { "message": "rate limited", "type": "api_error" }
+        });
+        assert_eq!(
+            upstream_error_message(&event).as_deref(),
+            Some("rate limited")
+        );
+    }
+
+    #[test]
+    fn status_mapping_recognizes_401_and_429() {
+        assert_eq!(
+            status_from_provider_message("xAI responses API 请求失败: 401 Unauthorized {}"),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_from_provider_message("xAI responses API 请求失败: 429 Too Many Requests {}"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status_from_provider_message("xAI responses API 请求失败: 403 Forbidden {}"),
+            StatusCode::FORBIDDEN
         );
     }
 }

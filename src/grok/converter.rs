@@ -58,6 +58,7 @@ pub enum ConversionError {
     WebSearchRequiresResponses(String),
     WebSearchUnsupported(String),
     FilesRequireResponses(String),
+    UnsupportedContentBlock(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -84,6 +85,10 @@ impl std::fmt::Display for ConversionError {
             Self::FilesRequireResponses(model) => write!(
                 formatter,
                 "模型 {model} 使用非 Responses backend；Anthropic source.type=file 需要 xAI Responses backend"
+            ),
+            Self::UnsupportedContentBlock(detail) => write!(
+                formatter,
+                "不支持的 Anthropic 内容块，请先转换或移除: {detail}"
             ),
         }
     }
@@ -181,10 +186,10 @@ pub fn convert_request_for_credential(
 
     let body = match backend {
         GrokApiBackend::Responses => {
-            build_responses_body(request, &model, reasoning_effort, replay_credential_id)
+            build_responses_body(request, &model, reasoning_effort, replay_credential_id)?
         }
         GrokApiBackend::ChatCompletions => {
-            build_chat_completions_body(request, &model, reasoning_effort)
+            build_chat_completions_body(request, &model, reasoning_effort)?
         }
         GrokApiBackend::Messages => build_messages_body(request, &model, reasoning_effort),
     };
@@ -271,7 +276,7 @@ fn build_responses_body(
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
     replay_credential_id: Option<u64>,
-) -> Value {
+) -> Result<Value, ConversionError> {
     let mut input = Vec::new();
     let mut instructions = Vec::new();
 
@@ -293,9 +298,9 @@ fn build_responses_body(
                 }
             }
             "assistant" => {
-                append_assistant_message(&mut input, &message.content, replay_credential_id)
+                append_assistant_message(&mut input, &message.content, replay_credential_id)?;
             }
-            _ => append_user_message(&mut input, &message.content),
+            _ => append_user_message(&mut input, &message.content)?,
         }
     }
 
@@ -343,18 +348,19 @@ fn build_responses_body(
         reasoning["effort"] = Value::String(effort.as_str().to_string());
     }
     body["reasoning"] = reasoning;
-    body
+    Ok(body)
 }
 
 fn build_chat_completions_body(
     request: &MessagesRequest,
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
-) -> Value {
+) -> Result<Value, ConversionError> {
     let mut body = json!({
         "model": model,
-        "messages": build_chat_messages(request),
-        "max_completion_tokens": request.max_tokens.max(1),
+        "messages": build_chat_messages(request)?,
+        // 与 Grok Build ChatCompletionRequest / xAI Chat 对照一致：使用 max_tokens。
+        "max_tokens": request.max_tokens.max(1),
         "stream_options": { "include_usage": true },
     });
     let tools = request
@@ -375,7 +381,7 @@ fn build_chat_completions_body(
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = Value::String(effort.as_str().to_string());
     }
-    body
+    Ok(body)
 }
 
 fn build_messages_body(
@@ -409,7 +415,7 @@ fn build_messages_body(
     body
 }
 
-fn build_chat_messages(request: &MessagesRequest) -> Vec<Value> {
+fn build_chat_messages(request: &MessagesRequest) -> Result<Vec<Value>, ConversionError> {
     let mut messages = Vec::new();
     if let Some(system) = &request.system {
         let text = system
@@ -430,21 +436,24 @@ fn build_chat_messages(request: &MessagesRequest) -> Vec<Value> {
                     messages.push(json!({ "role": message.role, "content": text }));
                 }
             }
-            "assistant" => append_chat_assistant_message(&mut messages, &message.content),
-            _ => append_chat_user_message(&mut messages, &message.content),
+            "assistant" => append_chat_assistant_message(&mut messages, &message.content)?,
+            _ => append_chat_user_message(&mut messages, &message.content)?,
         }
     }
-    messages
+    Ok(messages)
 }
 
-fn append_chat_user_message(messages: &mut Vec<Value>, content: &Value) {
+fn append_chat_user_message(
+    messages: &mut Vec<Value>,
+    content: &Value,
+) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
         let text = value_to_text(content);
         if !text.is_empty() {
             messages.push(json!({ "role": "user", "content": text }));
         }
-        return;
+        return Ok(());
     }
     let mut content_parts = Vec::new();
     for block in blocks {
@@ -470,23 +479,34 @@ fn append_chat_user_message(messages: &mut Vec<Value>, content: &Value) {
                     }));
                 }
             }
+            "document" => {
+                return Err(ConversionError::UnsupportedContentBlock(
+                    "Chat Completions 不支持 document 块；请使用 Responses backend 与 Files API"
+                        .to_string(),
+                ));
+            }
             "text" => {
                 if let Some(text) = block.text.filter(|text| !text.is_empty()) {
                     content_parts.push(json!({ "type": "text", "text": text }));
                 }
             }
-            _ => {
+            other => {
                 if let Some(text) = block
                     .text
                     .or(block.thinking)
                     .filter(|text| !text.is_empty())
                 {
                     content_parts.push(json!({ "type": "text", "text": text }));
+                } else if !matches!(other, "thinking") {
+                    return Err(ConversionError::UnsupportedContentBlock(format!(
+                        "Chat 路径不支持内容类型 {other}"
+                    )));
                 }
             }
         }
     }
     flush_chat_user_message(messages, &mut content_parts);
+    Ok(())
 }
 
 fn flush_chat_user_message(messages: &mut Vec<Value>, content_parts: &mut Vec<Value>) {
@@ -498,19 +518,27 @@ fn flush_chat_user_message(messages: &mut Vec<Value>, content_parts: &mut Vec<Va
     }
 }
 
-fn append_chat_assistant_message(messages: &mut Vec<Value>, content: &Value) {
+fn append_chat_assistant_message(
+    messages: &mut Vec<Value>,
+    content: &Value,
+) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
         let text = value_to_text(content);
         if !text.is_empty() {
             messages.push(json!({ "role": "assistant", "content": text }));
         }
-        return;
+        return Ok(());
     }
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block.block_type.as_str() {
+            "server_tool_use" | "web_search_tool_result" => {
+                return Err(ConversionError::UnsupportedContentBlock(
+                    "Chat Completions 不支持历史 server_tool_use / web_search_tool_result".to_string(),
+                ));
+            }
             "tool_use" => {
                 let id = block
                     .id
@@ -538,7 +566,11 @@ fn append_chat_assistant_message(messages: &mut Vec<Value>, content: &Value) {
                     text.push(value);
                 }
             }
-            _ => {}
+            other => {
+                return Err(ConversionError::UnsupportedContentBlock(format!(
+                    "Chat assistant 历史不支持内容类型 {other}"
+                )));
+            }
         }
     }
     if !text.is_empty() || !tool_calls.is_empty() {
@@ -551,9 +583,10 @@ fn append_chat_assistant_message(messages: &mut Vec<Value>, content: &Value) {
         }
         messages.push(message);
     }
+    Ok(())
 }
 
-fn append_user_message(input: &mut Vec<Value>, content: &Value) {
+fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
         let text = value_to_text(content);
@@ -563,7 +596,7 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                 vec![json!({ "type": "input_text", "text": text })],
             ));
         }
-        return;
+        return Ok(());
     }
 
     let mut content_parts = Vec::new();
@@ -591,6 +624,10 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                         "type": "input_image",
                         "image_url": url,
                     }));
+                } else {
+                    return Err(ConversionError::UnsupportedContentBlock(
+                        "image 块缺少 file_id 或可识别的 image_url/base64 source".to_string(),
+                    ));
                 }
             }
             "image_url" => {
@@ -599,6 +636,10 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                         "type": "input_image",
                         "image_url": url,
                     }));
+                } else {
+                    return Err(ConversionError::UnsupportedContentBlock(
+                        "image_url 块缺少可用 URL".to_string(),
+                    ));
                 }
             }
             "document" => {
@@ -607,6 +648,11 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                         "type": "input_file",
                         "file_id": file_id,
                     }));
+                } else {
+                    return Err(ConversionError::UnsupportedContentBlock(
+                        "document 仅支持 source.type=file（请先上传 Files API）；base64/URL document 不被静默丢弃"
+                            .to_string(),
+                    ));
                 }
             }
             "text" => {
@@ -616,22 +662,37 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                     }
                 }
             }
-            _ => {
+            "web_search_tool_result" => {
+                // 历史 server web search 结果：转成可读上下文，避免静默丢弃。
+                let summary = value_to_text(&block.content.unwrap_or(Value::Null));
+                if !summary.is_empty() {
+                    content_parts.push(json!({
+                        "type": "input_text",
+                        "text": format!("[web_search_tool_result]\n{summary}"),
+                    }));
+                }
+            }
+            other => {
                 let text = block.text.or(block.thinking).unwrap_or_default();
                 if !text.is_empty() {
                     content_parts.push(json!({ "type": "input_text", "text": text }));
+                } else {
+                    return Err(ConversionError::UnsupportedContentBlock(format!(
+                        "user 消息不支持内容类型 {other}"
+                    )));
                 }
             }
         }
     }
     flush_message(input, "user", &mut content_parts);
+    Ok(())
 }
 
 fn append_assistant_message(
     input: &mut Vec<Value>,
     content: &Value,
     replay_credential_id: Option<u64>,
-) {
+) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
         let text = value_to_text(content);
@@ -641,7 +702,7 @@ fn append_assistant_message(
                 vec![json!({ "type": "output_text", "text": text })],
             ));
         }
-        return;
+        return Ok(());
     }
 
     let mut content_parts = Vec::new();
@@ -695,10 +756,34 @@ fn append_assistant_message(
                     }
                 }
             }
-            _ => {}
+            "server_tool_use" => {
+                // 回放为可读文本，避免多轮历史静默丢失。
+                flush_message(input, "assistant", &mut content_parts);
+                let name = block.name.unwrap_or_else(|| "server_tool".to_string());
+                let input_json =
+                    serde_json::to_string(&block.input.unwrap_or_else(|| json!({})))
+                        .unwrap_or_else(|_| "{}".to_string());
+                content_parts.push(json!({
+                    "type": "output_text",
+                    "text": format!("[server_tool_use name={name}] {input_json}"),
+                }));
+            }
+            "web_search_tool_result" => {
+                let summary = value_to_text(&block.content.unwrap_or(Value::Null));
+                content_parts.push(json!({
+                    "type": "output_text",
+                    "text": format!("[web_search_tool_result]\n{summary}"),
+                }));
+            }
+            other => {
+                return Err(ConversionError::UnsupportedContentBlock(format!(
+                    "assistant 历史不支持内容类型 {other}"
+                )));
+            }
         }
     }
     flush_message(input, "assistant", &mut content_parts);
+    Ok(())
 }
 
 fn flush_message(input: &mut Vec<Value>, role: &str, content: &mut Vec<Value>) {
@@ -1049,6 +1134,38 @@ mod tests {
         assert_eq!(converted.backend, GrokApiBackend::ChatCompletions);
         assert!(converted.body.get("messages").is_some());
         assert!(converted.body.get("input").is_none());
+        assert_eq!(converted.body["max_tokens"], 128);
+        assert!(converted.body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn rejects_base64_document_instead_of_silent_drop() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([{
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "AAAA"
+                    }
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let error = convert_request(&request, "grok-4.5", None)
+            .expect_err("base64 document must not be dropped")
+            .to_string();
+        assert!(error.contains("document") || error.contains("不支持"));
     }
 
     #[test]

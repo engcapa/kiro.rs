@@ -9,18 +9,31 @@ use crate::anthropic::{SseEvent, SseStateManager};
 
 use super::reasoning_sig::{encode_signature, extract_reasoning_item};
 
+/// 按字节缓冲的 SSE 解码器：跨 chunk 保留不完整 UTF-8，并同时识别
+/// `\n\n` 与 `\r\n\r\n` 事件分隔符。
 #[derive(Default)]
 pub struct XaiSseDecoder {
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl XaiSseDecoder {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Value> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(index) = self.buffer.find("\n\n") {
-            let block = self.buffer[..index].replace('\r', "");
-            self.buffer.drain(..index + 2);
+        while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
+            let block_bytes = self.buffer[..sep_at].to_vec();
+            self.buffer.drain(..sep_at + sep_len);
+            let block = match String::from_utf8(block_bytes) {
+                Ok(block) => block,
+                Err(error) => {
+                    tracing::debug!(
+                        "xAI SSE 事件块含非法 UTF-8，按 lossy 解码: {}",
+                        error
+                    );
+                    String::from_utf8_lossy(error.as_bytes()).into_owned()
+                }
+            };
+            let block = block.replace('\r', "");
             if let Some(event) = parse_sse_block(&block) {
                 events.push(event);
             }
@@ -29,9 +42,37 @@ impl XaiSseDecoder {
     }
 
     pub fn finish(&mut self) -> Vec<Value> {
-        let block = std::mem::take(&mut self.buffer).replace('\r', "");
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let block_bytes = std::mem::take(&mut self.buffer);
+        let block = match String::from_utf8(block_bytes) {
+            Ok(block) => block,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        };
+        let block = block.replace('\r', "");
         parse_sse_block(&block).into_iter().collect()
     }
+}
+
+/// 返回事件分隔符在 buffer 中的起始下标与长度（2=`\n\n`，4=`\r\n\r\n`）。
+fn find_sse_event_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index + 1 < buffer.len() {
+        if index + 3 < buffer.len()
+            && buffer[index] == b'\r'
+            && buffer[index + 1] == b'\n'
+            && buffer[index + 2] == b'\r'
+            && buffer[index + 3] == b'\n'
+        {
+            return Some((index, 4));
+        }
+        if buffer[index] == b'\n' && buffer[index + 1] == b'\n' {
+            return Some((index, 2));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn parse_sse_block(block: &str) -> Option<Value> {
@@ -80,6 +121,15 @@ struct WebSearchBlock {
     result_emitted: bool,
 }
 
+/// 非流式 Anthropic `content` 组装顺序，镜像上游 `response.output` 交错顺序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrderedBlock {
+    Thinking,
+    Text,
+    WebSearch(String),
+    Tool(String),
+}
+
 /// 同时驱动流式事件和非流式聚合的状态机。
 pub struct GrokStreamContext {
     state: SseStateManager,
@@ -104,6 +154,8 @@ pub struct GrokStreamContext {
     tool_order: Vec<String>,
     web_search_blocks: HashMap<String, WebSearchBlock>,
     web_search_order: Vec<String>,
+    /// 内容块出现顺序（thinking / web_search / text / tools 交错）。
+    content_order: Vec<OrderedBlock>,
     stop_reason: Option<String>,
     completed: bool,
 }
@@ -130,8 +182,15 @@ impl GrokStreamContext {
             tool_order: Vec::new(),
             web_search_blocks: HashMap::new(),
             web_search_order: Vec::new(),
+            content_order: Vec::new(),
             stop_reason: None,
             completed: false,
+        }
+    }
+
+    fn note_content_order(&mut self, entry: OrderedBlock) {
+        if !self.content_order.contains(&entry) {
+            self.content_order.push(entry);
         }
     }
 
@@ -558,6 +617,7 @@ impl GrokStreamContext {
         events.extend(self.close_thinking_block());
         let index = self.state.next_block_index();
         self.text_block_index = Some(index);
+        self.note_content_order(OrderedBlock::Text);
         events.extend(self.state.handle_content_block_start(
             index,
             "text",
@@ -576,6 +636,7 @@ impl GrokStreamContext {
         }
         let index = self.state.next_block_index();
         self.thinking_block_index = Some(index);
+        self.note_content_order(OrderedBlock::Thinking);
         let events = self.state.handle_content_block_start(
             index,
             "thinking",
@@ -614,6 +675,7 @@ impl GrokStreamContext {
             },
         );
         self.tool_order.push(key.clone());
+        self.note_content_order(OrderedBlock::Tool(key.clone()));
         self.tool_aliases.insert(raw_key.to_string(), key.clone());
         self.tool_aliases.insert(id.clone(), key.clone());
         events.extend(self.state.handle_content_block_start(
@@ -660,6 +722,7 @@ impl GrokStreamContext {
             },
         );
         self.web_search_order.push(key.to_string());
+        self.note_content_order(OrderedBlock::WebSearch(key.to_string()));
         events.extend(self.state.handle_content_block_start(
             index,
             "server_tool_use",
@@ -904,17 +967,24 @@ impl GrokStreamContext {
     pub fn to_anthropic_response(&self) -> Value {
         let mut content = Vec::new();
         let signature = self.build_reasoning_signature();
-        if self.thinking_enabled && (!self.thinking.is_empty() || signature.is_some()) {
-            let mut thinking = json!({
-                "type": "thinking",
-                "thinking": self.thinking,
-            });
-            if let Some(signature) = signature {
-                thinking["signature"] = Value::String(signature);
+        let push_thinking = |content: &mut Vec<Value>| {
+            if self.thinking_enabled && (!self.thinking.is_empty() || signature.is_some()) {
+                let mut thinking = json!({
+                    "type": "thinking",
+                    "thinking": self.thinking,
+                });
+                if let Some(signature) = signature.clone() {
+                    thinking["signature"] = Value::String(signature);
+                }
+                content.push(thinking);
             }
-            content.push(thinking);
-        }
-        for key in &self.web_search_order {
+        };
+        let push_text = |content: &mut Vec<Value>| {
+            if !self.text.is_empty() {
+                content.push(json!({ "type": "text", "text": self.text }));
+            }
+        };
+        let push_web_search = |content: &mut Vec<Value>, key: &str| {
             if let Some(web_search) = self.web_search_blocks.get(key) {
                 content.push(json!({
                     "type": "server_tool_use",
@@ -927,11 +997,8 @@ impl GrokStreamContext {
                     "content": web_search.results,
                 }));
             }
-        }
-        if !self.text.is_empty() {
-            content.push(json!({ "type": "text", "text": self.text }));
-        }
-        for key in &self.tool_order {
+        };
+        let push_tool = |content: &mut Vec<Value>, key: &str| {
             if let Some(tool) = self.tool_blocks.get(key) {
                 let input =
                     serde_json::from_str::<Value>(&tool.arguments).unwrap_or_else(|_| json!({}));
@@ -941,6 +1008,38 @@ impl GrokStreamContext {
                     "name": tool.name,
                     "input": input,
                 }));
+            }
+        };
+
+        if self.content_order.is_empty() {
+            // 兼容未走过 ensure_* 的聚合路径：回退到历史固定顺序。
+            push_thinking(&mut content);
+            for key in &self.web_search_order {
+                push_web_search(&mut content, key);
+            }
+            push_text(&mut content);
+            for key in &self.tool_order {
+                push_tool(&mut content, key);
+            }
+        } else {
+            for entry in &self.content_order {
+                match entry {
+                    OrderedBlock::Thinking => push_thinking(&mut content),
+                    OrderedBlock::Text => push_text(&mut content),
+                    OrderedBlock::WebSearch(key) => push_web_search(&mut content, key),
+                    OrderedBlock::Tool(key) => push_tool(&mut content, key),
+                }
+            }
+            // 若某些块在 order 中遗漏（例如仅有 signature 的 thinking），补齐。
+            if self.thinking_enabled
+                && (!self.thinking.is_empty() || signature.is_some())
+                && !self.content_order.contains(&OrderedBlock::Thinking)
+            {
+                // 插到最前以贴近常见 reasoning-first 形态。
+                let mut prefix = Vec::new();
+                push_thinking(&mut prefix);
+                prefix.append(&mut content);
+                content = prefix;
             }
         }
         let stop_reason = self.stop_reason.clone().unwrap_or_else(|| {
@@ -1133,6 +1232,105 @@ mod tests {
         let events = decoder.feed(b"\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["delta"], "hi");
+    }
+
+    #[test]
+    fn preserves_multibyte_utf8_split_across_chunks() {
+        let mut decoder = XaiSseDecoder::default();
+        // "你好" in UTF-8: E4 BD A0 E5 A5 BD — split after first byte of second char
+        let prefix = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"";
+        let chinese = "你好".as_bytes();
+        let mut first = prefix.to_vec();
+        first.extend_from_slice(&chinese[..4]); // incomplete second char
+        assert!(decoder.feed(&first).is_empty());
+        let mut second = chinese[4..].to_vec();
+        second.extend_from_slice(b"\"}\n\n");
+        let events = decoder.feed(&second);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["delta"], "你好");
+    }
+
+    #[test]
+    fn decodes_crlf_framed_sse_events() {
+        let mut decoder = XaiSseDecoder::default();
+        let frame = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"crlf\"}\r\n\r\n";
+        let events = decoder.feed(frame);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["delta"], "crlf");
+    }
+
+    #[test]
+    fn incomplete_stream_without_terminal_is_not_completed() {
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.process_event(&json!({
+            "type": "response.output_text.delta",
+            "delta": "partial"
+        }));
+        assert!(!context.completed());
+        // 无 response.completed 时 finish_events 仍会生成收尾，但 completed 仍为 false，
+        // 供 handlers 决定是否发成功 message_stop。
+        let _ = context.finish_events();
+        assert!(!context.completed());
+    }
+
+    #[test]
+    fn interleaved_output_order_preserved_in_non_stream_response() {
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{"type":"summary_text","text":"think"}],
+                        "encrypted_content": "enc"
+                    },
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "query": "rust",
+                            "sources": [{"url":"https://example.com","title":"ex"}]
+                        }
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":"answer"}]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": "{\"path\":\"a\"}"
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        }));
+        assert!(context.completed());
+        let response = context.to_anthropic_response();
+        let types: Vec<&str> = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        // thinking → server_tool_use + result → text → tool_use
+        assert_eq!(
+            types,
+            vec![
+                "thinking",
+                "server_tool_use",
+                "web_search_tool_result",
+                "text",
+                "tool_use"
+            ]
+        );
     }
 
     #[test]
