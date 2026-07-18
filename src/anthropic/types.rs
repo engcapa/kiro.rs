@@ -48,7 +48,12 @@ pub struct Model {
     pub display_name: String,
     #[serde(rename = "type")]
     pub model_type: String,
+    /// 最大输出 tokens（Grok 来自 catalog `maxCompletionTokens`）。
     pub max_tokens: i32,
+    /// 上下文窗口 / 最大输入 tokens。Grok 来自 catalog `contextWindow`；
+    /// 目录未声明时省略该字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
 }
 
 /// 模型列表响应
@@ -128,6 +133,12 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 采样温度；`/grok` 会透传到 Responses / Chat Completions（及 Messages backend）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// nucleus sampling；`/grok` 会透传到 Responses / Chat Completions（及 Messages backend）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -205,7 +216,8 @@ pub struct SystemMessage {
 ///
 /// 支持两种格式：
 /// 1. 普通工具：{ name, description, input_schema }
-/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
+/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8,
+///    allowed_domains: ["docs.example.com"] }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tool {
     /// 工具类型，如 "web_search_20250305"（可选，仅 WebSearch 工具）
@@ -223,6 +235,10 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Web Search 结果域名白名单。xAI Responses 的原生 web_search 工具将
+    /// 此字段映射为 `filters.allowed_domains`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
 }
 
 /// 内容块
@@ -250,15 +266,31 @@ pub struct ContentBlock {
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// 兼容部分 Anthropic/OpenAI 客户端发送的
+    /// `{type:"image_url",image_url:{url:"..."}}` 形状。标准 Anthropic
+    /// `image` 块仍优先使用 `source`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<serde_json::Value>,
 }
 
 /// 图片数据源
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
+    #[serde(default)]
     pub source_type: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
+    /// Anthropic URL image source 的远程地址。旧的 base64 source 不带这个
+    /// 字段，因此保持可选且不影响既有请求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Anthropic Files API 的已上传文件 ID。`source.type = "file"` 时使用；
+    /// `/grok` 会把它映射为 xAI Responses 的 `input_file.file_id`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

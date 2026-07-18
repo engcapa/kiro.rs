@@ -571,11 +571,14 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                allowed_domains: None,
             }]),
             tool_choice: None,
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -601,6 +604,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    allowed_domains: None,
                 },
                 Tool {
                     tool_type: None,
@@ -608,12 +612,15 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    allowed_domains: None,
                 },
             ]),
             tool_choice: None,
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -641,6 +648,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let query = extract_search_query(&req);
@@ -666,6 +675,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let query = extract_search_query(&req);

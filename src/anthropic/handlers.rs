@@ -77,6 +77,15 @@ pub async fn get_models() -> impl IntoResponse {
     let models = if let Some(catalog) = &*guard {
         let mut list = Vec::new();
         for m in &catalog.models {
+            let max_tokens = m
+                .token_limits
+                .as_ref()
+                .and_then(|l| l.max_output_tokens)
+                .unwrap_or(64000);
+            let context_window = m
+                .token_limits
+                .as_ref()
+                .and_then(|l| l.max_input_tokens);
             // 基础模型
             list.push(Model {
                 id: m.model_id.clone(),
@@ -85,7 +94,8 @@ pub async fn get_models() -> impl IntoResponse {
                 owned_by: "anthropic".to_string(),
                 display_name: m.model_name.clone(),
                 model_type: "chat".to_string(),
-                max_tokens: m.token_limits.as_ref().and_then(|l| l.max_output_tokens).unwrap_or(64000),
+                max_tokens,
+                context_window,
             });
 
             // 检查 schema properties 中是否包含 thinking 或 output_config 相关的配置
@@ -105,7 +115,8 @@ pub async fn get_models() -> impl IntoResponse {
                     owned_by: "anthropic".to_string(),
                     display_name: format!("{} (Thinking)", m.model_name),
                     model_type: "chat".to_string(),
-                    max_tokens: m.token_limits.as_ref().and_then(|l| l.max_output_tokens).unwrap_or(64000),
+                    max_tokens,
+                    context_window,
                 });
             }
         }
@@ -121,6 +132,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.7".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-opus-4-7-thinking".to_string(),
@@ -130,6 +142,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.7 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-opus-4-6".to_string(),
@@ -139,6 +152,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.6".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-opus-4-6-thinking".to_string(),
@@ -148,6 +162,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.6 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-sonnet-4-6".to_string(),
@@ -157,6 +172,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Sonnet 4.6".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-sonnet-4-6-thinking".to_string(),
@@ -166,6 +182,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-opus-4-5-20251101".to_string(),
@@ -175,6 +192,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.5".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-opus-4-5-20251101-thinking".to_string(),
@@ -184,6 +202,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Opus 4.5 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-sonnet-4-5-20250929".to_string(),
@@ -193,6 +212,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Sonnet 4.5".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-sonnet-4-5-20250929-thinking".to_string(),
@@ -202,6 +222,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-haiku-4-5-20251001".to_string(),
@@ -211,6 +232,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Haiku 4.5".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
             Model {
                 id: "claude-haiku-4-5-20251001-thinking".to_string(),
@@ -220,6 +242,7 @@ pub async fn get_models() -> impl IntoResponse {
                 display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
                 model_type: "chat".to_string(),
                 max_tokens: 64000,
+                context_window: None,
             },
         ]
     };

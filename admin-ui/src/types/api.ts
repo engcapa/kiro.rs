@@ -67,6 +67,20 @@ export interface KiroModel {
   tokenLimits?: TokenLimits | null
   promptCaching?: PromptCaching | null
   additionalModelRequestFieldsSchema?: Record<string, unknown> | null
+  /** Grok Build catalog fields; absent for Kiro control-plane catalogs. */
+  apiBackend?: 'responses' | 'chat_completions' | 'messages' | string
+  supportedInApi?: boolean
+  supportsReasoningEffort?: boolean
+  defaultReasoningEffort?: string | null
+  reasoningEfforts?: ReasoningEffortOption[]
+}
+
+export interface ReasoningEffortOption {
+  id: string
+  value: string
+  label: string
+  description?: string | null
+  default?: boolean
 }
 
 export interface CredentialCatalogResponse {
@@ -109,8 +123,10 @@ export interface SetNameRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   name?: string
+  /** Grok `/grok/admin` 使用的 xAI API token / OAuth access token。 */
+  accessToken?: string
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'token' | 'oauth'
   clientId?: string
   clientSecret?: string
   priority?: number
@@ -138,6 +154,25 @@ export interface AddCredentialResponse {
   userName?: string
   profileArn?: string
   importedAt?: string
+}
+
+export type GrokOAuthStatus = 'pending' | 'completed' | 'failed' | 'cancelled'
+
+export interface GrokOAuthStartResponse {
+  state: string
+  authorizationUrl: string
+  callbackUrl: string
+  expiresInSeconds: number
+}
+
+export interface GrokOAuthStatusResponse {
+  state: string
+  status: GrokOAuthStatus
+  authorizationUrl: string
+  createdAt: string
+  credentialId?: number
+  email?: string
+  error?: string
 }
 
 export interface ApiKeyEntry {

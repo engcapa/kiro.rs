@@ -9,6 +9,8 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   LoadBalancingMode,
+  GrokOAuthStartResponse,
+  GrokOAuthStatusResponse,
 } from '@/types/api'
 import { api } from './client'
 
@@ -123,5 +125,21 @@ export async function setCredentialPools(
     `/credentials/${id}/pools`,
     { pools }
   )
+  return data
+}
+
+// `/grok/admin` 专用的 xAI Grok Build OAuth 流程。普通 `/admin` 不展示入口。
+export async function startGrokOAuth(): Promise<GrokOAuthStartResponse> {
+  const { data } = await api.post<GrokOAuthStartResponse>('/oauth/start')
+  return data
+}
+
+export async function getGrokOAuthStatus(state: string): Promise<GrokOAuthStatusResponse> {
+  const { data } = await api.get<GrokOAuthStatusResponse>(`/oauth/status/${encodeURIComponent(state)}`)
+  return data
+}
+
+export async function cancelGrokOAuth(state: string): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/oauth/cancel/${encodeURIComponent(state)}`)
   return data
 }

@@ -41,6 +41,8 @@ fn sample_request(model: &str, thinking: Option<Thinking>, oc: Option<OutputConf
         thinking,
         output_config: oc,
         metadata: None,
+        temperature: None,
+        top_p: None,
     }
 }
 

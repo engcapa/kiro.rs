@@ -1,4 +1,4 @@
-use kiro_rs::{admin, admin_ui, anthropic, http_client, kiro, model, token};
+use kiro_rs::{admin, admin_ui, anthropic, grok, http_client, kiro, model, token};
 use kiro_rs::model::api_key_manager::ApiKeyManager;
 
 use std::collections::HashMap;
@@ -45,6 +45,20 @@ async fn main() {
 
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
+
+    // Grok Build 凭据与 Kiro 凭据完全独立。文件不存在时按空池启动，
+    // 之后可通过 /grok/api/admin/credentials 导入 token，或启动 OAuth 授权。
+    let grok_credentials_path = args.grok_credentials.unwrap_or_else(|| {
+        grok::credentials::GrokCredentials::default_credentials_path().to_string()
+    });
+    let grok_credentials_config = grok::credentials::GrokCredentialsConfig::load(
+        &grok_credentials_path,
+    )
+    .unwrap_or_else(|e| {
+        tracing::error!("加载 Grok 凭据失败: {}", e);
+        std::process::exit(1);
+    });
+    let grok_credentials_list = grok_credentials_config.into_sorted_credentials();
 
     // 转换为按优先级排序的凭据列表
     let mut credentials_list = credentials_config.into_sorted_credentials();
@@ -168,7 +182,7 @@ async fn main() {
         api_url: config.count_tokens_api_url.clone(),
         api_key: config.count_tokens_api_key.clone(),
         auth_type: config.count_tokens_auth_type.clone(),
-        proxy: proxy_config,
+        proxy: proxy_config.clone(),
         tls_backend: config.tls_backend,
     });
 
@@ -180,10 +194,57 @@ async fn main() {
         }),
     );
 
+    // 创建独立的 Grok Build/xAI 凭据池和 Provider。不得复用 Kiro 的
+    // MultiTokenManager：两者的 token 刷新、请求协议和响应流格式不同。
+    let grok_token_manager = Arc::new(
+        grok::token_manager::GrokTokenManager::new(
+            config.clone(),
+            grok_credentials_list,
+            proxy_config.clone(),
+            grok_credentials_path.into(),
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("创建 Grok Token 管理器失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
+    let grok_provider = Arc::new(
+        grok::provider::GrokProvider::new(grok_token_manager.clone(), proxy_config.clone())
+            .unwrap_or_else(|e| {
+                tracing::error!("创建 Grok Provider 失败: {}", e);
+                std::process::exit(1);
+            }),
+    );
+
+    // Grok Build 的 `/v1/models` 目录与凭据绑定：不同 OAuth 账号/API token
+    // 可见的模型、effort 菜单和 API backend 都可能不同。目录拉取失败只保留
+    // 旧值，不影响推理凭据本身。
+    tracing::info!("正在拉取 Grok 凭据模型目录...");
+    if let Err(error) = grok_provider.refresh_model_catalog(false).await {
+        tracing::warn!(%error, "启动时拉取 Grok 模型目录失败");
+    }
+    let grok_catalog_provider = grok_provider.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+            if let Err(error) = grok_catalog_provider.refresh_model_catalog(false).await {
+                tracing::warn!(%error, "定时刷新 Grok 模型目录失败（将沿用旧目录）");
+            }
+        }
+    });
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
+        config.extract_thinking,
+        Some(api_key_manager.clone()),
+    );
+
+    let grok_app = grok::create_router_with_provider(
+        &api_key,
+        grok_provider.clone(),
+        config.grok_default_model.clone(),
         config.extract_thinking,
         Some(api_key_manager.clone()),
     );
@@ -199,7 +260,7 @@ async fn main() {
     let app = if let Some(admin_key) = &config.admin_api_key {
         if admin_key.trim().is_empty() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
-            anthropic_app
+            anthropic_app.nest("/grok", grok_app)
         } else {
             let admin_service = admin::AdminService::new(
                 token_manager.clone(),
@@ -212,14 +273,40 @@ async fn main() {
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
+            // Grok Admin 和已有 Kiro Admin 共享管理员 API Key / client API
+            // key 管理器，但各自操作独立的凭据池和凭据文件。
+            let grok_oauth = grok::oauth::GrokOAuthService::new(
+                grok_token_manager.clone(),
+                proxy_config.clone(),
+            )
+            .unwrap_or_else(|e| {
+                tracing::error!("创建 Grok OAuth 服务失败: {}", e);
+                std::process::exit(1);
+            });
+            let grok_admin_service = grok::admin::GrokAdminService::new(
+                grok_token_manager.clone(),
+                grok_provider.clone(),
+                api_key_manager.clone(),
+                grok_oauth,
+            );
+            let grok_admin_state = grok::admin::GrokAdminState::new(admin_key, grok_admin_service);
+            let grok_admin_app = grok::admin::create_admin_router(grok_admin_state);
+            let grok_admin_ui_app = admin_ui::create_admin_ui_router();
+
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)
+                .nest(
+                    "/grok",
+                    grok_app
+                        .nest("/api/admin", grok_admin_app)
+                        .nest("/admin", grok_admin_ui_app),
+                )
         }
     } else {
-        anthropic_app
+        anthropic_app.nest("/grok", grok_app)
     };
 
     // 启动服务器
@@ -230,6 +317,18 @@ async fn main() {
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("Grok Build / xAI API:");
+    tracing::info!("  GET  /grok/v1/models");
+    tracing::info!("  POST /grok/v1/messages");
+    tracing::info!("  POST /grok/v1/messages/count_tokens");
+    tracing::info!("  GET/POST /grok/v1/files");
+    tracing::info!("  GET/DELETE /grok/v1/files/:file_id");
+    tracing::info!("  POST /grok/v1/images/generations");
+    tracing::info!("  POST /grok/v1/images/edits");
+    tracing::info!("  POST /grok/v1/videos/generations");
+    tracing::info!("  GET  /grok/v1/videos/:request_id");
+    tracing::info!("  POST /grok/cc/v1/messages");
+    tracing::info!("  GET/POST /grok/cc/v1/files (Files API alias)");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
@@ -239,6 +338,12 @@ async fn main() {
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
+        tracing::info!("Grok Admin API:");
+        tracing::info!("  GET  /grok/api/admin/credentials");
+        tracing::info!("  POST /grok/api/admin/credentials");
+        tracing::info!("  POST /grok/api/admin/oauth/start");
+        tracing::info!("Grok Admin UI:");
+        tracing::info!("  GET  /grok/admin");
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

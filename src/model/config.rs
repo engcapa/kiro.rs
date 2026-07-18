@@ -98,7 +98,15 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// Grok Build / xAI Responses API 的默认模型。
+    /// 可按请求中的 `model` 覆盖；未指定或传入 Claude 别名时使用该值。
+    #[serde(default = "default_grok_default_model")]
+    pub grok_default_model: String,
 
+    /// Grok Build / xAI Responses API 的默认上游地址。
+    /// 通常保持 `https://api.x.ai/v1`；也可用于私有兼容网关。
+    #[serde(default = "default_grok_base_url")]
+    pub grok_base_url: String,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -157,6 +165,14 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_grok_default_model() -> String {
+    "grok-4.5".to_string()
+}
+
+fn default_grok_base_url() -> String {
+    "https://api.x.ai/v1".to_string()
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -184,6 +200,8 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            grok_default_model: default_grok_default_model(),
+            grok_base_url: default_grok_base_url(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
