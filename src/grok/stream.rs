@@ -96,6 +96,152 @@ fn parse_sse_block(block: &str) -> Option<Value> {
     }
 }
 
+const MAX_ANTHROPIC_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Messages backend 已经返回 Anthropic wire protocol，因此 handler 会原样
+/// 转发字节。这个观察器只旁路检查完整 SSE frame，用于判断凭据健康状态，
+/// 不会重新编码或改变发给客户端的内容。
+#[derive(Default)]
+pub struct AnthropicSseObserver {
+    buffer: Vec<u8>,
+    terminal: bool,
+    failure: Option<AnthropicSseFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnthropicSseFailure {
+    /// 上游明确发送了 Anthropic error event；原始事件已经透传给客户端。
+    Upstream(String),
+    /// SSE framing / UTF-8 / JSON 损坏，需要代理补发一个 error event。
+    Protocol(String),
+}
+
+impl AnthropicSseObserver {
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if self.failure.is_some() || self.terminal {
+            return;
+        }
+        self.buffer.extend_from_slice(chunk);
+        while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
+            if sep_at > MAX_ANTHROPIC_SSE_FRAME_BYTES {
+                self.fail_protocol("xAI Messages SSE 单个事件超过 4 MiB");
+                return;
+            }
+            let block = self.buffer[..sep_at].to_vec();
+            self.buffer.drain(..sep_at + sep_len);
+            self.observe_block(&block);
+            if self.failure.is_some() || self.terminal {
+                return;
+            }
+        }
+        if self.buffer.len() > MAX_ANTHROPIC_SSE_FRAME_BYTES {
+            self.fail_protocol("xAI Messages SSE 未终止事件超过 4 MiB");
+        }
+    }
+
+    pub fn finish(&mut self) {
+        if self.failure.is_some() || self.terminal || self.buffer.is_empty() {
+            return;
+        }
+        if self.buffer.len() > MAX_ANTHROPIC_SSE_FRAME_BYTES {
+            self.fail_protocol("xAI Messages SSE 未终止事件超过 4 MiB");
+            return;
+        }
+        let block = std::mem::take(&mut self.buffer);
+        self.observe_block(&block);
+    }
+
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+
+    pub fn failure(&self) -> Option<&AnthropicSseFailure> {
+        self.failure.as_ref()
+    }
+
+    fn observe_block(&mut self, block: &[u8]) {
+        let block = match std::str::from_utf8(block) {
+            Ok(block) => block,
+            Err(error) => {
+                self.fail_protocol(format!("xAI Messages SSE 包含非法 UTF-8: {error}"));
+                return;
+            }
+        };
+        let normalized = block.replace("\r\n", "\n").replace('\r', "\n");
+        let mut event_name = None;
+        let mut data_lines = Vec::new();
+        for line in normalized.lines() {
+            if line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => event_name = Some(value),
+                "data" => data_lines.push(value),
+                _ => {}
+            }
+        }
+
+        let data = data_lines.join("\n");
+        if event_name == Some("error") {
+            let message = serde_json::from_str::<Value>(&data)
+                .ok()
+                .and_then(|value| anthropic_error_message(&value))
+                .unwrap_or_else(|| {
+                    (!data.trim().is_empty())
+                        .then(|| truncate(&data).to_string())
+                        .unwrap_or_else(|| "xAI Messages 上游返回 event:error".to_string())
+                });
+            self.failure = Some(AnthropicSseFailure::Upstream(message));
+            return;
+        }
+        if data.is_empty() {
+            if event_name == Some("message_stop") {
+                self.terminal = true;
+            }
+            return;
+        }
+        let value = match serde_json::from_str::<Value>(&data) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail_protocol(format!(
+                    "xAI Messages SSE 事件 JSON 无效: {error}; data={}",
+                    truncate(&data)
+                ));
+                return;
+            }
+        };
+        if value.get("type").and_then(Value::as_str) == Some("error") {
+            self.failure = Some(AnthropicSseFailure::Upstream(
+                anthropic_error_message(&value)
+                    .unwrap_or_else(|| "xAI Messages 上游返回错误事件".to_string()),
+            ));
+            return;
+        }
+        if event_name == Some("message_stop")
+            || value.get("type").and_then(Value::as_str) == Some("message_stop")
+        {
+            self.terminal = true;
+        }
+    }
+
+    fn fail_protocol(&mut self, message: impl Into<String>) {
+        self.buffer.clear();
+        self.failure = Some(AnthropicSseFailure::Protocol(message.into()));
+    }
+}
+
+fn anthropic_error_message(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("error").filter(|error| error.is_string()))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[derive(Debug)]
 struct ToolBlock {
     index: i32,
@@ -1400,6 +1546,56 @@ mod tests {
         let events = decoder.feed(frame);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["delta"], "crlf");
+    }
+
+    #[test]
+    fn messages_observer_requires_and_accepts_fragmented_terminal_event() {
+        let mut observer = AnthropicSseObserver::default();
+        observer.feed(
+            b"event: message_start\r\ndata: {\"type\":\"message_start\"}\r\n\r\nevent: message_",
+        );
+        assert!(!observer.terminal());
+        assert!(observer.failure().is_none());
+        observer.feed(b"stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n");
+        assert!(observer.terminal());
+        assert!(observer.failure().is_none());
+    }
+
+    #[test]
+    fn messages_observer_detects_event_name_and_json_error_forms() {
+        let mut named = AnthropicSseObserver::default();
+        named.feed(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"quota\"}}\n\n",
+        );
+        assert_eq!(
+            named.failure(),
+            Some(&AnthropicSseFailure::Upstream("quota".to_string()))
+        );
+
+        let mut data_only = AnthropicSseObserver::default();
+        data_only.feed(b"data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n");
+        assert_eq!(
+            data_only.failure(),
+            Some(&AnthropicSseFailure::Upstream("overloaded".to_string()))
+        );
+    }
+
+    #[test]
+    fn messages_observer_rejects_malformed_event_without_claiming_terminal() {
+        let mut observer = AnthropicSseObserver::default();
+        observer.feed(b"event: message_delta\ndata: {not-json}\n\n");
+        assert!(!observer.terminal());
+        assert!(matches!(
+            observer.failure(),
+            Some(AnthropicSseFailure::Protocol(message))
+                if message.contains("JSON 无效")
+        ));
+
+        let mut truncated = AnthropicSseObserver::default();
+        truncated.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}");
+        truncated.finish();
+        assert!(!truncated.terminal());
+        assert!(truncated.failure().is_none());
     }
 
     #[test]

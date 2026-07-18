@@ -30,7 +30,7 @@ use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
 use super::provider::{GrokCredentialRoute, GrokUpstreamResponse};
 use super::reasoning_sig::{ReasoningSignatureCodec, latest_verified_route_credential};
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
-use super::stream::{GrokStreamContext, XaiSseDecoder};
+use super::stream::{AnthropicSseFailure, AnthropicSseObserver, GrokStreamContext, XaiSseDecoder};
 
 const PING_INTERVAL_SECS: u64 = 25;
 
@@ -1023,18 +1023,35 @@ fn create_messages_sse_stream(
         let Some(response) = response else { return };
         let body_stream = response.bytes_stream();
         tokio::pin!(body_stream);
-        let mut saw_bytes = false;
-        let mut read_error = false;
+        let mut observer = AnthropicSseObserver::default();
         loop {
             tokio::select! {
                 chunk = body_stream.next() => match chunk {
                     Some(Ok(chunk)) => {
-                        saw_bytes = true;
+                        observer.feed(&chunk);
+                        let failure = observer.failure().cloned();
+                        let terminal = observer.terminal();
+                        // Messages backend 已是 Anthropic wire protocol：原始上游
+                        // chunk 必须先完整透传，观察器只决定健康状态。
                         yield Ok(chunk);
+                        if let Some(failure) = failure {
+                            if let Some(id) = credential_id {
+                                state.provider.token_manager().report_failure(id);
+                            }
+                            if let AnthropicSseFailure::Protocol(message) = failure {
+                                yield Ok(upstream_error_sse(&message));
+                            }
+                            return;
+                        }
+                        if terminal {
+                            if let Some(id) = credential_id {
+                                state.provider.token_manager().report_success(id);
+                            }
+                            return;
+                        }
                     }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "读取 xAI Messages SSE 响应失败");
-                        read_error = true;
                         if let Some(id) = credential_id {
                             state.provider.token_manager().report_failure(id);
                         }
@@ -1046,17 +1063,29 @@ fn create_messages_sse_stream(
                 _ = ping.tick() => yield Ok(ping_sse()),
             }
         }
-        // 透传路径无法解析 Anthropic 终态；仅在读失败时记失败，正常 EOF 记成功。
-        if !read_error {
+        // SSE 允许最后一个事件不带空行分隔符；EOF 时再观察一次残留 frame。
+        observer.finish();
+        if let Some(failure) = observer.failure().cloned() {
             if let Some(id) = credential_id {
-                if saw_bytes {
-                    state.provider.token_manager().report_success(id);
-                } else {
-                    state.provider.token_manager().report_failure(id);
-                    yield Ok(upstream_error_sse("xAI Messages 流在无任何数据时结束"));
-                }
+                state.provider.token_manager().report_failure(id);
             }
+            if let AnthropicSseFailure::Protocol(message) = failure {
+                yield Ok(upstream_error_sse(&message));
+            }
+            return;
         }
+        if observer.terminal() {
+            if let Some(id) = credential_id {
+                state.provider.token_manager().report_success(id);
+            }
+            return;
+        }
+        if let Some(id) = credential_id {
+            state.provider.token_manager().report_failure(id);
+        }
+        yield Ok(upstream_error_sse(
+            "xAI Messages 流在收到 message_stop 前结束",
+        ));
     }
 }
 
