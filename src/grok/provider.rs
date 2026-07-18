@@ -39,6 +39,15 @@ pub struct GrokUpstreamResponse {
     pub credential_id: u64,
 }
 
+/// 一次 Messages 请求的凭据约束。Files 等上游资源只能由创建账号消费，必须
+/// Required；普通推理仅把会话账号作为 Preferred，发生可重试错误时允许切换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokCredentialRoute {
+    Required(u64),
+    Preferred(u64),
+    LoadBalanced,
+}
+
 #[derive(Clone)]
 struct VideoJob {
     upstream_request_id: String,
@@ -182,178 +191,200 @@ impl GrokProvider {
         allowed_pools: Option<&[String]>,
         pinned_credential_id: Option<u64>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
-        let total = self.token_manager.total_count();
-        let max_retries = if pinned_credential_id.is_some() {
-            MAX_RETRIES_PER_CREDENTIAL
-        } else {
-            (total * MAX_RETRIES_PER_CREDENTIAL).clamp(1, MAX_TOTAL_RETRIES)
+        let route = pinned_credential_id
+            .map(GrokCredentialRoute::Required)
+            .unwrap_or(GrokCredentialRoute::LoadBalanced);
+        self.call_api_with_body(
+            backend,
+            model,
+            reasoning_effort,
+            requires_backend_search,
+            allowed_pools,
+            route,
+            |_| Ok(body.clone()),
+        )
+        .await
+    }
+
+    /// 与 [`Self::call_api`] 相同，但在每个凭据 attempt 前重新生成 wire body。
+    /// 这保证 failover 到另一账号时会重新执行 catalog 转换，并剥离与新账号不
+    /// 匹配的 encrypted reasoning，而不是把为 A 构建的 body 原样发送给 B。
+    pub async fn call_api_with_body<F>(
+        &self,
+        backend: GrokApiBackend,
+        model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+        route: GrokCredentialRoute,
+        mut body_for_credential: F,
+    ) -> anyhow::Result<GrokUpstreamResponse>
+    where
+        F: FnMut(u64) -> anyhow::Result<Value>,
+    {
+        let (preferred_id, required_id) = match route {
+            GrokCredentialRoute::Required(id) => (Some(id), Some(id)),
+            GrokCredentialRoute::Preferred(id) => (Some(id), None),
+            GrokCredentialRoute::LoadBalanced => (None, None),
         };
+        let mut candidates = self.token_manager.routing_candidate_ids(
+            preferred_id,
+            required_id,
+            Some(model),
+            reasoning_effort,
+            Some(backend),
+            requires_backend_search,
+            allowed_pools,
+        )?;
+        candidates.truncate(MAX_TOTAL_RETRIES);
         let mut last_error = None;
         let mut forced_refresh = HashSet::new();
+        let mut total_attempts = 0_usize;
 
-        if let Some(credential_id) = pinned_credential_id {
-            if self.token_manager.credential(credential_id).is_none() {
-                anyhow::bail!("文件绑定的 Grok 凭据 #{credential_id} 已不存在");
-            }
-            if let Some(catalog) = self.token_manager.catalog_for(credential_id) {
-                let file_model = catalog.model_by_id(model).ok_or_else(|| {
-                    anyhow::anyhow!("上传文件所用的 Grok 凭据 #{credential_id} 不支持模型 {model}")
-                })?;
-                if file_model.api_backend != backend {
-                    anyhow::bail!(
-                        "上传文件所用的 Grok 凭据 #{credential_id} 对模型 {model} 使用 {} backend，无法按当前 {} backend 请求",
-                        file_model.api_backend.as_str(),
-                        backend.as_str()
-                    );
+        'credentials: for credential_id in candidates {
+            for credential_attempt in 0..MAX_RETRIES_PER_CREDENTIAL {
+                if total_attempts >= MAX_TOTAL_RETRIES {
+                    break 'credentials;
                 }
-            }
-        }
+                total_attempts += 1;
+                let context = match self.token_manager.acquire_context_for(credential_id).await {
+                    Ok(context) => context,
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                };
+                let body = match body_for_credential(context.id) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        last_error = Some(
+                            error.context(format!("为 Grok 凭据 #{} 构建请求失败", context.id)),
+                        );
+                        break;
+                    }
+                };
+                let base_url = self
+                    .token_manager
+                    .model_for(context.id, model)
+                    .and_then(|model| model.base_url)
+                    .unwrap_or_else(|| {
+                        context
+                            .credentials
+                            .effective_base_url(self.token_manager.config())
+                            .to_string()
+                    });
+                let url = endpoint_url(&base_url, backend);
+                let cli_chat_proxy = is_cli_chat_proxy_url(&url);
+                let session_id = body
+                    .get("prompt_cache_key")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty());
+                let request_id = Uuid::new_v4().to_string();
+                let accepts_sse = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                let mut request = self
+                    .client_for(&context.credentials)?
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header(
+                        "accept",
+                        if accepts_sse {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .header("connection", "keep-alive")
+                    .header("x-grok-req-id", request_id)
+                    .header("x-grok-model-override", model)
+                    .header("x-grok-agent-id", GROK_BUILD_CLIENT_IDENTIFIER)
+                    .json(&body);
+                if let Some(session_id) = session_id {
+                    request = request
+                        .header("x-grok-conv-id", session_id)
+                        .header("x-grok-session-id", session_id);
+                }
+                let request = Self::authenticated_request(
+                    request,
+                    &context.credentials,
+                    &context.token,
+                    cli_chat_proxy,
+                );
 
-        for attempt in 0..max_retries {
-            let context_result = match pinned_credential_id {
-                Some(credential_id) => self.token_manager.acquire_context_for(credential_id).await,
-                None => {
-                    self.token_manager
-                        .acquire_context(
-                            Some(model),
-                            reasoning_effort,
-                            Some(backend),
-                            requires_backend_search,
-                            allowed_pools,
-                        )
-                        .await
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.token_manager.report_failure(context.id);
+                        last_error = Some(error.into());
+                        if credential_attempt + 1 < MAX_RETRIES_PER_CREDENTIAL {
+                            sleep(retry_delay(credential_attempt)).await;
+                        }
+                        continue;
+                    }
+                };
+                let status = response.status();
+                if status.is_success() {
+                    // 不在此处 report_success：流式/聚合路径必须在终态
+                    // （response.completed / 完整 JSON）确认后才记健康成功。
+                    return Ok(GrokUpstreamResponse {
+                        response,
+                        credential_id: context.id,
+                    });
                 }
-            };
-            let context = match context_result {
-                Ok(context) => context,
-                Err(error) => {
-                    last_error = Some(error);
+
+                let response_body = response.text().await.unwrap_or_default();
+                if is_quota_exhausted(status.as_u16(), &response_body) {
+                    self.token_manager.report_quota_exhausted(context.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "xAI {} API 配额已用尽: {} {}",
+                        backend.as_str(),
+                        status,
+                        response_body
+                    ));
                     break;
                 }
-            };
-            let base_url = self
-                .token_manager
-                .model_for(context.id, model)
-                .and_then(|model| model.base_url)
-                .unwrap_or_else(|| {
-                    context
-                        .credentials
-                        .effective_base_url(self.token_manager.config())
-                        .to_string()
-                });
-            let url = endpoint_url(&base_url, backend);
-            let cli_chat_proxy = is_cli_chat_proxy_url(&url);
-            let session_id = body
-                .get("prompt_cache_key")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty());
-            let request_id = Uuid::new_v4().to_string();
-            let accepts_sse = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-            let mut request = self
-                .client_for(&context.credentials)?
-                .post(&url)
-                .header("content-type", "application/json")
-                .header(
-                    "accept",
-                    if accepts_sse {
-                        "text/event-stream"
-                    } else {
-                        "application/json"
-                    },
-                )
-                .header("connection", "keep-alive")
-                .header("x-grok-req-id", request_id)
-                .header("x-grok-model-override", model)
-                .header("x-grok-agent-id", GROK_BUILD_CLIENT_IDENTIFIER)
-                .json(body);
-            if let Some(session_id) = session_id {
-                request = request
-                    .header("x-grok-conv-id", session_id)
-                    .header("x-grok-session-id", session_id);
-            }
-            let request = Self::authenticated_request(
-                request,
-                &context.credentials,
-                &context.token,
-                cli_chat_proxy,
-            );
 
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = Some(error.into());
-                    if attempt + 1 < max_retries {
-                        sleep(retry_delay(attempt)).await;
+                if matches!(status.as_u16(), 401 | 403)
+                    && context.credentials.is_oauth()
+                    && forced_refresh.insert(context.id)
+                {
+                    tracing::info!(
+                        credential_id = context.id,
+                        "xAI 返回认证错误，尝试强制刷新 OAuth token"
+                    );
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(context.id)
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                }
+
+                let retryable = matches!(status.as_u16(), 401 | 403 | 408 | 429)
+                    || status.is_server_error()
+                    || status.as_u16() == 400 && response_body.contains("encrypted_content");
+                if retryable {
+                    self.token_manager.report_failure(context.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "xAI {} API 请求失败: {} {}",
+                        backend.as_str(),
+                        status,
+                        response_body
+                    ));
+                    if credential_attempt + 1 < MAX_RETRIES_PER_CREDENTIAL {
+                        sleep(retry_delay(credential_attempt)).await;
                     }
                     continue;
                 }
-            };
-            let status = response.status();
-            if status.is_success() {
-                // 不在此处 report_success：流式/聚合路径必须在终态
-                // （response.completed / 完整 JSON）确认后才记健康成功。
-                return Ok(GrokUpstreamResponse {
-                    response,
-                    credential_id: context.id,
-                });
-            }
 
-            let response_body = response.text().await.unwrap_or_default();
-            if is_quota_exhausted(status.as_u16(), &response_body) {
-                let available = self.token_manager.report_quota_exhausted(context.id);
-                last_error = Some(anyhow::anyhow!(
-                    "xAI {} API 配额已用尽: {} {}",
-                    backend.as_str(),
-                    status,
-                    response_body
-                ));
-                if !available {
-                    break;
-                }
-                continue;
-            }
-
-            if matches!(status.as_u16(), 401 | 403)
-                && context.credentials.is_oauth()
-                && forced_refresh.insert(context.id)
-            {
-                tracing::info!(
-                    credential_id = context.id,
-                    "xAI 返回认证错误，尝试强制刷新 OAuth token"
-                );
-                if self
-                    .token_manager
-                    .force_refresh_token_for(context.id)
-                    .await
-                    .is_ok()
-                {
-                    continue;
-                }
-            }
-
-            if matches!(status.as_u16(), 401 | 403 | 408 | 429) || status.is_server_error() {
-                let available = self.token_manager.report_failure(context.id);
-                last_error = Some(anyhow::anyhow!(
+                return Err(anyhow::anyhow!(
                     "xAI {} API 请求失败: {} {}",
                     backend.as_str(),
                     status,
                     response_body
                 ));
-                if !available {
-                    break;
-                }
-                if attempt + 1 < max_retries {
-                    sleep(retry_delay(attempt)).await;
-                }
-                continue;
             }
-
-            return Err(anyhow::anyhow!(
-                "xAI {} API 请求失败: {} {}",
-                backend.as_str(),
-                status,
-                response_body
-            ));
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI {} API 请求失败", backend.as_str())))
@@ -1015,6 +1046,12 @@ pub type SharedGrokProvider = Arc<GrokProvider>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use serde_json::json;
+
+    use crate::model::config::Config;
+
+    use super::super::token_manager::GrokTokenManager;
 
     #[test]
     fn recognizes_quota_errors() {
@@ -1041,5 +1078,90 @@ mod tests {
             endpoint_url("https://api.x.ai/v1/responses/", GrokApiBackend::Responses),
             "https://api.x.ai/v1/responses"
         );
+    }
+
+    #[tokio::test]
+    async fn preferred_route_rebuilds_body_and_fails_over_after_quota() {
+        async fn upstream(
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> impl axum::response::IntoResponse {
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if authorization.ends_with("token-one") {
+                return (
+                    reqwest::StatusCode::PAYMENT_REQUIRED,
+                    Json(json!({"error":"insufficient_quota"})),
+                );
+            }
+            (reqwest::StatusCode::OK, Json(body))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/responses", post(upstream)))
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{address}");
+        let credentials_path =
+            std::env::temp_dir().join(format!("kiro-rs-provider-failover-{}.json", Uuid::new_v4()));
+        let manager = Arc::new(
+            GrokTokenManager::new(
+                Config::default(),
+                vec![
+                    GrokCredentials {
+                        id: Some(1),
+                        access_token: Some("token-one".to_string()),
+                        base_url: Some(base_url.clone()),
+                        ..Default::default()
+                    },
+                    GrokCredentials {
+                        id: Some(2),
+                        access_token: Some("token-two".to_string()),
+                        base_url: Some(base_url),
+                        ..Default::default()
+                    },
+                ],
+                None,
+                credentials_path.clone(),
+            )
+            .unwrap(),
+        );
+        let provider = GrokProvider::new(manager, None).unwrap();
+        let built_for = Arc::new(Mutex::new(Vec::new()));
+        let observed = built_for.clone();
+        let upstream = provider
+            .call_api_with_body(
+                GrokApiBackend::Responses,
+                "grok-4.5",
+                None,
+                false,
+                None,
+                GrokCredentialRoute::Preferred(1),
+                move |credential_id| {
+                    observed.lock().push(credential_id);
+                    Ok(json!({
+                        "model": "grok-4.5",
+                        "built_for": credential_id,
+                        "stream": false
+                    }))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(upstream.credential_id, 2);
+        assert_eq!(
+            upstream.response.json::<Value>().await.unwrap()["built_for"],
+            2
+        );
+        assert_eq!(*built_for.lock(), vec![1, 2]);
+
+        server.abort();
+        let _ = std::fs::remove_file(&credentials_path);
+        let _ = std::fs::remove_file(credentials_path.with_extension("reasoning.key"));
     }
 }

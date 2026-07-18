@@ -1,6 +1,7 @@
 //! `/grok` Anthropic-compatible HTTP handlers。
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -26,12 +27,64 @@ use super::media::{
     build_image_edit_body, build_image_generation_body, build_video_generation_body,
 };
 use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
-use super::provider::GrokUpstreamResponse;
-use super::reasoning_sig::latest_verified_route_credential;
+use super::provider::{GrokCredentialRoute, GrokUpstreamResponse};
+use super::reasoning_sig::{ReasoningSignatureCodec, latest_verified_route_credential};
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
 use super::stream::{GrokStreamContext, XaiSseDecoder};
 
 const PING_INTERVAL_SECS: u64 = 25;
+
+/// 可针对每张故障转移凭据重新构建的 Messages 请求。fallback_body 仅用于
+/// catalog 未加载且目标 backend 不是默认 Responses 的情况；Chat/Messages
+/// body 不携带账号绑定的 encrypted reasoning，因此复用是安全的。
+#[derive(Clone)]
+struct RoutedGrokRequest {
+    payload: Arc<MessagesRequest>,
+    fallback_body: Value,
+    default_model: String,
+    model: String,
+    thinking_enabled: bool,
+    backend: GrokApiBackend,
+    reasoning_effort: Option<ReasoningEffort>,
+    uses_hosted_web_search: bool,
+    upstream_stream: bool,
+    signature_codec: ReasoningSignatureCodec,
+}
+
+impl RoutedGrokRequest {
+    fn body_for_credential(
+        &self,
+        state: &GrokAppState,
+        credential_id: u64,
+    ) -> anyhow::Result<Value> {
+        let catalog = state.provider.token_manager().catalog_for(credential_id);
+        if catalog.is_none() && self.backend != GrokApiBackend::Responses {
+            return Ok(self.fallback_body.clone());
+        }
+        let converted = convert_request_for_credential(
+            &self.payload,
+            &self.default_model,
+            catalog.as_deref(),
+            Some(credential_id),
+            Some(&self.signature_codec),
+        )?;
+        if converted.model != self.model
+            || converted.backend != self.backend
+            || converted.reasoning_effort != self.reasoning_effort
+            || converted.uses_hosted_web_search != self.uses_hosted_web_search
+        {
+            anyhow::bail!(
+                "凭据 #{} 的转换结果与本轮固定的 model/backend/effort/search 计划不一致（model={} backend={}）",
+                credential_id,
+                converted.model,
+                converted.backend.as_str(),
+            );
+        }
+        let mut body = converted.body;
+        body["stream"] = Value::Bool(self.upstream_stream);
+        Ok(body)
+    }
+}
 
 /// POST /grok/v1/files
 ///
@@ -551,52 +604,58 @@ pub async fn post_messages(
         "Received POST /grok/v1/messages request"
     );
 
+    let stream_requested = payload.stream;
+    let upstream_stream = converted.backend != GrokApiBackend::Messages || stream_requested;
     let mut body = converted.body;
-    if converted.backend == GrokApiBackend::Messages {
+    body["stream"] = Value::Bool(upstream_stream);
+    let route = match file_credential_id {
+        Some(id) => GrokCredentialRoute::Required(id),
+        None => GrokCredentialRoute::Preferred(
+            pinned_credential_id.expect("successful routing always returns a credential"),
+        ),
+    };
+    let routed = RoutedGrokRequest {
+        payload: Arc::new(payload),
+        fallback_body: body,
+        default_model: state.default_model.clone(),
+        model: converted.model,
+        thinking_enabled: converted.thinking_enabled,
+        backend: converted.backend,
+        reasoning_effort: converted.reasoning_effort,
+        uses_hosted_web_search: converted.uses_hosted_web_search,
+        upstream_stream,
+        signature_codec: state.reasoning_signatures.clone(),
+    };
+    if routed.backend == GrokApiBackend::Messages {
         // Messages backend 本身就是 Anthropic 协议，直接透传其 SSE/JSON；请求
         // 体中的 thinking/output_config 已按 Grok Build 的 summarized 规则重建。
-        body["stream"] = Value::Bool(payload.stream);
         return messages_backend_response(
             state,
-            body,
-            converted.model,
-            converted.reasoning_effort,
-            payload.stream,
+            routed,
+            stream_requested,
             allowed_pools.0,
-            pinned_credential_id,
+            route,
         )
         .await;
     }
     // Responses 和 Chat Completions 均统一向上游请求 SSE，再聚合为调用方要
     // 求的 Anthropic 流式或非流式格式。
-    body["stream"] = Value::Bool(true);
-
-    if payload.stream {
+    if stream_requested {
         stream_response(
             state,
-            body,
-            converted.model,
+            routed,
             input_tokens,
-            converted.thinking_enabled,
-            converted.backend,
-            converted.reasoning_effort,
-            converted.uses_hosted_web_search,
             allowed_pools.0,
-            pinned_credential_id,
+            route,
         )
         .await
     } else {
         non_stream_response(
             state,
-            body,
-            converted.model,
+            routed,
             input_tokens,
-            converted.thinking_enabled,
-            converted.backend,
-            converted.reasoning_effort,
-            converted.uses_hosted_web_search,
             &allowed_pools.0,
-            pinned_credential_id,
+            route,
         )
         .await
     }
@@ -623,27 +682,17 @@ pub async fn post_messages_cc(
 
 async fn stream_response(
     state: GrokAppState,
-    body: Value,
-    model: String,
+    request: RoutedGrokRequest,
     input_tokens: i32,
-    thinking_enabled: bool,
-    backend: GrokApiBackend,
-    reasoning_effort: Option<ReasoningEffort>,
-    uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
-    pinned_credential_id: Option<u64>,
+    route: GrokCredentialRoute,
 ) -> Response {
     let stream = create_sse_stream(
         state,
-        body,
-        model,
+        request,
         input_tokens,
-        thinking_enabled,
-        backend,
-        reasoning_effort,
-        uses_hosted_web_search,
         allowed_pools,
-        pinned_credential_id,
+        route,
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -659,18 +708,17 @@ async fn stream_response(
 
 fn create_sse_stream(
     state: GrokAppState,
-    body: Value,
-    model: String,
+    request: RoutedGrokRequest,
     input_tokens: i32,
-    thinking_enabled: bool,
-    backend: GrokApiBackend,
-    reasoning_effort: Option<ReasoningEffort>,
-    uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
-    pinned_credential_id: Option<u64>,
+    route: GrokCredentialRoute,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
-        let mut context = GrokStreamContext::new(model.clone(), input_tokens, thinking_enabled);
+        let mut context = GrokStreamContext::new(
+            request.model.clone(),
+            input_tokens,
+            request.thinking_enabled,
+        );
         context.set_signature_codec(state.reasoning_signatures.clone());
         for event in context.initial_events() {
             yield Ok(Bytes::from(event.to_sse_string()));
@@ -678,14 +726,14 @@ fn create_sse_stream(
 
         let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
         ping.tick().await;
-        let connect = state.provider.call_api(
-            &body,
-            backend,
-            &model,
-            reasoning_effort,
-            uses_hosted_web_search,
+        let connect = state.provider.call_api_with_body(
+            request.backend,
+            &request.model,
+            request.reasoning_effort,
+            request.uses_hosted_web_search,
             Some(&allowed_pools),
-            pinned_credential_id,
+            route,
+            |credential_id| request.body_for_credential(&state, credential_id),
         );
         tokio::pin!(connect);
         let mut credential_id = None;
@@ -782,26 +830,21 @@ fn create_sse_stream(
 
 async fn non_stream_response(
     state: GrokAppState,
-    body: Value,
-    model: String,
+    request: RoutedGrokRequest,
     input_tokens: i32,
-    thinking_enabled: bool,
-    backend: GrokApiBackend,
-    reasoning_effort: Option<ReasoningEffort>,
-    uses_hosted_web_search: bool,
     allowed_pools: &[String],
-    pinned_credential_id: Option<u64>,
+    route: GrokCredentialRoute,
 ) -> Response {
     let upstream = match state
         .provider
-        .call_api(
-            &body,
-            backend,
-            &model,
-            reasoning_effort,
-            uses_hosted_web_search,
+        .call_api_with_body(
+            request.backend,
+            &request.model,
+            request.reasoning_effort,
+            request.uses_hosted_web_search,
             Some(allowed_pools),
-            pinned_credential_id,
+            route,
+            |credential_id| request.body_for_credential(&state, credential_id),
         )
         .await
     {
@@ -824,7 +867,11 @@ async fn non_stream_response(
         }
     };
 
-    let mut context = GrokStreamContext::new(model, input_tokens, thinking_enabled);
+    let mut context = GrokStreamContext::new(
+        request.model.clone(),
+        input_tokens,
+        request.thinking_enabled,
+    );
     context.set_signature_codec(state.reasoning_signatures.clone());
     context.set_credential_id(credential_id);
     let mut decoder = XaiSseDecoder::default();
@@ -872,21 +919,17 @@ async fn non_stream_response(
 /// Grok Build 语义适配，其余 SSE 原样转发给调用方。
 async fn messages_backend_response(
     state: GrokAppState,
-    body: Value,
-    model: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    request: RoutedGrokRequest,
     stream_requested: bool,
     allowed_pools: Vec<String>,
-    pinned_credential_id: Option<u64>,
+    route: GrokCredentialRoute,
 ) -> Response {
     if stream_requested {
         let stream = create_messages_sse_stream(
             state,
-            body,
-            model,
-            reasoning_effort,
+            request,
             allowed_pools,
-            pinned_credential_id,
+            route,
         );
         return Response::builder()
             .status(StatusCode::OK)
@@ -901,14 +944,14 @@ async fn messages_backend_response(
     }
     let upstream = match state
         .provider
-        .call_api(
-            &body,
+        .call_api_with_body(
             GrokApiBackend::Messages,
-            &model,
-            reasoning_effort,
+            &request.model,
+            request.reasoning_effort,
             false,
             Some(&allowed_pools),
-            pinned_credential_id,
+            route,
+            |credential_id| request.body_for_credential(&state, credential_id),
         )
         .await
     {
@@ -944,23 +987,21 @@ async fn messages_backend_response(
 
 fn create_messages_sse_stream(
     state: GrokAppState,
-    body: Value,
-    model: String,
-    reasoning_effort: Option<ReasoningEffort>,
+    request: RoutedGrokRequest,
     allowed_pools: Vec<String>,
-    pinned_credential_id: Option<u64>,
+    route: GrokCredentialRoute,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut ping = interval(Duration::from_secs(PING_INTERVAL_SECS));
         ping.tick().await;
-        let connect = state.provider.call_api(
-            &body,
+        let connect = state.provider.call_api_with_body(
             GrokApiBackend::Messages,
-            &model,
-            reasoning_effort,
+            &request.model,
+            request.reasoning_effort,
             false,
             Some(&allowed_pools),
-            pinned_credential_id,
+            route,
+            |credential_id| request.body_for_credential(&state, credential_id),
         );
         tokio::pin!(connect);
         let mut credential_id = None;

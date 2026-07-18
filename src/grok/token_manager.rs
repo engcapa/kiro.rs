@@ -668,6 +668,86 @@ impl GrokTokenManager {
         )
     }
 
+    /// 为一次上游调用生成不会重复的故障转移候选列表。首选凭据在仍 eligible
+    /// 时排首位，其余账号按当前负载均衡策略排序；required_id 用于 Files 等
+    /// 绑定资源，只允许返回指定账号。
+    pub fn routing_candidate_ids(
+        &self,
+        preferred_id: Option<u64>,
+        required_id: Option<u64>,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<Vec<u64>> {
+        let entries = self.entries.lock();
+        if entries.is_empty() {
+            bail!("未配置 Grok 凭据");
+        }
+        let is_eligible = |entry: &&CredentialEntry| {
+            !entry.disabled
+                && pool_matches(entry, allowed_pools)
+                && credential_supports(
+                    entry,
+                    model_id,
+                    reasoning_effort,
+                    backend,
+                    requires_backend_search,
+                )
+        };
+        if let Some(required_id) = required_id {
+            if entries
+                .iter()
+                .find(|entry| entry.id == required_id)
+                .is_some_and(|entry| is_eligible(&entry))
+            {
+                return Ok(vec![required_id]);
+            }
+            bail!(
+                "绑定资源所用的 Grok 凭据 #{} 已禁用、无权访问当前资源池或不支持模型/backend",
+                required_id
+            );
+        }
+
+        let mode = self.get_load_balancing_mode();
+        let mut candidates: Vec<u64> = match mode.as_str() {
+            LOAD_BALANCING_MODE_PRIORITY => {
+                let mut eligible = entries.iter().filter(is_eligible).collect::<Vec<_>>();
+                eligible.sort_by_key(|entry| entry.credentials.priority);
+                eligible.into_iter().map(|entry| entry.id).collect()
+            }
+            LOAD_BALANCING_MODE_BALANCED => {
+                let mut eligible = entries.iter().filter(is_eligible).collect::<Vec<_>>();
+                eligible.sort_by_key(|entry| (entry.success_count, entry.credentials.priority));
+                eligible.into_iter().map(|entry| entry.id).collect()
+            }
+            _ => {
+                let current_id = *self.current_id.lock();
+                let start = entries
+                    .iter()
+                    .position(|entry| entry.id == current_id)
+                    .map(|index| (index + 1) % entries.len())
+                    .unwrap_or(0);
+                (0..entries.len())
+                    .map(|offset| &entries[(start + offset) % entries.len()])
+                    .filter(is_eligible)
+                    .map(|entry| entry.id)
+                    .collect()
+            }
+        };
+        if let Some(preferred_id) = preferred_id {
+            if let Some(position) = candidates.iter().position(|id| *id == preferred_id) {
+                candidates.rotate_left(position);
+            }
+        }
+        if candidates.is_empty() {
+            bail!("没有支持当前模型/backend 且属于当前 API Key 资源池的 Grok 凭据");
+        }
+        *self.current_id.lock() = candidates[0];
+        Ok(candidates)
+    }
+
     /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
     /// 时自动刷新。目录未加载的凭据会被保守地放行，保持控制平面抖动时的服务
     /// 可用性；目录已加载的凭据则严格按其模型能力过滤。`requires_backend_search`
@@ -1373,6 +1453,43 @@ mod tests {
                 )
                 .unwrap(),
             preferred
+        );
+    }
+
+    #[test]
+    fn routing_candidates_prefer_session_account_without_duplicates_and_honor_required() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(3),
+                access_token: Some("token-three".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let candidates = manager
+            .routing_candidate_ids(Some(2), None, None, None, None, false, None)
+            .unwrap();
+        assert_eq!(candidates[0], 2);
+        assert_eq!(candidates.len(), 3);
+        let unique = candidates
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), candidates.len());
+        assert_eq!(
+            manager
+                .routing_candidate_ids(None, Some(1), None, None, None, false, None)
+                .unwrap(),
+            vec![1]
         );
     }
 
