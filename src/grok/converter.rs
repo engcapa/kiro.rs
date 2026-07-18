@@ -14,6 +14,10 @@ pub struct ConvertedGrokRequest {
     pub thinking_enabled: bool,
     pub backend: GrokApiBackend,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// 是否把 Anthropic Web Search 转换成 xAI Responses 的 hosted tool。
+    /// 该标记会继续传给凭据选择器，保证在多账号场景中只选择 catalog
+    /// `supportsBackendSearch=true` 的凭据。
+    pub uses_hosted_web_search: bool,
 }
 
 #[derive(Debug)]
@@ -25,6 +29,8 @@ pub enum ConversionError {
         model: String,
         effort: ReasoningEffort,
     },
+    WebSearchRequiresResponses(String),
+    WebSearchUnsupported(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -40,6 +46,14 @@ impl std::fmt::Display for ConversionError {
             Self::UnsupportedReasoningEffort { model, effort } => {
                 write!(formatter, "模型 {model} 不支持 reasoning effort={effort}")
             }
+            Self::WebSearchRequiresResponses(model) => write!(
+                formatter,
+                "模型 {model} 使用 chat_completions backend，无法承载 Grok Build 的 hosted web_search；请选择 Responses backend 模型"
+            ),
+            Self::WebSearchUnsupported(model) => write!(
+                formatter,
+                "模型 {model} 的 Grok Build catalog 未声明 supportsBackendSearch，无法启用 hosted web_search"
+            ),
         }
     }
 }
@@ -62,6 +76,22 @@ pub fn convert_request(
         // 真实 catalog 尚未拉取时沿用已有 `/responses` 兼容行为；真实
         // catalog 一到位后则严格按它的 apiBackend 分派。
         .unwrap_or(GrokApiBackend::Responses);
+    let requests_web_search = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(is_web_search_tool));
+    // Grok Build 只会把 backend-hosted tool 加入 Responses 请求；Chat
+    // Completions 的转换器没有 hosted_tools 通道。显式拒绝比把一个无效的
+    // `type:web_search` 混进 Chat payload 更可预测。
+    if requests_web_search && backend == GrokApiBackend::ChatCompletions {
+        return Err(ConversionError::WebSearchRequiresResponses(model));
+    }
+    let uses_hosted_web_search = requests_web_search && backend == GrokApiBackend::Responses;
+    // 无真实 catalog 时沿用 bootstrap/原有兼容路径。真实目录一旦取得，需
+    // 按 Grok Build 的 supportsBackendSearch capability 进行前置校验。
+    if uses_hosted_web_search && model_entry.is_some_and(|model| !model.supports_backend_search) {
+        return Err(ConversionError::WebSearchUnsupported(model));
+    }
     let reasoning_effort = resolve_reasoning_effort(request, model_entry, &model)?;
     let thinking_enabled = match backend {
         GrokApiBackend::Messages => reasoning_effort
@@ -84,6 +114,7 @@ pub fn convert_request(
         thinking_enabled,
         backend,
         reasoning_effort,
+        uses_hosted_web_search,
     })
 }
 
@@ -210,7 +241,7 @@ fn build_responses_body(
     let converted_tools = request
         .tools
         .as_ref()
-        .map(|tools| tools.iter().filter_map(convert_tool).collect::<Vec<_>>())
+        .map(|tools| convert_tools(tools, convert_tool))
         .unwrap_or_default();
     if !converted_tools.is_empty() {
         body["tools"] = Value::Array(converted_tools);
@@ -242,12 +273,7 @@ fn build_chat_completions_body(
     let tools = request
         .tools
         .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(convert_chat_tool)
-                .collect::<Vec<_>>()
-        })
+        .map(|tools| convert_tools(tools, convert_chat_tool))
         .unwrap_or_default();
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
@@ -347,12 +373,12 @@ fn append_chat_user_message(messages: &mut Vec<Value>, content: &Value) {
                     "content": value_to_text(&block.content.unwrap_or(Value::Null)),
                 }));
             }
-            "image" => {
-                if let Some(source) = block.source {
+            "image" | "image_url" => {
+                if let Some(url) = image_url_from_block(&block) {
                     content_parts.push(json!({
                         "type": "image_url",
                         "image_url": {
-                            "url": format!("data:{};base64,{}", source.media_type, source.data),
+                            "url": url,
                         },
                     }));
                 }
@@ -467,11 +493,11 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                     "output": value_to_text(&block.content.unwrap_or(Value::Null)),
                 }));
             }
-            "image" => {
-                if let Some(source) = block.source {
+            "image" | "image_url" => {
+                if let Some(url) = image_url_from_block(&block) {
                     content_parts.push(json!({
                         "type": "input_image",
-                        "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                        "image_url": url,
                     }));
                 }
             }
@@ -563,6 +589,47 @@ fn parse_content_blocks(content: &Value) -> Vec<ContentBlock> {
     }
 }
 
+/// 将 Anthropic `image` block（base64 或 URL）以及常见 OpenAI 兼容
+/// `image_url` block 规范为 xAI 可以接受的 image URL。Grok Build 会把本地
+/// 附件归一化成 data URL；代理端没有调用方的本地文件系统，因此只接受已经
+/// 可传输的 data URL 或远程 URL。
+fn image_url_from_block(block: &ContentBlock) -> Option<String> {
+    if let Some(source) = &block.source {
+        if let Some(url) = source
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_string());
+        }
+        let data = source.data.trim();
+        if !data.is_empty() {
+            if data.starts_with("data:") {
+                return Some(data.to_string());
+            }
+            let media_type = source.media_type.trim();
+            if !media_type.is_empty() {
+                return Some(format!("data:{media_type};base64,{data}"));
+            }
+        }
+    }
+    let value = block.image_url.as_ref()?;
+    match value {
+        Value::String(url) => non_empty_trimmed(url),
+        Value::Object(object) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(non_empty_trimmed),
+        _ => None,
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn value_to_text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -591,12 +658,25 @@ fn value_to_text(value: &Value) -> String {
 }
 
 fn convert_tool(tool: &Tool) -> Option<Value> {
-    if tool
-        .tool_type
-        .as_deref()
-        .is_some_and(|tool_type| tool_type.starts_with("web_search"))
-    {
-        return Some(json!({ "type": "web_search" }));
+    if is_web_search_tool(tool) {
+        let mut converted = json!({ "type": "web_search" });
+        if let Some(domains) = tool
+            .allowed_domains
+            .as_ref()
+            .map(|domains| {
+                domains
+                    .iter()
+                    .map(|domain| domain.trim())
+                    .filter(|domain| !domain.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|domains| !domains.is_empty())
+        {
+            // 与 Grok Build `HostedTool::WebSearch` 完全相同的 wire shape。
+            converted["filters"] = json!({ "allowed_domains": domains });
+        }
+        return Some(converted);
     }
     if tool.name.trim().is_empty() {
         return None;
@@ -617,6 +697,40 @@ fn convert_tool(tool: &Tool) -> Option<Value> {
         "description": tool.description,
         "parameters": parameters,
     }))
+}
+
+/// Grok Build 会让 hosted `web_search` 胜过同名 function，避免 xAI
+/// Responses 拒绝 `Duplicate tool names: web_search`。将该规则用于
+/// Anthropic 转换，既允许 web search 与普通工具并存，也不会丢失 hosted
+/// tool 的优先级。
+fn convert_tools(tools: &[Tool], converter: fn(&Tool) -> Option<Value>) -> Vec<Value> {
+    let has_web_search = tools.iter().any(is_web_search_tool);
+    let mut hosted_web_search_added = false;
+    tools
+        .iter()
+        .filter_map(|tool| {
+            if has_web_search && !is_web_search_tool(tool) && tool.name == "web_search" {
+                return None;
+            }
+            // Anthropic 请求理论上只会有一个 Web Search tool；若兼容客户端
+            // 重复发送，保留首个（及其 allowed_domains），避免 xAI 拒绝重复的
+            // hosted tool 名称。这与 Grok Build 为一个 agent turn 注入单个
+            // HostedTool::WebSearch 的行为一致。
+            if is_web_search_tool(tool) {
+                if hosted_web_search_added {
+                    return None;
+                }
+                hosted_web_search_added = true;
+            }
+            converter(tool)
+        })
+        .collect()
+}
+
+fn is_web_search_tool(tool: &Tool) -> bool {
+    tool.tool_type
+        .as_deref()
+        .is_some_and(|tool_type| tool_type.starts_with("web_search"))
 }
 
 fn convert_chat_tool(tool: &Tool) -> Option<Value> {
@@ -703,6 +817,7 @@ mod tests {
                 )
                 .unwrap(),
                 max_uses: None,
+                allowed_domains: None,
             }]),
             tool_choice: None,
             thinking: Some(Thinking {
@@ -718,6 +833,146 @@ mod tests {
         assert_eq!(converted.body["input"][1]["type"], "function_call_output");
         assert_eq!(converted.body["tools"][0]["type"], "function");
         assert!(converted.body.get("reasoning").is_some());
+    }
+
+    #[test]
+    fn converts_web_search_to_build_hosted_tool_with_domain_filters() {
+        let request = web_search_request();
+
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        let tools = converted.body["tools"].as_array().unwrap();
+        assert!(converted.uses_hosted_web_search);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(
+            tools[0]["filters"]["allowed_domains"],
+            json!(["docs.rs", "example.com"])
+        );
+    }
+
+    #[test]
+    fn rejects_hosted_web_search_when_catalog_does_not_support_it() {
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportsBackendSearch":false
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let error = convert_request(&web_search_request(), "grok-4.5", Some(&catalog))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("supportsBackendSearch"));
+    }
+
+    #[test]
+    fn rejects_hosted_web_search_for_chat_completions_backend() {
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"chat_completions",
+                "supportsBackendSearch":true
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let error = convert_request(&web_search_request(), "grok-4.5", Some(&catalog))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("chat_completions"));
+    }
+
+    #[test]
+    fn keeps_only_one_hosted_web_search_definition() {
+        let mut request = web_search_request();
+        request.tools.as_mut().unwrap().push(Tool {
+            tool_type: Some("web_search_20250305".to_string()),
+            name: "web_search".to_string(),
+            description: String::new(),
+            input_schema: Default::default(),
+            max_uses: None,
+            allowed_domains: Some(vec!["second.example".to_string()]),
+        });
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        let tools = converted.body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["filters"]["allowed_domains"],
+            json!(["docs.rs", "example.com"])
+        );
+    }
+
+    fn web_search_request() -> MessagesRequest {
+        MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 1024,
+            stream: true,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("search the docs"),
+            }],
+            tools: Some(vec![
+                Tool {
+                    tool_type: Some("web_search_20250305".to_string()),
+                    name: "web_search".to_string(),
+                    description: String::new(),
+                    input_schema: Default::default(),
+                    max_uses: Some(8),
+                    allowed_domains: Some(vec![
+                        "docs.rs".to_string(),
+                        " ".to_string(),
+                        "example.com".to_string(),
+                    ]),
+                },
+                // Grok Build drops this collision: hosted web_search wins.
+                Tool {
+                    tool_type: None,
+                    name: "web_search".to_string(),
+                    description: "incorrect function duplicate".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    allowed_domains: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn converts_anthropic_base64_and_url_images_without_rewriting_urls() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"text","text":"describe these"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},
+                    {"type":"image","source":{"type":"url","url":"https://example.com/photo.png"}},
+                    {"type":"image_url","image_url":{"url":"https://example.com/openai-shape.jpg"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        let content = converted.body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AA==");
+        assert_eq!(content[2]["image_url"], "https://example.com/photo.png");
+        assert_eq!(
+            content[3]["image_url"],
+            "https://example.com/openai-shape.jpg"
+        );
     }
 
     #[test]

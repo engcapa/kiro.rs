@@ -496,7 +496,7 @@ impl GrokTokenManager {
 
     pub fn peek_next_credential_name(&self, allowed_pools: Option<&[String]>) -> Option<String> {
         let id = self
-            .choose_credential_id(None, None, None, allowed_pools)
+            .choose_credential_id(None, None, None, false, allowed_pools)
             .ok()?;
         self.credential(id)
             .map(|credential| credential.display_name(id))
@@ -504,23 +504,30 @@ impl GrokTokenManager {
 
     /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
     /// 时自动刷新。目录未加载的凭据会被保守地放行，保持控制平面抖动时的服务
-    /// 可用性；目录已加载的凭据则严格按其模型能力过滤。
+    /// 可用性；目录已加载的凭据则严格按其模型能力过滤。`requires_backend_search`
+    /// 对应 Grok Build catalog 的 `supportsBackendSearch`，避免把 Responses
+    /// hosted search 投递给不支持它的凭据。
     pub async fn acquire_context(
         &self,
         model_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<GrokCallContext> {
         let attempts = self.total_count().max(1) * MAX_FAILURES_PER_CREDENTIAL as usize;
         let mut last_error = None;
         for _ in 0..attempts {
-            let id =
-                match self.choose_credential_id(model_id, reasoning_effort, backend, allowed_pools)
-                {
-                    Ok(id) => id,
-                    Err(error) => return Err(error),
-                };
+            let id = match self.choose_credential_id(
+                model_id,
+                reasoning_effort,
+                backend,
+                requires_backend_search,
+                allowed_pools,
+            ) {
+                Ok(id) => id,
+                Err(error) => return Err(error),
+            };
             match self.acquire_context_for(id).await {
                 Ok(context) => return Ok(context),
                 Err(error) => {
@@ -763,6 +770,7 @@ impl GrokTokenManager {
         model_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         let entries = self.entries.lock();
@@ -777,7 +785,13 @@ impl GrokTokenManager {
             .filter(|(_, entry)| {
                 !entry.disabled
                     && pool_matches(entry, allowed_pools)
-                    && credential_supports(entry, model_id, reasoning_effort, backend)
+                    && credential_supports(
+                        entry,
+                        model_id,
+                        reasoning_effort,
+                        backend,
+                        requires_backend_search,
+                    )
             })
             .collect::<Vec<_>>();
         if eligible.is_empty() {
@@ -786,11 +800,15 @@ impl GrokTokenManager {
                 let effort = reasoning_effort
                     .map(|effort| format!("、effort={effort}"))
                     .unwrap_or_default();
+                let backend_search = requires_backend_search
+                    .then_some("、supportsBackendSearch=true")
+                    .unwrap_or_default();
                 bail!(
-                    "没有 Grok 凭据支持模型 {}（backend={}{}）或当前 API Key 资源池",
+                    "没有 Grok 凭据支持模型 {}（backend={}{}{}）或当前 API Key 资源池",
                     model_id,
                     backend,
-                    effort
+                    effort,
+                    backend_search,
                 );
             }
             bail!("没有可用于当前 API Key 资源池的 Grok 凭据");
@@ -818,7 +836,13 @@ impl GrokTokenManager {
                         let entry = &entries[index];
                         (!entry.disabled
                             && pool_matches(entry, allowed_pools)
-                            && credential_supports(entry, model_id, reasoning_effort, backend))
+                            && credential_supports(
+                                entry,
+                                model_id,
+                                reasoning_effort,
+                                backend,
+                                requires_backend_search,
+                            ))
                         .then_some(entry.id)
                     })
             }
@@ -924,14 +948,14 @@ fn credential_supports(
     model_id: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
     backend: Option<GrokApiBackend>,
+    requires_backend_search: bool,
 ) -> bool {
     let Some(model_id) = model_id else {
         return true;
     };
-    entry
-        .model_index
-        .as_ref()
-        .is_none_or(|index| index.supports(model_id, reasoning_effort, backend))
+    entry.model_index.as_ref().is_none_or(|index| {
+        index.supports(model_id, reasoning_effort, backend, requires_backend_search)
+    })
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -996,7 +1020,7 @@ mod tests {
         ]);
         let pools = vec!["two".to_string()];
         let context = manager
-            .acquire_context(None, None, None, Some(&pools))
+            .acquire_context(None, None, None, false, Some(&pools))
             .await
             .unwrap();
         assert_eq!(context.id, 2);
@@ -1063,6 +1087,7 @@ mod tests {
                 Some("grok-composer-2.5-fast"),
                 Some(ReasoningEffort::Xhigh),
                 Some(GrokApiBackend::Responses),
+                false,
                 None,
             )
             .await
@@ -1074,6 +1099,7 @@ mod tests {
                 Some("grok-4.5"),
                 Some(ReasoningEffort::Xhigh),
                 Some(GrokApiBackend::Responses),
+                false,
                 None,
             )
             .await
@@ -1082,5 +1108,59 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("grok-4.5"));
+    }
+
+    #[tokio::test]
+    async fn backend_search_only_uses_credential_whose_catalog_supports_it() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+        ]);
+        manager
+            .set_model_catalog(
+                1,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-4.5",
+                        "apiBackend":"responses",
+                        "supportsBackendSearch":false
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+        manager
+            .set_model_catalog(
+                2,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-4.5",
+                        "apiBackend":"responses",
+                        "supportsBackendSearch":true
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+
+        let context = manager
+            .acquire_context(
+                Some("grok-4.5"),
+                None,
+                Some(GrokApiBackend::Responses),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.id, 2);
     }
 }

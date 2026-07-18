@@ -467,6 +467,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/grok/v1/models` | GET | 返回所有已加载凭据目录的模型并集；目录未加载时返回 bootstrap 清单 |
 | `/grok/v1/messages` | POST | Anthropic Messages → catalog 指定的 xAI Responses / Chat Completions / Messages，支持流式、工具调用、图片与 thinking |
 | `/grok/v1/messages/count_tokens` | POST | 估算请求 Token 数量 |
+| `/grok/v1/images/generations` | POST | Grok Build Imagine 文生图扩展；返回 xAI `data[].b64_json` |
+| `/grok/v1/images/edits` | POST | Grok Build Imagine 图像编辑扩展，支持一张或多张参考图 |
+| `/grok/v1/videos/generations` | POST | Grok Build image-to-video / reference-to-video 扩展，返回可轮询任务 ID |
+| `/grok/v1/videos/{request_id}` | GET | 轮询视频生成状态；完成时返回 xAI `video.url` |
 | `/grok/cc/v1/messages` | POST | Claude Code 兼容路径 |
 | `/grok/cc/v1/messages/count_tokens` | POST | Token 估算 |
 
@@ -481,6 +485,92 @@ Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
 `reasoning.effort`。因此无需也不会再依赖模型名的 `-thinking` 后缀。收到的 xAI reasoning
 summary 会转换为 Anthropic `thinking` 内容块。`xhigh` 会原样保留；但若服务端给该模型提供
 了明确的 `reasoningEfforts` 菜单，则只接受菜单中声明的值。
+
+#### Web Search
+
+`/grok/v1/messages` 接受 Anthropic 的 Web Search tool，并按 Grok Build 的
+Responses hosted-tool 形状转发，而不是把它降级成普通 function：
+
+```json
+{
+  "model": "grok-4.5",
+  "max_tokens": 2048,
+  "messages": [{"role": "user", "content": "查一下 Rust 最新稳定版"}],
+  "tools": [{
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "allowed_domains": ["blog.rust-lang.org", "doc.rust-lang.org"]
+  }]
+}
+```
+
+上游实际得到 `{"type":"web_search","filters":{"allowed_domains":[...]}}`；若同时定义了同名普通
+function，和 Grok Build 一样由 hosted Web Search 优先，避免 xAI 的重复工具名错误。
+对于 catalog 为 `responses` 的模型，流式与非流式响应都会将 xAI `web_search_call` 转换为 Anthropic
+`server_tool_use` 和 `web_search_tool_result` 内容块，保留 query、来源 URL、标题和摘要，并在
+`usage.server_tool_use.web_search_requests` 中计数。catalog 为 `messages` 的模型本身使用 Anthropic
+wire protocol，会将该工具和服务端事件原样透传。
+真实 catalog 已加载时，只有声明 `supportsBackendSearch: true` 的 `responses` 凭据才会被选中；多个
+凭据的模型并集即使包含该模型，也不会把带搜索的请求负载到不支持搜索的账号。`chat_completions`
+backend 没有 Grok Build 的 hosted-tools 通道，因此此组合会明确返回 400，需改用 catalog 标记为
+`responses` 的模型，而不会悄悄降级成普通 function。
+`max_uses` 会被接受以兼容 Anthropic 请求，但 xAI Responses 没有对应 wire 字段，实际调用次数由
+xAI 的 hosted-tool sampler 决定。
+
+#### 图片输入与 Imagine 图片/视频生成
+
+标准 Anthropic 消息中的图片输入可直接使用，既支持 base64 source：
+
+```json
+{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+```
+
+也支持 URL source `{"type":"image","source":{"type":"url","url":"https://..."}}`；同时兼容常见的
+OpenAI 形状 `{"type":"image_url","image_url":{"url":"..."}}`。它们会被转换为 xAI Responses 的
+`input_image`（或 Chat Completions 的 `image_url`），不会重写 HTTPS URL。
+
+Anthropic Messages 本身没有统一的“生成图片/视频”输出块。Grok Build 也不是通过 Responses
+生成媒体，而是以本地 `image_gen`、`image_edit`、`image_to_video`、`reference_to_video` 工具直连
+xAI 的 `/images/*`、`/videos/*`。因此 `/grok` 保持 Messages 的 Anthropic 兼容性，同时提供下列明确的
+Build-style 扩展端点：
+
+```bash
+# 文生图：固定使用 Grok Build 默认的 grok-imagine-image-quality、n=1、1k、b64_json
+curl -X POST http://127.0.0.1:8080/grok/v1/images/generations \
+  -H 'x-api-key: <apiKey>' -H 'content-type: application/json' \
+  -d '{"prompt":"a capybara astronaut","aspect_ratio":"16:9"}'
+
+# 图像编辑：image 是一张或多张参考图；单图映射 xAI image，多图映射 images
+curl -X POST http://127.0.0.1:8080/grok/v1/images/edits \
+  -H 'x-api-key: <apiKey>' -H 'content-type: application/json' \
+  -d '{"prompt":"turn this into watercolor","image":["data:image/png;base64,..."]}'
+
+# 单图生成视频：对应 Grok Build image_to_video
+curl -X POST http://127.0.0.1:8080/grok/v1/videos/generations \
+  -H 'x-api-key: <apiKey>' -H 'content-type: application/json' \
+  -d '{"image":"https://example.com/frame.png","prompt":"slow camera push-in","duration":6,"resolution_name":"480p"}'
+
+# 多参考图生成视频：对应 Grok Build reference_to_video（images 必须为 2 到 7 张）
+curl -X POST http://127.0.0.1:8080/grok/v1/videos/generations \
+  -H 'x-api-key: <apiKey>' -H 'content-type: application/json' \
+  -d '{"prompt":"cinematic transition","images":["https://example.com/a.png","https://example.com/b.png"],"aspect_ratio":"16:9","duration":10,"resolution_name":"720p"}'
+```
+
+单图视频使用 `grok-imagine-video-1.5-preview`，多参考图视频使用
+`grok-imagine-video`；`duration` 只允许 `6` 或 `10`，`resolution_name` 只允许 `480p` 或 `720p`。
+视频创建响应中的 `request_id` 是代理生成的 opaque ID，需用 `GET /grok/v1/videos/{request_id}`
+轮询；成功时其中的 `video.url` 是 xAI 返回的可下载 URL。Grok Build 在本地会把图片/视频保存到 session
+目录，而 HTTP 代理不能写入远程调用方的文件系统，因此保留 base64 图片和视频 URL 原样返回。调用方应和
+Grok Build 一样每 5 秒轮询一次、最长等待 300 秒；opaque ID 只保存在本进程内，服务重启或创建 1 小时后会
+失效并返回 404。
+
+`/images/edits` 的 `image` 只接受 `data:image/...;base64,...`：Grok Build 会把它的本地参考图解码、压缩后
+转换为这种形式，代理不会错误读取调用方机器路径或下载任意 HTTPS URL。视频的 `image` / `images` 则接受
+`https://` URL 或 `data:image/...;base64,...`。视频输入上传也未实现：Grok Build 的实际能力是**图片生成视频**
+和**参考图生成视频**，不是上传视频给对话模型。
+
+媒体端点和 Grok Build 一样直连公共 xAI API 基址（`grokBaseUrl`），即使推理使用 OAuth 且 Messages
+走 CLI chat proxy 也是如此；凭据池、API Key 资源池限制和 OAuth 自动刷新仍与 `/grok/v1/messages` 共用。
 
 ### Thinking 模式
 
@@ -561,7 +651,8 @@ summary 会转换为 Anthropic `thinking` 内容块。`xhigh` 会原样保留；
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+3. **WebSearch 工具**: 根路径 `/v1/messages` 保留原有的单 WebSearch 工具转换逻辑；`/grok/v1/messages`
+   支持与普通工具并存的 xAI hosted Web Search，具体 wire 映射见上文
 
 ## 项目结构
 

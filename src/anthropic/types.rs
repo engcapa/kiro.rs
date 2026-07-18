@@ -205,7 +205,8 @@ pub struct SystemMessage {
 ///
 /// 支持两种格式：
 /// 1. 普通工具：{ name, description, input_schema }
-/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8 }
+/// 2. WebSearch 工具：{ type: "web_search_20250305", name: "web_search", max_uses: 8,
+///    allowed_domains: ["docs.example.com"] }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tool {
     /// 工具类型，如 "web_search_20250305"（可选，仅 WebSearch 工具）
@@ -223,6 +224,10 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Web Search 结果域名白名单。xAI Responses 的原生 web_search 工具将
+    /// 此字段映射为 `filters.allowed_domains`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
 }
 
 /// 内容块
@@ -250,15 +255,27 @@ pub struct ContentBlock {
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// 兼容部分 Anthropic/OpenAI 客户端发送的
+    /// `{type:"image_url",image_url:{url:"..."}}` 形状。标准 Anthropic
+    /// `image` 块仍优先使用 `source`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<serde_json::Value>,
 }
 
 /// 图片数据源
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
+    #[serde(default)]
     pub source_type: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
+    /// Anthropic URL image source 的远程地址。旧的 base64 source 不带这个
+    /// 字段，因此保持可选且不影响既有请求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

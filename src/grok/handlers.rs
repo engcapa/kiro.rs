@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -21,11 +21,151 @@ use crate::anthropic::types::{
 use crate::token;
 
 use super::converter::convert_request;
+use super::media::{
+    build_image_edit_body, build_image_generation_body, build_video_generation_body,
+};
 use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
+use super::provider::GrokUpstreamResponse;
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
 use super::stream::{GrokStreamContext, XaiSseDecoder};
 
 const PING_INTERVAL_SECS: u64 = 25;
+
+/// POST /grok/v1/images/generations
+///
+/// Build-style input: `{prompt, aspect_ratio?}`. 返回的 `data[].b64_json`
+/// 是 xAI 原始响应；HTTP 服务无法像本地 Grok Build 一样写入调用方磁盘。
+pub async fn post_image_generations(
+    State(state): State<GrokAppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
+    JsonExtractor(payload): JsonExtractor<Value>,
+) -> Response {
+    let body = match build_image_generation_body(&payload) {
+        Ok(body) => body,
+        Err(error) => return invalid_media_request(error),
+    };
+    forward_media_request(state, allowed_pools.0, "/images/generations", body).await
+}
+
+/// POST /grok/v1/images/edits
+///
+/// Build-style input: `{prompt, image: [data-url, ...], aspect_ratio?}`。
+/// 单图和多图会按 Grok Build 分别转换为 xAI `image` / `images`；代理不能
+/// 读取调用方本地文件或下载任意远程图，因此编辑参考图必须已是 data URL。
+pub async fn post_image_edits(
+    State(state): State<GrokAppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
+    JsonExtractor(payload): JsonExtractor<Value>,
+) -> Response {
+    let body = match build_image_edit_body(&payload) {
+        Ok(body) => body,
+        Err(error) => return invalid_media_request(error),
+    };
+    forward_media_request(state, allowed_pools.0, "/images/edits", body).await
+}
+
+/// POST /grok/v1/videos/generations
+///
+/// 支持 Grok Build 的 image-to-video 与 reference-to-video 输入。响应中的
+/// `request_id` 为代理 opaque id；用 GET `/grok/v1/videos/{request_id}`
+/// 轮询即可拿到 xAI 的 `status` 与完成后的 `video.url`。
+pub async fn post_video_generations(
+    State(state): State<GrokAppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
+    JsonExtractor(payload): JsonExtractor<Value>,
+) -> Response {
+    let body = match build_video_generation_body(&payload) {
+        Ok(body) => body,
+        Err(error) => return invalid_media_request(error),
+    };
+    let upstream = match state
+        .provider
+        .call_public_api(
+            reqwest::Method::POST,
+            "/videos/generations",
+            Some(&body),
+            Some(&allowed_pools.0),
+        )
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return map_provider_error(error),
+    };
+    let status = upstream.response.status();
+    let credential_id = upstream.credential_id;
+    let bytes = match upstream.response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => return media_response_read_error(error),
+    };
+    let mut response = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("xAI 视频生成返回了无法解析的 JSON: {error}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let upstream_request_id = match response
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    {
+        Some(request_id) => request_id,
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "xAI 视频生成响应缺少 request_id",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let request_id = match state
+        .provider
+        .register_video_job(&upstream_request_id, credential_id)
+    {
+        Ok(request_id) => request_id,
+        Err(error) => return map_provider_error(error),
+    };
+    let Some(object) = response.as_object_mut() else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "xAI 视频生成响应必须是 JSON 对象",
+            )),
+        )
+            .into_response();
+    };
+    object.insert("request_id".to_string(), Value::String(request_id));
+    let mut client_response = Json(response).into_response();
+    *client_response.status_mut() = status;
+    client_response
+}
+
+/// GET /grok/v1/videos/{request_id}
+pub async fn get_video_generation(
+    State(state): State<GrokAppState>,
+    axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
+    Path(request_id): Path<String>,
+) -> Response {
+    let upstream = match state
+        .provider
+        .poll_video_job(&request_id, &allowed_pools.0)
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return map_provider_error(error),
+    };
+    public_json_response(upstream).await
+}
 
 /// GET /grok/v1/models
 pub async fn get_models(State(state): State<GrokAppState>) -> impl IntoResponse {
@@ -143,6 +283,7 @@ pub async fn post_messages(
             converted.thinking_enabled,
             converted.backend,
             converted.reasoning_effort,
+            converted.uses_hosted_web_search,
             allowed_pools.0,
         )
         .await
@@ -155,6 +296,7 @@ pub async fn post_messages(
             converted.thinking_enabled,
             converted.backend,
             converted.reasoning_effort,
+            converted.uses_hosted_web_search,
             &allowed_pools.0,
         )
         .await
@@ -188,6 +330,7 @@ async fn stream_response(
     thinking_enabled: bool,
     backend: GrokApiBackend,
     reasoning_effort: Option<ReasoningEffort>,
+    uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
 ) -> Response {
     let stream = create_sse_stream(
@@ -198,6 +341,7 @@ async fn stream_response(
         thinking_enabled,
         backend,
         reasoning_effort,
+        uses_hosted_web_search,
         allowed_pools,
     );
     Response::builder()
@@ -220,6 +364,7 @@ fn create_sse_stream(
     thinking_enabled: bool,
     backend: GrokApiBackend,
     reasoning_effort: Option<ReasoningEffort>,
+    uses_hosted_web_search: bool,
     allowed_pools: Vec<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
@@ -235,6 +380,7 @@ fn create_sse_stream(
             backend,
             &model,
             reasoning_effort,
+            uses_hosted_web_search,
             Some(&allowed_pools),
         );
         tokio::pin!(connect);
@@ -297,6 +443,7 @@ async fn non_stream_response(
     thinking_enabled: bool,
     backend: GrokApiBackend,
     reasoning_effort: Option<ReasoningEffort>,
+    uses_hosted_web_search: bool,
     allowed_pools: &[String],
 ) -> Response {
     let upstream = match state
@@ -306,6 +453,7 @@ async fn non_stream_response(
             backend,
             &model,
             reasoning_effort,
+            uses_hosted_web_search,
             Some(allowed_pools),
         )
         .await
@@ -397,6 +545,7 @@ async fn messages_backend_response(
             GrokApiBackend::Messages,
             &model,
             reasoning_effort,
+            false,
             Some(&allowed_pools),
         )
         .await
@@ -439,6 +588,7 @@ fn create_messages_sse_stream(
             GrokApiBackend::Messages,
             &model,
             reasoning_effort,
+            false,
             Some(&allowed_pools),
         );
         tokio::pin!(connect);
@@ -476,7 +626,11 @@ fn create_messages_sse_stream(
 
 fn map_provider_error(error: anyhow::Error) -> Response {
     let message = error.to_string();
-    let status = if message.contains("没有可用") || message.contains("未配置 Grok 凭据") {
+    let status = if message.contains("无权访问") {
+        StatusCode::FORBIDDEN
+    } else if message.contains("视频任务不存在或已过期") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("没有可用") || message.contains("未配置 Grok 凭据") {
         StatusCode::SERVICE_UNAVAILABLE
     } else if message.contains("请求失败: 400") || message.contains("请求失败: 422") {
         StatusCode::BAD_REQUEST
@@ -484,6 +638,72 @@ fn map_provider_error(error: anyhow::Error) -> Response {
         StatusCode::BAD_GATEWAY
     };
     (status, Json(ErrorResponse::new("api_error", message))).into_response()
+}
+
+async fn forward_media_request(
+    state: GrokAppState,
+    allowed_pools: Vec<String>,
+    path: &str,
+    body: Value,
+) -> Response {
+    let upstream = match state
+        .provider
+        .call_public_api(
+            reqwest::Method::POST,
+            path,
+            Some(&body),
+            Some(&allowed_pools),
+        )
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => return map_provider_error(error),
+    };
+    public_json_response(upstream).await
+}
+
+async fn public_json_response(upstream: GrokUpstreamResponse) -> Response {
+    let status = upstream.response.status();
+    let content_type = upstream
+        .response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    match upstream.response.bytes().await {
+        Ok(bytes) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(bytes))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "构建 Grok Imagine 响应失败");
+                Response::new(Body::empty())
+            }),
+        Err(error) => media_response_read_error(error),
+    }
+}
+
+fn invalid_media_request(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            error.to_string(),
+        )),
+    )
+        .into_response()
+}
+
+fn media_response_read_error(error: reqwest::Error) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(
+            "api_error",
+            format!("读取 xAI Imagine 响应失败: {error}"),
+        )),
+    )
+        .into_response()
 }
 
 fn ping_sse() -> Bytes {

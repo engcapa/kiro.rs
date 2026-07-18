@@ -170,6 +170,11 @@ pub struct GrokModel {
     pub supported_in_api: bool,
     #[serde(default)]
     pub supports_reasoning_effort: bool,
+    /// Grok Build 仅在目录明确声明该能力时，才将 Responses hosted
+    /// Web Search 注入该模型的请求。这个字段也参与每凭据路由，避免合并
+    /// catalog 后把搜索请求负载到不支持它的账号。
+    #[serde(default)]
+    pub supports_backend_search: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -288,6 +293,10 @@ impl GrokModelCatalog {
                     }),
                     supported_in_api: true,
                     supports_reasoning_effort: true,
+                    // bootstrap 用于真实 catalog 还未加载的兼容窗口；保持
+                    // `/grok` 既有 Responses Web Search 可用性。真实 catalog
+                    // 到位后会严格以 supportsBackendSearch 为准。
+                    supports_backend_search: true,
                     reasoning_effort: None,
                     // 缺少服务端菜单时 Grok Build 使用 legacy 的
                     // low/medium/high/xhigh fallback，而不是把 xhigh 压缩。
@@ -381,6 +390,13 @@ impl GrokModel {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             supports_reasoning_effort,
+            supports_backend_search: value_from(
+                object,
+                meta,
+                &["supportsBackendSearch", "supports_backend_search"],
+            )
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
             reasoning_effort,
             reasoning_efforts,
         })
@@ -397,6 +413,7 @@ pub struct GrokCredentialModelIndex {
 struct GrokModelCapability {
     backend: GrokApiBackend,
     supports_reasoning_effort: bool,
+    supports_backend_search: bool,
     efforts: HashSet<ReasoningEffort>,
     uses_legacy_effort_menu: bool,
 }
@@ -413,6 +430,7 @@ impl GrokCredentialModelIndex {
                     GrokModelCapability {
                         backend: model.api_backend,
                         supports_reasoning_effort: model.supports_reasoning_effort,
+                        supports_backend_search: model.supports_backend_search,
                         efforts: model
                             .reasoning_efforts
                             .iter()
@@ -431,11 +449,15 @@ impl GrokCredentialModelIndex {
         model_id: &str,
         effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
     ) -> bool {
         let Some(model) = self.models.get(&model_id.to_ascii_lowercase()) else {
             return false;
         };
         if backend.is_some_and(|backend| model.backend != backend) {
+            return false;
+        }
+        if requires_backend_search && !model.supports_backend_search {
             return false;
         }
         let Some(effort) = effort else {
@@ -486,6 +508,7 @@ pub fn merge_catalogs(catalogs: &[GrokModelCatalog]) -> GrokModelCatalog {
 fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
     existing.supported_in_api |= incoming.supported_in_api;
     existing.supports_reasoning_effort |= incoming.supports_reasoning_effort;
+    existing.supports_backend_search |= incoming.supports_backend_search;
     if existing.description.is_none() {
         existing.description = incoming.description.clone();
     }
@@ -651,6 +674,7 @@ mod tests {
                     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
                     "apiBackend": "responses",
                     "contextWindow": 256000,
+                    "supportsBackendSearch": true,
                     "supportsReasoningEffort": true,
                     "reasoningEfforts": ["low", {"id":"deep","value":"xhigh","label":"Deep"}]
                 }]
@@ -659,6 +683,7 @@ mod tests {
         );
         let model = catalog.model_by_id("grok-composer-2.5-fast").unwrap();
         assert_eq!(model.api_backend, GrokApiBackend::Responses);
+        assert!(model.supports_backend_search);
         assert!(model.supports_effort(ReasoningEffort::Xhigh));
         assert_eq!(model.resolve_effort("deep"), Some(ReasoningEffort::Xhigh));
         assert_eq!(
@@ -674,6 +699,7 @@ mod tests {
                 "data": [{
                     "model": "grok-4.5",
                     "apiBackend": "responses",
+                    "supportsBackendSearch": true,
                     "supportsReasoningEffort": true,
                     "reasoningEfforts": ["low", "medium", "high"]
                 }]
@@ -684,14 +710,21 @@ mod tests {
         assert!(index.supports(
             "grok-4.5",
             Some(ReasoningEffort::High),
-            Some(GrokApiBackend::Responses)
+            Some(GrokApiBackend::Responses),
+            true,
         ));
         assert!(!index.supports(
             "grok-4.5",
             Some(ReasoningEffort::Xhigh),
-            Some(GrokApiBackend::Responses)
+            Some(GrokApiBackend::Responses),
+            true,
         ));
-        assert!(!index.supports("grok-4.5", None, Some(GrokApiBackend::ChatCompletions)));
+        assert!(!index.supports(
+            "grok-4.5",
+            None,
+            Some(GrokApiBackend::ChatCompletions),
+            true,
+        ));
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod admin;
 pub mod converter;
 pub mod credentials;
 pub mod handlers;
+pub mod media;
 pub mod model_catalog;
 pub mod oauth;
 pub mod provider;

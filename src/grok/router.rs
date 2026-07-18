@@ -16,7 +16,10 @@ use crate::anthropic::types::ErrorResponse;
 use crate::common::auth;
 use crate::model::api_key_manager::ApiKeyManager;
 
-use super::handlers::{count_tokens, get_models, post_messages, post_messages_cc};
+use super::handlers::{
+    count_tokens, get_models, get_video_generation, post_image_edits, post_image_generations,
+    post_messages, post_messages_cc, post_video_generations,
+};
 use super::provider::SharedGrokProvider;
 
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
@@ -75,6 +78,13 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // Grok Build 的 Imagine 工具使用独立 xAI endpoint；这些路由保留
+        // Anthropic `/messages` 兼容性，同时给需要媒体生成的调用方一个
+        // 不伪造 content block 的 Build-style API。
+        .route("/images/generations", post(post_image_generations))
+        .route("/images/edits", post(post_image_edits))
+        .route("/videos/generations", post(post_video_generations))
+        .route("/videos/{request_id}", get(get_video_generation))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -65,6 +65,19 @@ struct ToolBlock {
     stopped: bool,
 }
 
+/// xAI Responses 的 hosted `web_search` 调用。它由服务端执行，不能转换成
+/// 需要客户端回填结果的 Anthropic `tool_use`；应使用 Anthropic 的
+/// `server_tool_use` + `web_search_tool_result` 成对内容块。
+#[derive(Debug)]
+struct WebSearchBlock {
+    index: i32,
+    id: String,
+    input: Value,
+    results: Vec<Value>,
+    stopped: bool,
+    result_emitted: bool,
+}
+
 /// 同时驱动流式事件和非流式聚合的状态机。
 pub struct GrokStreamContext {
     state: SseStateManager,
@@ -81,6 +94,8 @@ pub struct GrokStreamContext {
     tool_blocks: HashMap<String, ToolBlock>,
     tool_aliases: HashMap<String, String>,
     tool_order: Vec<String>,
+    web_search_blocks: HashMap<String, WebSearchBlock>,
+    web_search_order: Vec<String>,
     stop_reason: Option<String>,
     completed: bool,
 }
@@ -102,6 +117,8 @@ impl GrokStreamContext {
             tool_blocks: HashMap::new(),
             tool_aliases: HashMap::new(),
             tool_order: Vec::new(),
+            web_search_blocks: HashMap::new(),
+            web_search_order: Vec::new(),
             stop_reason: None,
             completed: false,
         }
@@ -346,11 +363,25 @@ impl GrokStreamContext {
 
     fn process_output_item_added(&mut self, event: &Value) -> Vec<SseEvent> {
         let item = event.get("item").unwrap_or(&Value::Null);
-        if item.get("type").and_then(Value::as_str) == Some("function_call") {
-            let (key, id, name) = function_call_identity(item, event);
-            return self.ensure_tool_block(&key, &id, &name);
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let (key, id, name) = function_call_identity(item, event);
+                self.ensure_tool_block(&key, &id, &name)
+            }
+            Some("web_search_call") => {
+                let (key, id, input) = web_search_identity(item, event);
+                // `response.output_item.added` 通常只携带 in_progress 状态；
+                // 此时等 done 事件拿到完整 query/来源后再发 block，避免向
+                // Anthropic 客户端暴露空输入。少数网关会在 added 中给出 action，
+                // 则可立即展示 server tool 开始事件。
+                if input.as_object().is_some_and(|input| !input.is_empty()) {
+                    self.ensure_web_search_block(&key, &id, input)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
         }
-        Vec::new()
     }
 
     fn process_output_item_done(&mut self, event: &Value) -> Vec<SseEvent> {
@@ -383,6 +414,7 @@ impl GrokStreamContext {
                 }
                 events
             }
+            Some("web_search_call") => self.finish_web_search(item, event),
             _ => Vec::new(),
         }
     }
@@ -516,6 +548,116 @@ impl GrokStreamContext {
         events
     }
 
+    fn ensure_web_search_block(&mut self, key: &str, id: &str, input: Value) -> Vec<SseEvent> {
+        if self.web_search_blocks.contains_key(key) {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        // `server_tool_use` 不是 client tool_use，SseStateManager 不会替它
+        // 自动关闭 text；显式收束前序文本/思考以满足 Anthropic 的块顺序。
+        if let Some(index) = self.thinking_block_index.take() {
+            events.extend(self.state.handle_content_block_stop(index));
+        }
+        if let Some(index) = self.text_block_index.take() {
+            events.extend(self.state.handle_content_block_stop(index));
+        }
+        let index = self.state.next_block_index();
+        let id = if id.trim().is_empty() {
+            key.to_string()
+        } else {
+            id.to_string()
+        };
+        self.web_search_blocks.insert(
+            key.to_string(),
+            WebSearchBlock {
+                index,
+                id: id.clone(),
+                input: input.clone(),
+                results: Vec::new(),
+                stopped: false,
+                result_emitted: false,
+            },
+        );
+        self.web_search_order.push(key.to_string());
+        events.extend(self.state.handle_content_block_start(
+            index,
+            "server_tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": input,
+                }
+            }),
+        ));
+        events
+    }
+
+    fn finish_web_search(&mut self, item: &Value, event: &Value) -> Vec<SseEvent> {
+        let (key, id, input) = web_search_identity(item, event);
+        let results = web_search_results(item);
+        let mut events = self.ensure_web_search_block(&key, &id, input);
+        events.extend(self.finish_web_search_block(&key, results));
+        events
+    }
+
+    fn finish_web_search_block(&mut self, key: &str, results: Vec<Value>) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let stop_index = {
+            let Some(block) = self.web_search_blocks.get_mut(key) else {
+                return events;
+            };
+            if block.stopped {
+                None
+            } else {
+                block.stopped = true;
+                Some(block.index)
+            }
+        };
+        if let Some(index) = stop_index {
+            events.extend(self.state.handle_content_block_stop(index));
+        }
+
+        let emit_result = {
+            let Some(block) = self.web_search_blocks.get_mut(key) else {
+                return events;
+            };
+            if block.result_emitted {
+                false
+            } else {
+                block.results = results;
+                block.result_emitted = true;
+                true
+            }
+        };
+        if !emit_result {
+            return events;
+        }
+        let content = self
+            .web_search_blocks
+            .get(key)
+            .map(|block| block.results.clone())
+            .unwrap_or_default();
+        let index = self.state.next_block_index();
+        events.extend(self.state.handle_content_block_start(
+            index,
+            "web_search_tool_result",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "content": content,
+                }
+            }),
+        ));
+        events.extend(self.state.handle_content_block_stop(index));
+        events
+    }
+
     fn append_tool_arguments(&mut self, raw_key: &str, arguments: &str) -> Vec<SseEvent> {
         if arguments.is_empty() {
             return Vec::new();
@@ -591,11 +733,31 @@ impl GrokStreamContext {
     }
 
     pub fn finish_events(&mut self) -> Vec<SseEvent> {
+        // 某些兼容网关只发送 added 而没有 done。仍然给 Anthropic 客户端一个
+        // 完整的 server-tool 生命周期（空来源结果），而不是留下半开的块。
+        let pending_web_searches = self
+            .web_search_order
+            .iter()
+            .filter(|key| {
+                self.web_search_blocks
+                    .get(*key)
+                    .is_some_and(|block| !block.result_emitted)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for key in pending_web_searches {
+            events.extend(self.finish_web_search_block(&key, Vec::new()));
+        }
         if let Some(reason) = self.stop_reason.clone() {
             self.state.set_stop_reason(reason);
         }
-        self.state
-            .generate_final_events(self.input_tokens(), self.output_tokens())
+        let mut final_events = self
+            .state
+            .generate_final_events(self.input_tokens(), self.output_tokens());
+        self.add_web_search_usage(&mut final_events);
+        events.extend(final_events);
+        events
     }
 
     pub fn completed(&self) -> bool {
@@ -649,6 +811,20 @@ impl GrokStreamContext {
         if self.thinking_enabled && !self.thinking.is_empty() {
             content.push(json!({ "type": "thinking", "thinking": self.thinking }));
         }
+        for key in &self.web_search_order {
+            if let Some(web_search) = self.web_search_blocks.get(key) {
+                content.push(json!({
+                    "type": "server_tool_use",
+                    "id": web_search.id,
+                    "name": "web_search",
+                    "input": web_search.input,
+                }));
+                content.push(json!({
+                    "type": "web_search_tool_result",
+                    "content": web_search.results,
+                }));
+            }
+        }
         if !self.text.is_empty() {
             content.push(json!({ "type": "text", "text": self.text }));
         }
@@ -671,6 +847,15 @@ impl GrokStreamContext {
                 "tool_use".to_string()
             }
         });
+        let mut usage = json!({
+            "input_tokens": self.input_tokens(),
+            "output_tokens": self.output_tokens(),
+        });
+        if !self.web_search_order.is_empty() {
+            usage["server_tool_use"] = json!({
+                "web_search_requests": self.web_search_order.len(),
+            });
+        }
         json!({
             "id": self.message_id,
             "type": "message",
@@ -679,8 +864,29 @@ impl GrokStreamContext {
             "model": self.model,
             "stop_reason": stop_reason,
             "stop_sequence": null,
-            "usage": { "input_tokens": self.input_tokens(), "output_tokens": self.output_tokens() }
+            "usage": usage,
         })
+    }
+
+    /// Anthropic 将服务端 Web Search 的消耗单列在 `usage.server_tool_use`。
+    /// 保留这个字段可让标准 Anthropic 客户端正确归因，而不把它误判为普通
+    /// client tool_use。
+    fn add_web_search_usage(&self, events: &mut [SseEvent]) {
+        if self.web_search_order.is_empty() {
+            return;
+        }
+        let count = self.web_search_order.len();
+        for event in events {
+            if event.event != "message_delta" {
+                continue;
+            }
+            if let Some(usage) = event.data.get_mut("usage").and_then(Value::as_object_mut) {
+                usage.insert(
+                    "server_tool_use".to_string(),
+                    json!({ "web_search_requests": count }),
+                );
+            }
+        }
     }
 }
 
@@ -697,6 +903,74 @@ fn function_call_identity(item: &Value, event: &Value) -> (String, String, Strin
         .unwrap_or(item_id);
     let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
     (item_id.to_string(), call_id.to_string(), name.to_string())
+}
+
+fn web_search_identity(item: &Value, event: &Value) -> (String, String, Value) {
+    let id = item
+        .get("id")
+        .or_else(|| event.get("item_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("web_search");
+    (id.to_string(), id.to_string(), web_search_input(item))
+}
+
+/// xAI 的 action 在 search/open_page/find 等动作间变化。Anthropic web
+/// search 的标准 input 是 query；对非 search 动作保留完整 action，避免将
+/// xAI 的信息静默丢弃。
+fn web_search_input(item: &Value) -> Value {
+    let Some(action) = item.get("action").and_then(Value::as_object) else {
+        return json!({});
+    };
+    if action.get("type").and_then(Value::as_str) == Some("search") {
+        if let Some(query) = action.get("query").and_then(Value::as_str) {
+            return json!({ "query": query });
+        }
+    }
+    Value::Object(action.clone())
+}
+
+/// Build 将 web-search 结果保存在 `web_search_call.action.sources`。转换成
+/// Anthropic `web_search_result` 时优先保留 URL、标题和可展示的摘要文本；
+/// 服务端未提供来源时则发送空列表，和 Anthropic 的 server-tool 语义一致。
+fn web_search_results(item: &Value) -> Vec<Value> {
+    item.pointer("/action/sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|source| {
+            let url = source.get("url").and_then(Value::as_str)?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            let title = source
+                .get("title")
+                .or_else(|| source.get("name"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(url);
+            let content = source
+                .get("encrypted_content")
+                .or_else(|| source.get("snippet"))
+                .or_else(|| source.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut result = json!({
+                "type": "web_search_result",
+                "title": title,
+                "url": url,
+                "encrypted_content": content,
+            });
+            if let Some(page_age) = source
+                .get("page_age")
+                .or_else(|| source.get("published_date"))
+                .cloned()
+            {
+                result["page_age"] = page_age;
+            }
+            Some(result)
+        })
+        .collect()
 }
 
 fn chat_text_values(delta: &Value, keys: &[&str]) -> Vec<String> {
@@ -882,5 +1156,58 @@ mod tests {
         assert_eq!(response["content"][1]["type"], "tool_use");
         assert_eq!(response["content"][1]["name"], "read");
         assert_eq!(response["content"][1]["input"]["path"], "a");
+    }
+
+    #[test]
+    fn converts_xai_web_search_call_to_anthropic_server_tool_result() {
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        let events = context.process_event(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "latest Rust release",
+                    "sources": [{
+                        "title": "Rust Blog",
+                        "url": "https://blog.rust-lang.org/",
+                        "snippet": "Release notes"
+                    }]
+                }
+            }
+        }));
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "server_tool_use"
+                && event.data["content_block"]["input"]["query"] == "latest Rust release"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "web_search_tool_result"
+                && event.data["content_block"]["content"][0]["url"] == "https://blog.rust-lang.org/"
+        }));
+
+        let response = context.to_anthropic_response();
+        assert_eq!(response["stop_reason"], "end_turn");
+        assert_eq!(response["content"][0]["type"], "server_tool_use");
+        assert_eq!(response["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(
+            response["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+
+        let final_events = context.finish_events();
+        let delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("final message delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            delta.data["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
     }
 }
