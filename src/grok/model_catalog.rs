@@ -478,6 +478,15 @@ impl GrokCredentialModelIndex {
             model.efforts.contains(&effort)
         }
     }
+
+    /// 判断目录中是否至少有一个可通过指定 backend 调用的 API 模型。
+    ///
+    /// Files 上传发生在具体模型选择之前，但上传得到的 file id 只能被
+    /// Responses `input_file` 消费。因此无模型路由不能把 backend 条件当作
+    /// 无条件放行；已加载目录时应至少证明该凭据拥有一个对应 backend 模型。
+    pub fn supports_backend(&self, backend: GrokApiBackend) -> bool {
+        self.models.values().any(|model| model.backend == backend)
+    }
 }
 
 /// 将各凭据目录合成 handler 侧的只读“并集”视图。真正发送时仍会根据单凭据

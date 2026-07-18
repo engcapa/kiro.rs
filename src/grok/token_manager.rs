@@ -1088,12 +1088,15 @@ fn credential_supports(
     backend: Option<GrokApiBackend>,
     requires_backend_search: bool,
 ) -> bool {
-    let Some(model_id) = model_id else {
-        return true;
-    };
-    entry.model_index.as_ref().is_none_or(|index| {
-        index.supports(model_id, reasoning_effort, backend, requires_backend_search)
-    })
+    entry
+        .model_index
+        .as_ref()
+        .is_none_or(|index| match model_id {
+            Some(model_id) => {
+                index.supports(model_id, reasoning_effort, backend, requires_backend_search)
+            }
+            None => backend.is_none_or(|backend| index.supports_backend(backend)),
+        })
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -1370,6 +1373,52 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("grok-4.5"));
+    }
+
+    #[tokio::test]
+    async fn backend_only_routing_rejects_chat_only_catalog_for_file_uploads() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("chat-token".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("responses-token".to_string()),
+                ..Default::default()
+            },
+        ]);
+        manager
+            .set_model_catalog(
+                1,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-chat-only",
+                        "apiBackend":"chat_completions"
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+        manager
+            .set_model_catalog(
+                2,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-responses",
+                        "apiBackend":"responses"
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+
+        let context = manager
+            .acquire_context(None, None, Some(GrokApiBackend::Responses), false, None)
+            .await
+            .unwrap();
+        assert_eq!(context.id, 2);
     }
 
     #[tokio::test]
