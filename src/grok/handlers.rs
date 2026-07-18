@@ -20,7 +20,7 @@ use crate::anthropic::types::{
 };
 use crate::token;
 
-use super::converter::convert_request;
+use super::converter::{convert_request, plan_request};
 use super::files::{FileListQuery, FileMetadata, FileStoreError, MAX_UPLOAD_BYTES};
 use super::media::{
     build_image_edit_body, build_image_generation_body, build_video_generation_body,
@@ -437,7 +437,7 @@ pub async fn post_messages(
     State(state): State<GrokAppState>,
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     axum::extract::Extension(api_key_info): axum::extract::Extension<ApiKeyInfo>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     let file_credential_id = match state
         .file_store
@@ -452,23 +452,50 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let next_credential = state
-        .provider
-        .token_manager()
-        .peek_next_credential_name(Some(&allowed_pools.0))
-        .unwrap_or_else(|| "None".to_string());
-    tracing::info!(
-        model = %payload.model,
-        stream = payload.stream,
-        message_count = payload.messages.len(),
-        api_key_name = %api_key_info.name,
-        credential_name = %next_credential,
-        pools = ?allowed_pools.0,
-        "Received POST /grok/v1/messages request"
-    );
 
-    let catalog = state.provider.model_catalog();
-    let converted = match convert_request(&payload, &state.default_model, catalog.as_deref()) {
+    // 1) 用并集/bootstrap catalog 做模型别名与能力规划（不构建上游 body）。
+    let merged_catalog = state.provider.model_catalog();
+    let plan = match plan_request(&payload, &state.default_model, merged_catalog.as_deref()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    error.to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // 2) 选定路由凭据，并用**该凭据**的 catalog 做 wire 转换，保证
+    //    backend/body 与真正发送账号一致（修复合并目录 apiBackend 误导）。
+    let routing_credential_id = match file_credential_id {
+        Some(id) => Some(id),
+        None => state
+            .provider
+            .token_manager()
+            .find_routing_credential_id(
+                Some(&plan.model),
+                plan.reasoning_effort,
+                plan.backend_constraint(),
+                plan.needs_web_search,
+                Some(&allowed_pools.0),
+            )
+            .ok(),
+    };
+    let routing_catalog = routing_credential_id
+        .and_then(|id| state.provider.token_manager().catalog_for(id))
+        .or_else(|| merged_catalog.clone());
+    // 规范化为 wire model id，避免目标凭据 catalog 只有正式 id、没有别名。
+    payload.model = plan.model.clone();
+
+    let converted = match convert_request(
+        &payload,
+        &state.default_model,
+        routing_catalog.as_deref(),
+    ) {
         Ok(converted) => converted,
         Err(error) => {
             return (
@@ -481,6 +508,36 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    let credential_name = routing_credential_id
+        .and_then(|id| {
+            state
+                .provider
+                .token_manager()
+                .credential_display_name(id)
+        })
+        .or_else(|| {
+            state.provider.token_manager().peek_next_credential_name(
+                Some(&converted.model),
+                converted.reasoning_effort,
+                Some(converted.backend),
+                converted.uses_hosted_web_search,
+                Some(&allowed_pools.0),
+            )
+        })
+        .unwrap_or_else(|| "None".to_string());
+    tracing::info!(
+        model = %payload.model,
+        resolved_model = %converted.model,
+        backend = %converted.backend.as_str(),
+        stream = payload.stream,
+        message_count = payload.messages.len(),
+        api_key_name = %api_key_info.name,
+        credential_name = %credential_name,
+        routing_credential_id = ?routing_credential_id,
+        pools = ?allowed_pools.0,
+        "Received POST /grok/v1/messages request"
+    );
 
     let mut body = converted.body;
     if converted.backend == GrokApiBackend::Messages {
@@ -623,7 +680,12 @@ fn create_sse_stream(
                 result = &mut connect => match result {
                     Ok(response) => break Some(response.response),
                     Err(error) => {
+                        // 已发 message_start：先 error，再收尾未关闭块 / message_stop，
+                        // 避免部分客户端挂在半开 message 上。
                         yield Ok(provider_error_sse(&error));
+                        for event in context.finish_events() {
+                            yield Ok(Bytes::from(event.to_sse_string()));
+                        }
                         break None;
                     }
                 },
@@ -642,6 +704,9 @@ fn create_sse_stream(
                         for upstream_event in decoder.feed(&chunk) {
                             if let Some(message) = upstream_error_message(&upstream_event) {
                                 yield Ok(upstream_error_sse(&message));
+                                for event in context.finish_events() {
+                                    yield Ok(Bytes::from(event.to_sse_string()));
+                                }
                                 return;
                             }
                             for event in context.process_event(&upstream_event) {
@@ -651,7 +716,13 @@ fn create_sse_stream(
                     }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "读取 xAI SSE 响应失败");
-                        break;
+                        yield Ok(upstream_error_sse(&format!(
+                            "读取 xAI SSE 响应失败: {error}"
+                        )));
+                        for event in context.finish_events() {
+                            yield Ok(Bytes::from(event.to_sse_string()));
+                        }
+                        return;
                     }
                     None => break,
                 },
@@ -659,6 +730,13 @@ fn create_sse_stream(
             }
         }
         for upstream_event in decoder.finish() {
+            if let Some(message) = upstream_error_message(&upstream_event) {
+                yield Ok(upstream_error_sse(&message));
+                for event in context.finish_events() {
+                    yield Ok(Bytes::from(event.to_sse_string()));
+                }
+                return;
+            }
             for event in context.process_event(&upstream_event) {
                 yield Ok(Bytes::from(event.to_sse_string()));
             }

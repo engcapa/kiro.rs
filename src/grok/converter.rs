@@ -20,6 +20,29 @@ pub struct ConvertedGrokRequest {
     pub uses_hosted_web_search: bool,
 }
 
+/// 选凭据前的轻量规划：解析模型、effort 与能力需求，但不构建上游 body。
+///
+/// 真正的 wire 转换必须使用**即将发送的那张凭据**的 catalog，避免合并目录的
+/// `apiBackend` 与单凭据 backend 不一致时把 Chat/Responses 请求体投错。
+#[derive(Debug, Clone)]
+pub struct ConversionPlan {
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub needs_web_search: bool,
+    pub needs_files: bool,
+}
+
+impl ConversionPlan {
+    /// 选凭据时的 backend 约束：Files / hosted Web Search 只能走 Responses。
+    pub fn backend_constraint(&self) -> Option<GrokApiBackend> {
+        if self.needs_files || self.needs_web_search {
+            Some(GrokApiBackend::Responses)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ConversionError {
     EmptyMessages,
@@ -64,6 +87,36 @@ impl std::fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+/// 用并集/bootstrap catalog 做模型别名规范化与能力探测，供选凭据使用。
+///
+/// 注意：此处的 effort 校验基于传入 catalog；最终 wire 转换仍须用目标凭据
+/// catalog 再走一遍 [`convert_request`]。
+pub fn plan_request(
+    request: &MessagesRequest,
+    default_model: &str,
+    catalog: Option<&GrokModelCatalog>,
+) -> Result<ConversionPlan, ConversionError> {
+    if request.messages.is_empty() {
+        return Err(ConversionError::EmptyMessages);
+    }
+    let model = resolve_model(&request.model, default_model, catalog)?;
+    let model_entry = catalog.and_then(|catalog| catalog.model_by_id(&model));
+    let needs_web_search = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(is_web_search_tool));
+    let needs_files = request_has_file_inputs(request);
+    // 规划阶段对 effort 做宽松解析：有 model entry 时校验菜单；无 entry 时仍
+    // 解析 wire 值，留给目标凭据 catalog 做最终裁决。
+    let reasoning_effort = resolve_reasoning_effort(request, model_entry, &model)?;
+    Ok(ConversionPlan {
+        model,
+        reasoning_effort,
+        needs_web_search,
+        needs_files,
+    })
+}
 
 pub fn convert_request(
     request: &MessagesRequest,
@@ -905,6 +958,54 @@ mod tests {
             tools[0]["filters"]["allowed_domains"],
             json!(["docs.rs", "example.com"])
         );
+    }
+
+    #[test]
+    fn plan_request_detects_web_search_and_files_without_building_body() {
+        let mut request = web_search_request();
+        request.messages[0].content = json!([
+            {"type":"document","source":{"type":"file","file_id":"file_1"}},
+            {"type":"text","text":"summarize"}
+        ]);
+        let plan = plan_request(&request, "grok-4.5", None).unwrap();
+        assert_eq!(plan.model, "grok-4.5");
+        assert!(plan.needs_web_search);
+        assert!(plan.needs_files);
+        assert_eq!(plan.backend_constraint(), Some(GrokApiBackend::Responses));
+    }
+
+    #[test]
+    fn convert_uses_credential_catalog_backend_not_bootstrap_default() {
+        // 公共 api.x.ai 目录常缺 apiBackend → Chat Completions；若误用
+        // bootstrap/并集的 Responses 默认会把 body 建错。
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"chat_completions",
+                "supportsReasoningEffort":true,
+                "reasoningEfforts":["low","medium","high"]
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 128,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hi"),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let converted = convert_request(&request, "grok-4.5", Some(&catalog)).unwrap();
+        assert_eq!(converted.backend, GrokApiBackend::ChatCompletions);
+        assert!(converted.body.get("messages").is_some());
+        assert!(converted.body.get("input").is_none());
     }
 
     #[test]

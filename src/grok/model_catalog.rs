@@ -509,6 +509,11 @@ fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
     existing.supported_in_api |= incoming.supported_in_api;
     existing.supports_reasoning_effort |= incoming.supports_reasoning_effort;
     existing.supports_backend_search |= incoming.supports_backend_search;
+    // 并集目录仅用于 /models 展示与别名解析。异构凭据的 apiBackend 可能不同：
+    // 优先保留 Responses（Files / hosted Web Search 所需），其次 Messages，
+    // 最后 Chat Completions。真正发送时 handlers 会按**单凭据 catalog** 再
+    // convert，不依赖这里的 backend 做最终 wire 分派。
+    existing.api_backend = preferred_union_backend(existing.api_backend, incoming.api_backend);
     if existing.description.is_none() {
         existing.description = incoming.description.clone();
     }
@@ -531,6 +536,15 @@ fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
         {
             existing.reasoning_efforts.push(option.clone());
         }
+    }
+}
+
+fn preferred_union_backend(left: GrokApiBackend, right: GrokApiBackend) -> GrokApiBackend {
+    use GrokApiBackend::*;
+    match (left, right) {
+        (Responses, _) | (_, Responses) => Responses,
+        (Messages, _) | (_, Messages) => Messages,
+        (ChatCompletions, ChatCompletions) => ChatCompletions,
     }
 }
 
@@ -736,6 +750,37 @@ mod tests {
         assert_eq!(
             catalog.models[0].api_backend,
             GrokApiBackend::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn merge_catalogs_prefers_responses_backend_when_heterogeneous() {
+        let chat = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"chat_completions",
+                "supportsBackendSearch":false
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let responses = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportsBackendSearch":true
+            }]}),
+            "https://cli-chat-proxy.grok.com/v1",
+        );
+        // 先 Chat 后 Responses：并集应提升为 Responses，并 OR 能力位。
+        let merged = merge_catalogs(&[chat.clone(), responses.clone()]);
+        let model = merged.model_by_id("grok-4.5").unwrap();
+        assert_eq!(model.api_backend, GrokApiBackend::Responses);
+        assert!(model.supports_backend_search);
+        // 反序合并也应稳定为 Responses。
+        let merged_rev = merge_catalogs(&[responses, chat]);
+        assert_eq!(
+            merged_rev.model_by_id("grok-4.5").unwrap().api_backend,
+            GrokApiBackend::Responses
         );
     }
 }

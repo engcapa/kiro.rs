@@ -484,6 +484,45 @@ RUST_LOG=debug ./target/release/kiro-rs
 不会把并集里存在的模型发给没有授权的账号。`/grok` 与根路径共用客户端 API Key 和 API
 Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
 
+#### 模型目录生命周期与路由
+
+| 阶段 | `/grok/v1/models` 展示 | Messages 转换用的 catalog | 说明 |
+|------|------------------------|---------------------------|------|
+| 启动且尚无成功拉取 | bootstrap 清单（默认 `apiBackend=responses`） | bootstrap / 无目录时按 Responses 兼容路径 | 仅过渡窗口，**不代表**账号一定有权 |
+| 已拉取 ≥1 张凭据目录 | 各启用凭据目录的**并集** | **先选凭据，再按该凭据自己的目录 convert** | 并集只用于别名解析与列表；wire `apiBackend` 以单凭据为准 |
+| 某凭据 `/models` 失败 | 保留该凭据旧目录（若有） | 同上；无目录的凭据在选号时“未知放行” | 控制平面故障不禁用推理凭据 |
+| 定时刷新（约 10 分钟） | 更新并集 | 下次请求起生效 | 刷新失败沿用旧目录 |
+
+上游 `/v1/models` 未声明 `apiBackend` 时，与 Grok Build 一致默认 **`chat_completions`**。
+因此 catalog 就绪后，原先 bootstrap 下可用的 hosted Web Search / Files 路径，可能变为
+需要显式选择 `apiBackend=responses` 的模型——这是预期行为，不是回归。
+
+多账号异构时（例如 OAuth CLI 为 `responses`、API token 为 `chat_completions`）：
+
+1. 用并集 catalog 解析模型别名与 effort；
+2. 按模型 / effort / pool /（WebSearch→Responses）选出一张路由凭据；
+3. **仅用该凭据 catalog** 构建 Responses / Chat Completions / Messages 请求体；
+4. `call_api` 再按同样过滤条件选发送凭据（可 failover 到同 backend 的其它账号）。
+
+并集目录在合并异构 `apiBackend` 时优先展示 `responses`（便于发现 Web Search / Files 能力），
+但**不会**把 Chat-only 账号误建成 Responses body——最终 body 始终跟单凭据 catalog 走。
+
+#### Messages 字段支持矩阵
+
+| Anthropic / 客户端字段 | `/grok` 处理 |
+|------------------------|--------------|
+| `model`（含 `claude-*` / `grok-build` 别名） | 规范化后按 catalog 路由 |
+| `messages` / `system` | 转为目标 backend 的 input / messages / 透传 |
+| `max_tokens` | → `max_output_tokens` / `max_completion_tokens` / `max_tokens` |
+| `stream` | 支持；Responses/Chat 上游统一拉 SSE 再聚合成 Anthropic 流或 JSON |
+| `tools` / `tool_choice` | function 与 hosted `web_search`（见下） |
+| `thinking` / `output_config.effort` | → Responses `reasoning` / Chat `reasoning_effort` / Messages adaptive |
+| `metadata.user_id` | → Responses `prompt_cache_key`（会话/缓存键） |
+| `temperature` / `top_p` / `top_k` | **当前未透传** |
+| `stop_sequences` | **当前未透传** |
+| `source.type=file`（image/document） | 仅 `responses` backend；须先 `/grok/v1/files` 上传 |
+| 多轮 `thinking` + Anthropic `signature` | 历史 thinking 折成可见文本；**不**回放 xAI `encrypted_content`（协议限制，后续另议） |
+
 对于 catalog 为 `responses` 的模型，代理遵循 Grok Build 的请求语义：始终发送
 `reasoning.summary: "concise"`，并把 Anthropic `thinking` 或 `output_config.effort` 映射为
 `reasoning.effort`。因此无需也不会再依赖模型名的 `-thinking` 后缀。收到的 xAI reasoning

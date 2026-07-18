@@ -494,12 +494,56 @@ impl GrokTokenManager {
         Ok(())
     }
 
-    pub fn peek_next_credential_name(&self, allowed_pools: Option<&[String]>) -> Option<String> {
+    /// 预览下一张可用凭据的显示名，**不推进** round-robin 游标。
+    ///
+    /// 过滤参数应与真正的 `acquire_context` / `call_api` 一致，否则日志会
+    /// 把“并集里随便一张”误报成即将使用的账号。
+    pub fn peek_next_credential_name(
+        &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> Option<String> {
         let id = self
-            .choose_credential_id(None, None, None, false, allowed_pools)
+            .find_credential_id(
+                model_id,
+                reasoning_effort,
+                backend,
+                requires_backend_search,
+                allowed_pools,
+            )
             .ok()?;
+        self.credential_display_name(id)
+    }
+
+    /// 返回凭据显示名（若存在）。
+    pub fn credential_display_name(&self, id: u64) -> Option<String> {
         self.credential(id)
             .map(|credential| credential.display_name(id))
+    }
+
+    /// 为路由/转换选择一张凭据，**不推进** round-robin 游标。
+    ///
+    /// 用于在 `convert_request` 前锁定“将使用哪张凭据的 catalog/backend”，
+    /// 避免合并目录的 `apiBackend` 与真正发送账号不一致。真正发送时仍由
+    /// `acquire_context` 按同样过滤条件选凭据（并推进游标）。
+    pub fn find_routing_credential_id(
+        &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<u64> {
+        self.find_credential_id(
+            model_id,
+            reasoning_effort,
+            backend,
+            requires_backend_search,
+            allowed_pools,
+        )
     }
 
     /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
@@ -765,7 +809,28 @@ impl GrokTokenManager {
         }
     }
 
+    /// 按负载均衡策略选出一张可用凭据，并推进 round-robin 游标。
     fn choose_credential_id(
+        &self,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<u64> {
+        let id = self.find_credential_id(
+            model_id,
+            reasoning_effort,
+            backend,
+            requires_backend_search,
+            allowed_pools,
+        )?;
+        *self.current_id.lock() = id;
+        Ok(id)
+    }
+
+    /// 按负载均衡策略选出一张可用凭据，**不**修改 `current_id`。
+    fn find_credential_id(
         &self,
         model_id: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
@@ -848,8 +913,6 @@ impl GrokTokenManager {
             }
         }
         .ok_or_else(|| anyhow::anyhow!("没有可用的 Grok 凭据"))?;
-        drop(entries);
-        *self.current_id.lock() = id;
         Ok(id)
     }
 
@@ -1024,6 +1087,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(context.id, 2);
+    }
+
+    #[test]
+    fn peek_and_find_do_not_advance_round_robin_cursor() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let before = manager.snapshot().current_id;
+        let first = manager
+            .peek_next_credential_name(None, None, None, false, None)
+            .unwrap();
+        let second = manager
+            .peek_next_credential_name(None, None, None, false, None)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(manager.snapshot().current_id, before);
+        let routing = manager
+            .find_routing_credential_id(None, None, None, false, None)
+            .unwrap();
+        assert_eq!(manager.snapshot().current_id, before);
+        // choose/acquire 才会推进游标
+        let _ = manager.choose_credential_id(None, None, None, false, None);
+        assert_ne!(manager.snapshot().current_id, before);
+        assert_eq!(
+            manager.credential_display_name(routing).as_deref(),
+            Some(first.as_str())
+        );
     }
 
     #[test]
