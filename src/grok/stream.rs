@@ -9,94 +9,162 @@ use crate::anthropic::{SseEvent, SseStateManager};
 
 use super::reasoning_sig::{ReasoningSignatureCodec, extract_reasoning_item};
 
-/// 按字节缓冲的 SSE 解码器：跨 chunk 保留不完整 UTF-8，并同时识别
-/// `\n\n` 与 `\r\n\r\n` 事件分隔符。
+const MAX_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_SEPARATOR_BYTES: usize = 4;
+
+/// 按字节缓冲的严格 SSE 解码器：跨 chunk 保留不完整 UTF-8，兼容 LF、
+/// CRLF、CR 及其混合空行，并对单个未终止 frame 设置硬上限。
 #[derive(Default)]
 pub struct XaiSseDecoder {
     buffer: Vec<u8>,
 }
 
-impl XaiSseDecoder {
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Value> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
-            let block_bytes = self.buffer[..sep_at].to_vec();
-            self.buffer.drain(..sep_at + sep_len);
-            let block = match String::from_utf8(block_bytes) {
-                Ok(block) => block,
-                Err(error) => {
-                    tracing::debug!("xAI SSE 事件块含非法 UTF-8，按 lossy 解码: {}", error);
-                    String::from_utf8_lossy(error.as_bytes()).into_owned()
-                }
-            };
-            let block = block.replace('\r', "");
-            if let Some(event) = parse_sse_block(&block) {
-                events.push(event);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XaiSseDecodeError {
+    FrameTooLarge { limit: usize },
+    InvalidUtf8(String),
+    InvalidJson { error: String, data: String },
+}
+
+impl std::fmt::Display for XaiSseDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameTooLarge { limit } => {
+                write!(formatter, "xAI SSE 单个事件超过 {limit} 字节上限")
+            }
+            Self::InvalidUtf8(error) => write!(formatter, "xAI SSE 包含非法 UTF-8: {error}"),
+            Self::InvalidJson { error, data } => {
+                write!(formatter, "xAI SSE 事件 JSON 无效: {error}; data={data}")
             }
         }
-        events
-    }
-
-    pub fn finish(&mut self) -> Vec<Value> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-        let block_bytes = std::mem::take(&mut self.buffer);
-        let block = match String::from_utf8(block_bytes) {
-            Ok(block) => block,
-            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-        };
-        let block = block.replace('\r', "");
-        parse_sse_block(&block).into_iter().collect()
     }
 }
 
-/// 返回事件分隔符在 buffer 中的起始下标与长度（2=`\n\n`，4=`\r\n\r\n`）。
+impl std::error::Error for XaiSseDecodeError {}
+
+impl XaiSseDecoder {
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Value>, XaiSseDecodeError> {
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let max_buffer = MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES;
+            let room = max_buffer.saturating_sub(self.buffer.len());
+            if room == 0 {
+                self.buffer.clear();
+                return Err(XaiSseDecodeError::FrameTooLarge {
+                    limit: MAX_SSE_FRAME_BYTES,
+                });
+            }
+            let take = room.min(chunk.len() - offset);
+            self.buffer.extend_from_slice(&chunk[offset..offset + take]);
+            offset += take;
+            self.drain_complete_events(&mut events)?;
+            if self.buffer.len() == max_buffer {
+                self.buffer.clear();
+                return Err(XaiSseDecodeError::FrameTooLarge {
+                    limit: MAX_SSE_FRAME_BYTES,
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<Value>, XaiSseDecodeError> {
+        if self.buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.buffer.len() > MAX_SSE_FRAME_BYTES {
+            self.buffer.clear();
+            return Err(XaiSseDecodeError::FrameTooLarge {
+                limit: MAX_SSE_FRAME_BYTES,
+            });
+        }
+        let block_bytes = std::mem::take(&mut self.buffer);
+        Ok(parse_sse_block(&block_bytes)?.into_iter().collect())
+    }
+
+    fn drain_complete_events(&mut self, events: &mut Vec<Value>) -> Result<(), XaiSseDecodeError> {
+        while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
+            if sep_at > MAX_SSE_FRAME_BYTES {
+                self.buffer.clear();
+                return Err(XaiSseDecodeError::FrameTooLarge {
+                    limit: MAX_SSE_FRAME_BYTES,
+                });
+            }
+            let block_bytes = self.buffer[..sep_at].to_vec();
+            self.buffer.drain(..sep_at + sep_len);
+            match parse_sse_block(&block_bytes) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 返回 SSE 空行分隔符的起始下标与长度。两次 line ending 可以分别是
+/// LF、CRLF 或 CR，因此也接受 `\r\n\n`、`\n\r\n` 等混合形式。
 fn find_sse_event_separator(buffer: &[u8]) -> Option<(usize, usize)> {
-    let mut index = 0;
-    while index + 1 < buffer.len() {
-        if index + 3 < buffer.len()
-            && buffer[index] == b'\r'
-            && buffer[index + 1] == b'\n'
-            && buffer[index + 2] == b'\r'
-            && buffer[index + 3] == b'\n'
-        {
-            return Some((index, 4));
+    for index in 0..buffer.len() {
+        let Some(first_len) = sse_line_ending_len(buffer, index) else {
+            continue;
+        };
+        let second_at = index + first_len;
+        if let Some(second_len) = sse_line_ending_len(buffer, second_at) {
+            return Some((index, first_len + second_len));
         }
-        if buffer[index] == b'\n' && buffer[index + 1] == b'\n' {
-            return Some((index, 2));
-        }
-        index += 1;
     }
     None
 }
 
-fn parse_sse_block(block: &str) -> Option<Value> {
-    let data = block
+fn sse_line_ending_len(buffer: &[u8], index: usize) -> Option<usize> {
+    match buffer.get(index).copied()? {
+        b'\n' => Some(1),
+        b'\r' if buffer.get(index + 1) == Some(&b'\n') => Some(2),
+        // chunk 末尾的 CR 可能是下一 chunk 中 CRLF 的前半段；等待一个
+        // 字节再决定，避免把 `\n\r\n` 过早拆成 `\n\r` + `\n`。
+        b'\r' if index + 1 == buffer.len() => None,
+        b'\r' => Some(1),
+        _ => None,
+    }
+}
+
+fn parse_sse_block(block: &[u8]) -> Result<Option<Value>, XaiSseDecodeError> {
+    let block = std::str::from_utf8(block)
+        .map_err(|error| XaiSseDecodeError::InvalidUtf8(error.to_string()))?;
+    let normalized = block.replace("\r\n", "\n").replace('\r', "\n");
+    let data = normalized
         .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .filter_map(|line| {
+            if line == "data" {
+                Some("")
+            } else {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if data.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Chat Completions 以 `[DONE]` 结束，而 Responses 以
     // `response.completed` 结束。保留一个内部完成标记，非流式聚合可以同时
     // 验证两种 backend 的终止语义。
     if data == "[DONE]" {
-        return Some(json!({ "type": "done" }));
+        return Ok(Some(json!({ "type": "done" })));
     }
-    match serde_json::from_str(&data) {
-        Ok(event) => Some(event),
-        Err(error) => {
-            tracing::debug!(%error, data = %truncate(&data), "忽略无法解析的 xAI SSE 事件");
-            None
-        }
-    }
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| XaiSseDecodeError::InvalidJson {
+            error: error.to_string(),
+            data: truncate(&data).to_string(),
+        })
 }
-
-const MAX_ANTHROPIC_SSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// Messages backend 已经返回 Anthropic wire protocol，因此 handler 会原样
 /// 转发字节。这个观察器只旁路检查完整 SSE frame，用于判断凭据健康状态，
@@ -121,21 +189,33 @@ impl AnthropicSseObserver {
         if self.failure.is_some() || self.terminal {
             return;
         }
-        self.buffer.extend_from_slice(chunk);
-        while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
-            if sep_at > MAX_ANTHROPIC_SSE_FRAME_BYTES {
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let max_buffer = MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES;
+            let room = max_buffer.saturating_sub(self.buffer.len());
+            if room == 0 {
                 self.fail_protocol("xAI Messages SSE 单个事件超过 4 MiB");
                 return;
             }
-            let block = self.buffer[..sep_at].to_vec();
-            self.buffer.drain(..sep_at + sep_len);
-            self.observe_block(&block);
-            if self.failure.is_some() || self.terminal {
+            let take = room.min(chunk.len() - offset);
+            self.buffer.extend_from_slice(&chunk[offset..offset + take]);
+            offset += take;
+            while let Some((sep_at, sep_len)) = find_sse_event_separator(&self.buffer) {
+                if sep_at > MAX_SSE_FRAME_BYTES {
+                    self.fail_protocol("xAI Messages SSE 单个事件超过 4 MiB");
+                    return;
+                }
+                let block = self.buffer[..sep_at].to_vec();
+                self.buffer.drain(..sep_at + sep_len);
+                self.observe_block(&block);
+                if self.failure.is_some() || self.terminal {
+                    return;
+                }
+            }
+            if self.buffer.len() == max_buffer {
+                self.fail_protocol("xAI Messages SSE 未终止事件超过 4 MiB");
                 return;
             }
-        }
-        if self.buffer.len() > MAX_ANTHROPIC_SSE_FRAME_BYTES {
-            self.fail_protocol("xAI Messages SSE 未终止事件超过 4 MiB");
         }
     }
 
@@ -143,7 +223,7 @@ impl AnthropicSseObserver {
         if self.failure.is_some() || self.terminal || self.buffer.is_empty() {
             return;
         }
-        if self.buffer.len() > MAX_ANTHROPIC_SSE_FRAME_BYTES {
+        if self.buffer.len() > MAX_SSE_FRAME_BYTES {
             self.fail_protocol("xAI Messages SSE 未终止事件超过 4 MiB");
             return;
         }
@@ -1503,7 +1583,14 @@ fn suffix_after(existing: &str, complete_or_delta: &str) -> String {
 }
 
 fn truncate(value: &str) -> &str {
-    value.get(..500).unwrap_or(value)
+    if value.len() <= 500 {
+        return value;
+    }
+    let mut end = 500;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -1516,9 +1603,12 @@ mod tests {
         assert!(
             decoder
                 .feed(b"event: response.output_text.delta\ndata: {\"type\":")
+                .unwrap()
                 .is_empty()
         );
-        let events = decoder.feed(b"\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
+        let events = decoder
+            .feed(b"\"response.output_text.delta\",\"delta\":\"hi\"}\n\n")
+            .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["delta"], "hi");
     }
@@ -1531,10 +1621,10 @@ mod tests {
         let chinese = "你好".as_bytes();
         let mut first = prefix.to_vec();
         first.extend_from_slice(&chinese[..4]); // incomplete second char
-        assert!(decoder.feed(&first).is_empty());
+        assert!(decoder.feed(&first).unwrap().is_empty());
         let mut second = chinese[4..].to_vec();
         second.extend_from_slice(b"\"}\n\n");
-        let events = decoder.feed(&second);
+        let events = decoder.feed(&second).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["delta"], "你好");
     }
@@ -1543,9 +1633,73 @@ mod tests {
     fn decodes_crlf_framed_sse_events() {
         let mut decoder = XaiSseDecoder::default();
         let frame = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"crlf\"}\r\n\r\n";
-        let events = decoder.feed(frame);
+        let events = decoder.feed(frame).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["delta"], "crlf");
+    }
+
+    #[test]
+    fn decodes_mixed_and_bare_cr_sse_separators() {
+        let mut decoder = XaiSseDecoder::default();
+        let events = decoder
+            .feed(
+                b"data: {\"type\":\"one\"}\r\n\ndata: {\"type\":\"two\"}\n\r\ndata: {\"type\":\"three\"}\r\r",
+            )
+            .unwrap();
+        assert_eq!(events[0]["type"], "one");
+        assert_eq!(events[1]["type"], "two");
+        let final_events = decoder.finish().unwrap();
+        assert_eq!(final_events[0]["type"], "three");
+
+        let mut fragmented = XaiSseDecoder::default();
+        assert!(
+            fragmented
+                .feed(b"data: {\"type\":\"before\"}\n\r")
+                .unwrap()
+                .is_empty()
+        );
+        let events = fragmented
+            .feed(b"\ndata: {\"type\":\"after\"}\n\n")
+            .unwrap();
+        assert_eq!(events[0]["type"], "before");
+        assert_eq!(events[1]["type"], "after");
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_and_malformed_json_instead_of_dropping_events() {
+        let mut invalid_utf8 = XaiSseDecoder::default();
+        let mut bytes = b"data: {\"type\":\"delta\",\"text\":\"".to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}\n\n");
+        assert!(matches!(
+            invalid_utf8.feed(&bytes),
+            Err(XaiSseDecodeError::InvalidUtf8(_))
+        ));
+
+        let mut malformed = XaiSseDecoder::default();
+        assert!(matches!(
+            malformed.feed(b"data: {not-json}\n\n"),
+            Err(XaiSseDecodeError::InvalidJson { .. })
+        ));
+        let mut malformed_at_eof = XaiSseDecoder::default();
+        malformed_at_eof.feed(b"data: {").unwrap();
+        assert!(matches!(
+            malformed_at_eof.finish(),
+            Err(XaiSseDecodeError::InvalidJson { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unterminated_frame_over_the_memory_limit() {
+        let mut decoder = XaiSseDecoder::default();
+        let oversized = vec![b'x'; MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES + 1];
+        assert_eq!(
+            decoder.feed(&oversized),
+            Err(XaiSseDecodeError::FrameTooLarge {
+                limit: MAX_SSE_FRAME_BYTES
+            })
+        );
+        assert!(decoder.buffer.is_empty());
     }
 
     #[test]
@@ -1596,6 +1750,17 @@ mod tests {
         truncated.finish();
         assert!(!truncated.terminal());
         assert!(truncated.failure().is_none());
+
+        let mut oversized = AnthropicSseObserver::default();
+        oversized.feed(&vec![
+            b'x';
+            MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES + 1
+        ]);
+        assert!(matches!(
+            oversized.failure(),
+            Some(AnthropicSseFailure::Protocol(message)) if message.contains("4 MiB")
+        ));
+        assert!(oversized.buffer.is_empty());
     }
 
     #[test]

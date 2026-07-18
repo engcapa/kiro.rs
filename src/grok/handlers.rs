@@ -759,16 +759,26 @@ fn create_sse_stream(
         let Some(response) = response else { return };
 
         let mut decoder = XaiSseDecoder::default();
-        let mut saw_upstream_error = false;
         let body_stream = response.bytes_stream();
         tokio::pin!(body_stream);
         loop {
             tokio::select! {
                 chunk = body_stream.next() => match chunk {
                     Some(Ok(chunk)) => {
-                        for upstream_event in decoder.feed(&chunk) {
+                        let upstream_events = match decoder.feed(&chunk) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                if let Some(id) = credential_id {
+                                    state.provider.token_manager().report_failure(id);
+                                }
+                                yield Ok(upstream_error_sse(&format!(
+                                    "解析 xAI SSE 响应失败: {error}"
+                                )));
+                                return;
+                            }
+                        };
+                        for upstream_event in upstream_events {
                             if let Some(message) = upstream_error_message(&upstream_event) {
-                                saw_upstream_error = true;
                                 if let Some(id) = credential_id {
                                     state.provider.token_manager().report_failure(id);
                                 }
@@ -796,9 +806,20 @@ fn create_sse_stream(
                 _ = ping.tick() => yield Ok(ping_sse()),
             }
         }
-        for upstream_event in decoder.finish() {
+        let final_events = match decoder.finish() {
+            Ok(events) => events,
+            Err(error) => {
+                if let Some(id) = credential_id {
+                    state.provider.token_manager().report_failure(id);
+                }
+                yield Ok(upstream_error_sse(&format!(
+                    "解析 xAI SSE 响应失败: {error}"
+                )));
+                return;
+            }
+        };
+        for upstream_event in final_events {
             if let Some(message) = upstream_error_message(&upstream_event) {
-                saw_upstream_error = true;
                 if let Some(id) = credential_id {
                     state.provider.token_manager().report_failure(id);
                 }
@@ -808,9 +829,6 @@ fn create_sse_stream(
             for event in context.process_event(&upstream_event) {
                 yield Ok(Bytes::from(event.to_sse_string()));
             }
-        }
-        if saw_upstream_error {
-            return;
         }
         if !context.completed() {
             if let Some(id) = credential_id {
@@ -876,10 +894,10 @@ async fn non_stream_response(
     );
     context.set_signature_codec(state.reasoning_signatures.clone());
     context.set_credential_id(credential_id);
-    let mut decoder = XaiSseDecoder::default();
-    let events = decoder.feed(&bytes);
-    for event in events.into_iter().chain(decoder.finish()) {
-        if let Some(message) = upstream_error_message(&event) {
+    if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
+        // 少数兼容网关会忽略 stream:true 并直接返回单 JSON。先识别这种
+        // 有界 HTTP body，避免把大型但合法的 JSON 当作未终止 SSE frame。
+        if let Some(message) = upstream_error_message(&response) {
             state.provider.token_manager().report_failure(credential_id);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -887,18 +905,52 @@ async fn non_stream_response(
             )
                 .into_response();
         }
-        context.process_event(&event);
-    }
-    if !context.completed() {
-        if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
-            // Chat Completions 的单 JSON 响应直接带 `choices`；Responses
-            // 则继续走 output-item 聚合。
-            if response.get("choices").is_some() {
-                context.process_event(&response);
-            } else {
-                let response = response.get("response").unwrap_or(&response);
-                context.ingest_completed_response(response);
+        if response.get("choices").is_some() {
+            context.process_event(&response);
+        } else {
+            let response = response.get("response").unwrap_or(&response);
+            context.ingest_completed_response(response);
+        }
+    } else {
+        let mut decoder = XaiSseDecoder::default();
+        let mut events = match decoder.feed(&bytes) {
+            Ok(events) => events,
+            Err(error) => {
+                state.provider.token_manager().report_failure(credential_id);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("解析 xAI SSE 响应失败: {error}"),
+                    )),
+                )
+                    .into_response();
             }
+        };
+        match decoder.finish() {
+            Ok(final_events) => events.extend(final_events),
+            Err(error) => {
+                state.provider.token_manager().report_failure(credential_id);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("解析 xAI SSE 响应失败: {error}"),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+        for event in events {
+            if let Some(message) = upstream_error_message(&event) {
+                state.provider.token_manager().report_failure(credential_id);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new("api_error", message)),
+                )
+                    .into_response();
+            }
+            context.process_event(&event);
         }
     }
     if !context.completed() {
