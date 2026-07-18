@@ -864,66 +864,63 @@ impl GrokTokenManager {
             .access_token
             .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("xAI OAuth 刷新响应缺少 access_token"))?;
-
-        let mut updated = current.clone();
-        updated.access_token = Some(access_token.clone());
-        if let Some(refresh_token) = refreshed
+        let refresh_token = refreshed
             .refresh_token
-            .filter(|token| !token.trim().is_empty())
-        {
-            updated.refresh_token = Some(refresh_token);
-        }
-        if let Some(id_token) = refreshed.id_token.filter(|token| !token.trim().is_empty()) {
-            updated.id_token = Some(id_token);
-        }
-        if let Some(token_type) = refreshed
+            .filter(|token| !token.trim().is_empty());
+        let id_token = refreshed.id_token.filter(|token| !token.trim().is_empty());
+        let token_type = refreshed
             .token_type
-            .filter(|token| !token.trim().is_empty())
-        {
-            updated.token_type = Some(token_type);
-        }
-        if let Some(user_id) = refreshed.user_id.filter(|value| !value.trim().is_empty()) {
-            updated.user_id = Some(user_id);
-        }
-        if let Some(team_id) = refreshed.team_id.filter(|value| !value.trim().is_empty()) {
-            updated.team_id = Some(team_id);
-        }
+            .filter(|token| !token.trim().is_empty());
+        let user_id = refreshed.user_id.filter(|value| !value.trim().is_empty());
+        let team_id = refreshed.team_id.filter(|value| !value.trim().is_empty());
         let expires_in = refreshed.expires_in.unwrap_or(3600).max(0);
-        updated.expires_at = Some((Utc::now() + Duration::seconds(expires_in)).to_rfc3339());
-        updated.last_refresh = Some(Utc::now().to_rfc3339());
-        updated.auth_method = Some("oauth".to_string());
-        let identity_token = updated.id_token.as_deref().unwrap_or(&access_token);
-        let (email, subject) = jwt_identity(identity_token);
-        if updated.email.is_none() {
-            updated.email = email;
-        }
-        if updated.subject.is_none() {
-            updated.subject = subject;
-        }
-        updated.canonicalize();
-
-        {
+        let refreshed_at = Utc::now();
+        let updated = {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .ok_or_else(|| anyhow::anyhow!("Grok 凭据 #{} 在刷新期间被删除", id))?;
-            // 刷新期间管理员可能已禁用该凭据：保留 Manual 禁用，避免撤销运维操作。
-            let keep_manual = entry.disabled_reason == Some(DisabledReason::Manual);
-            entry.credentials = updated.clone();
-            entry.refresh_failure_count = 0;
-            if keep_manual {
-                entry.disabled = true;
-                entry.credentials.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::Manual);
-                updated.disabled = true;
-            } else {
-                entry.disabled = false;
-                entry.credentials.disabled = false;
-                entry.disabled_reason = None;
-                updated.disabled = false;
+            // 网络请求期间管理面可能已经修改名称、资源池、优先级、代理或禁用
+            // 状态。只合并 OAuth 服务拥有的字段，绝不把请求前的完整快照写回。
+            let credentials = &mut entry.credentials;
+            credentials.access_token = Some(access_token.clone());
+            if let Some(refresh_token) = refresh_token {
+                credentials.refresh_token = Some(refresh_token);
             }
-        }
+            if let Some(id_token) = id_token {
+                credentials.id_token = Some(id_token);
+            }
+            if let Some(token_type) = token_type {
+                credentials.token_type = Some(token_type);
+            }
+            if let Some(user_id) = user_id {
+                credentials.user_id = Some(user_id);
+            }
+            if let Some(team_id) = team_id {
+                credentials.team_id = Some(team_id);
+            }
+            credentials.expires_at =
+                Some((refreshed_at + Duration::seconds(expires_in)).to_rfc3339());
+            credentials.last_refresh = Some(refreshed_at.to_rfc3339());
+            credentials.auth_method = Some("oauth".to_string());
+            let (email, subject) = jwt_identity(
+                credentials
+                    .id_token
+                    .as_deref()
+                    .unwrap_or(access_token.as_str()),
+            );
+            if credentials.email.is_none() {
+                credentials.email = email;
+            }
+            if credentials.subject.is_none() {
+                credentials.subject = subject;
+            }
+            credentials.canonicalize();
+            credentials.disabled = entry.disabled;
+            entry.refresh_failure_count = 0;
+            credentials.clone()
+        };
         self.persist_credentials()?;
         Ok(updated)
     }
@@ -1281,8 +1278,28 @@ pub type SharedGrokTokenManager = Arc<GrokTokenManager>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct RefreshGate {
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    async fn gated_refresh(State(gate): State<RefreshGate>) -> Json<serde_json::Value> {
+        gate.arrived.notify_one();
+        gate.release.notified().await;
+        Json(json!({
+            "access_token": "refreshed-access",
+            "refresh_token": "refreshed-refresh",
+            "token_type": "Bearer",
+            "expires_in": 7200,
+            "user_id": "refreshed-user"
+        }))
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
@@ -1544,6 +1561,88 @@ mod tests {
             let expected_name = format!("final-{id}");
             assert_eq!(credential.name.as_deref(), Some(expected_name.as_str()));
         }
+        let _ = std::fs::remove_file(&credentials_path);
+        let _ = std::fs::remove_file(credentials_path.with_extension("reasoning.key"));
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_merges_into_live_admin_state() {
+        let gate = RefreshGate {
+            arrived: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_gate = gate.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/token", post(gated_refresh))
+                    .with_state(server_gate),
+            )
+            .await
+            .unwrap();
+        });
+
+        let credentials_path = temp_path("grok-refresh-merge");
+        let manager = Arc::new(
+            GrokTokenManager::new(
+                Config::default(),
+                vec![GrokCredentials {
+                    id: Some(1),
+                    name: Some("before-refresh".to_string()),
+                    access_token: Some("stale-access".to_string()),
+                    refresh_token: Some("stale-refresh".to_string()),
+                    token_endpoint: Some(format!("http://{address}/token")),
+                    pools: Some(vec!["old-pool".to_string()]),
+                    priority: 1,
+                    ..Default::default()
+                }],
+                None,
+                credentials_path.clone(),
+            )
+            .unwrap(),
+        );
+        let refresh_manager = manager.clone();
+        let refresh = tokio::spawn(async move { refresh_manager.force_refresh_token_for(1).await });
+
+        gate.arrived.notified().await;
+        manager
+            .set_name(1, "edited-during-refresh".to_string())
+            .unwrap();
+        manager.set_pools(1, vec!["new-pool".to_string()]).unwrap();
+        manager.set_priority(1, 42).unwrap();
+        manager.set_disabled(1, true).unwrap();
+        gate.release.notify_one();
+
+        let refreshed = refresh.await.unwrap().unwrap();
+        assert_eq!(refreshed.access_token.as_deref(), Some("refreshed-access"));
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("refreshed-refresh")
+        );
+        assert_eq!(refreshed.name.as_deref(), Some("edited-during-refresh"));
+        assert_eq!(refreshed.pools, Some(vec!["new-pool".to_string()]));
+        assert_eq!(refreshed.priority, 42);
+        assert!(refreshed.disabled);
+
+        let persisted: Vec<GrokCredentials> =
+            serde_json::from_str(&std::fs::read_to_string(&credentials_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0].access_token.as_deref(),
+            Some("refreshed-access")
+        );
+        assert_eq!(persisted[0].name.as_deref(), Some("edited-during-refresh"));
+        assert_eq!(persisted[0].pools, Some(vec!["new-pool".to_string()]));
+        assert_eq!(persisted[0].priority, 42);
+        assert!(persisted[0].disabled);
+        assert_eq!(
+            manager.snapshot().entries[0].disabled_reason.as_deref(),
+            Some("manual")
+        );
+
+        server.abort();
         let _ = std::fs::remove_file(&credentials_path);
         let _ = std::fs::remove_file(credentials_path.with_extension("reasoning.key"));
     }
