@@ -18,6 +18,7 @@ use super::model_catalog::{
     GrokApiBackend, GrokCredentialModelIndex, GrokModel, GrokModelCatalog, ReasoningEffort,
     merge_catalogs,
 };
+use super::reasoning_sig::ReasoningSignatureCodec;
 
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const LOAD_BALANCING_MODE_PRIORITY: &str = "priority";
@@ -135,6 +136,7 @@ pub struct GrokTokenManager {
     refresh_lock: AsyncMutex<()>,
     credentials_path: PathBuf,
     load_balancing_mode: Mutex<String>,
+    reasoning_signature_codec: ReasoningSignatureCodec,
 }
 
 impl GrokTokenManager {
@@ -197,6 +199,9 @@ impl GrokTokenManager {
         let mode = normalize_load_balancing_mode(&config.load_balancing_mode)
             .unwrap_or(LOAD_BALANCING_MODE_ROUND_ROBIN)
             .to_string();
+        let signature_key_path = credentials_path.with_extension("reasoning.key");
+        let reasoning_signature_codec =
+            ReasoningSignatureCodec::load_or_create(&signature_key_path)?;
         let manager = Self {
             tls_backend: config.tls_backend,
             config,
@@ -206,6 +211,7 @@ impl GrokTokenManager {
             refresh_lock: AsyncMutex::new(()),
             credentials_path,
             load_balancing_mode: Mutex::new(mode),
+            reasoning_signature_codec,
         };
         if requires_persist {
             manager.persist_credentials()?;
@@ -215,6 +221,10 @@ impl GrokTokenManager {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn reasoning_signature_codec(&self) -> ReasoningSignatureCodec {
+        self.reasoning_signature_codec.clone()
     }
 
     pub fn total_count(&self) -> usize {
@@ -585,6 +595,70 @@ impl GrokTokenManager {
         requires_backend_search: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
+        self.choose_credential_id(
+            model_id,
+            reasoning_effort,
+            backend,
+            requires_backend_search,
+            allowed_pools,
+        )
+    }
+
+    /// 选择会话路由凭据。已验证 reasoning signature 指向的凭据优先；否则
+    /// metadata session key 在当前 eligible 集合上做稳定散列；两者均不存在时
+    /// 回退到配置的 round-robin/priority/balanced 策略。
+    ///
+    /// preferred id 仍会重新检查 disabled、pool、model/backend/search 能力，
+    /// 因而历史 signature 不能恢复已撤权或已禁用账号。
+    pub fn claim_routing_credential_id_with_affinity(
+        &self,
+        preferred_id: Option<u64>,
+        affinity_key: Option<&str>,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<u64> {
+        let affinity_key = affinity_key.map(str::trim).filter(|key| !key.is_empty());
+        let selected = {
+            let entries = self.entries.lock();
+            let eligible = entries
+                .iter()
+                .filter(|entry| {
+                    !entry.disabled
+                        && pool_matches(entry, allowed_pools)
+                        && credential_supports(
+                            entry,
+                            model_id,
+                            reasoning_effort,
+                            backend,
+                            requires_backend_search,
+                        )
+                })
+                .collect::<Vec<_>>();
+            preferred_id
+                .and_then(|preferred_id| {
+                    eligible
+                        .iter()
+                        .find(|entry| entry.id == preferred_id)
+                        .map(|entry| entry.id)
+                })
+                .or_else(|| {
+                    affinity_key.and_then(|key| {
+                        if eligible.is_empty() {
+                            return None;
+                        }
+                        let digest = Sha256::digest(key.as_bytes());
+                        let bucket = u64::from_be_bytes(digest[..8].try_into().ok()?);
+                        Some(eligible[bucket as usize % eligible.len()].id)
+                    })
+                })
+        };
+        if let Some(id) = selected {
+            *self.current_id.lock() = id;
+            return Ok(id);
+        }
         self.choose_credential_id(
             model_id,
             reasoning_effort,
@@ -1228,6 +1302,77 @@ mod tests {
         assert_eq!(
             manager.acquire_context_for(claimed_a).await.unwrap().id,
             claimed_a
+        );
+    }
+
+    #[test]
+    fn session_affinity_is_stable_and_verified_preference_wins() {
+        let manager = manager(vec![
+            GrokCredentials {
+                id: Some(1),
+                access_token: Some("token-one".to_string()),
+                ..Default::default()
+            },
+            GrokCredentials {
+                id: Some(2),
+                access_token: Some("token-two".to_string()),
+                ..Default::default()
+            },
+        ]);
+
+        let affinity_a = manager
+            .claim_routing_credential_id_with_affinity(
+                None,
+                Some("session-stable"),
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        let affinity_b = manager
+            .claim_routing_credential_id_with_affinity(
+                None,
+                Some("session-stable"),
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(affinity_a, affinity_b);
+
+        let preferred = if affinity_a == 1 { 2 } else { 1 };
+        assert_eq!(
+            manager
+                .claim_routing_credential_id_with_affinity(
+                    Some(preferred),
+                    Some("session-stable"),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap(),
+            preferred
+        );
+        manager.set_disabled(preferred, true).unwrap();
+        assert_ne!(
+            manager
+                .claim_routing_credential_id_with_affinity(
+                    Some(preferred),
+                    Some("session-stable"),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap(),
+            preferred
         );
     }
 

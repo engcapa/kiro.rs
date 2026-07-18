@@ -7,7 +7,7 @@ use crate::anthropic::types::{ContentBlock, MessagesRequest, Tool};
 
 use super::model_catalog::{GrokApiBackend, GrokModel, GrokModelCatalog, ReasoningEffort};
 use super::reasoning_sig::{
-    decode_signature, package_matches_credential, package_to_input_items,
+    ReasoningSignatureCodec, package_matches_route, package_to_input_items,
 };
 
 #[derive(Debug)]
@@ -131,7 +131,7 @@ pub fn convert_request(
     default_model: &str,
     catalog: Option<&GrokModelCatalog>,
 ) -> Result<ConvertedGrokRequest, ConversionError> {
-    convert_request_for_credential(request, default_model, catalog, None)
+    convert_request_for_credential(request, default_model, catalog, None, None)
 }
 
 /// 与 [`convert_request`] 相同，但携带路由凭据 id，用于校验历史
@@ -141,6 +141,7 @@ pub fn convert_request_for_credential(
     default_model: &str,
     catalog: Option<&GrokModelCatalog>,
     replay_credential_id: Option<u64>,
+    signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<ConvertedGrokRequest, ConversionError> {
     if request.messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
@@ -186,7 +187,13 @@ pub fn convert_request_for_credential(
 
     let body = match backend {
         GrokApiBackend::Responses => {
-            build_responses_body(request, &model, reasoning_effort, replay_credential_id)?
+            build_responses_body(
+                request,
+                &model,
+                reasoning_effort,
+                replay_credential_id,
+                signature_codec,
+            )?
         }
         GrokApiBackend::ChatCompletions => {
             build_chat_completions_body(request, &model, reasoning_effort)?
@@ -276,6 +283,7 @@ fn build_responses_body(
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
     replay_credential_id: Option<u64>,
+    signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<Value, ConversionError> {
     let mut input = Vec::new();
     let mut instructions = Vec::new();
@@ -298,7 +306,13 @@ fn build_responses_body(
                 }
             }
             "assistant" => {
-                append_assistant_message(&mut input, &message.content, replay_credential_id)?;
+                append_assistant_message(
+                    &mut input,
+                    &message.content,
+                    model,
+                    replay_credential_id,
+                    signature_codec,
+                )?;
             }
             _ => append_user_message(&mut input, &message.content)?,
         }
@@ -691,7 +705,9 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
 fn append_assistant_message(
     input: &mut Vec<Value>,
     content: &Value,
+    replay_model: &str,
     replay_credential_id: Option<u64>,
+    signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
@@ -730,13 +746,20 @@ fn append_assistant_message(
                     }
                 }
             }
-            // Claude Code 会原样回传 thinking + signature。若 signature 是我们
-            // 打包的 xai-rs1 完整 reasoning items，则展开为 Responses sibling；
-            // 否则回退为 output_text，避免历史上下文丢失。
+            // Claude Code 会原样回传 thinking + signature。仅当 xai-rs2 包通过
+            // HMAC 且 model/backend/credential 与本次真实路由完全一致时展开；
+            // 旧格式、篡改包与跨模型/跨账号包都回退为可见文本。
             "thinking" => {
-                if let Some(signature) = block.signature.as_deref() {
-                    if let Some(package) = decode_signature(signature) {
-                        if package_matches_credential(&package, replay_credential_id) {
+                if let (Some(codec), Some(signature)) =
+                    (signature_codec, block.signature.as_deref())
+                {
+                    if let Some(package) = codec.decode(signature) {
+                        if package_matches_route(
+                            &package,
+                            replay_model,
+                            GrokApiBackend::Responses.as_str(),
+                            replay_credential_id,
+                        ) {
                             flush_message(input, "assistant", &mut content_parts);
                             for item in package_to_input_items(&package) {
                                 input.push(item);
@@ -746,7 +769,9 @@ fn append_assistant_message(
                         tracing::debug!(
                             package_credential = ?package.credential_id,
                             replay_credential = ?replay_credential_id,
-                            "xai-rs1 reasoning signature 与当前路由凭据不匹配，回退为 thinking 文本"
+                            package_model = %package.model,
+                            replay_model,
+                            "xai-rs2 reasoning signature 与当前路由不匹配，回退为 thinking 文本"
                         );
                     }
                 }
@@ -1371,20 +1396,22 @@ mod tests {
 
     #[test]
     fn responses_body_includes_encrypted_reasoning_and_replays_signature_items() {
-        use super::super::reasoning_sig::encode_signature;
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
 
-        let signature = encode_signature(
-            "grok-4.5",
-            Some(3),
-            &[json!({
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let signature = codec
+            .encode(
+                "grok-4.5",
+                Some(3),
+                &[json!({
                 "type": "reasoning",
                 "id": "rs_1",
                 "status": "completed",
                 "summary": [{"type":"summary_text","text":"plan"}],
                 "encrypted_content": "enc_blob",
-            })],
-        )
-        .unwrap();
+                })],
+            )
+            .unwrap();
         let request = MessagesRequest {
             model: "grok-4.5".to_string(),
             max_tokens: 128,
@@ -1413,8 +1440,14 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        let converted =
-            convert_request_for_credential(&request, "grok-4.5", None, Some(3)).unwrap();
+        let converted = convert_request_for_credential(
+            &request,
+            "grok-4.5",
+            None,
+            Some(3),
+            Some(&codec),
+        )
+        .unwrap();
         assert_eq!(
             converted.body["include"],
             json!(["reasoning.encrypted_content"])
@@ -1432,18 +1465,20 @@ mod tests {
 
     #[test]
     fn mismatched_reasoning_signature_falls_back_to_thinking_text() {
-        use super::super::reasoning_sig::encode_signature;
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
 
-        let signature = encode_signature(
-            "grok-4.5",
-            Some(1),
-            &[json!({
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let signature = codec
+            .encode(
+                "grok-4.5",
+                Some(1),
+                &[json!({
                 "type": "reasoning",
                 "id": "rs_1",
                 "encrypted_content": "enc_blob",
-            })],
-        )
-        .unwrap();
+                })],
+            )
+            .unwrap();
         let request = MessagesRequest {
             model: "grok-4.5".to_string(),
             max_tokens: 64,
@@ -1463,8 +1498,14 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        let converted =
-            convert_request_for_credential(&request, "grok-4.5", None, Some(99)).unwrap();
+        let converted = convert_request_for_credential(
+            &request,
+            "grok-4.5",
+            None,
+            Some(99),
+            Some(&codec),
+        )
+        .unwrap();
         let input = converted.body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");

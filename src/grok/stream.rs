@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::anthropic::{SseEvent, SseStateManager};
 
-use super::reasoning_sig::{encode_signature, extract_reasoning_item};
+use super::reasoning_sig::{ReasoningSignatureCodec, extract_reasoning_item};
 
 /// 按字节缓冲的 SSE 解码器：跨 chunk 保留不完整 UTF-8，并同时识别
 /// `\n\n` 与 `\r\n\r\n` 事件分隔符。
@@ -139,8 +139,9 @@ pub struct GrokStreamContext {
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
     thinking_enabled: bool,
-    /// 签发 xai-rs1 signature 时写入，供 Claude Code 多轮回传后做凭据校验。
+    /// 签发 xai-rs2 signature 时写入，供 Claude Code 多轮回传后做凭据校验。
     credential_id: Option<u64>,
+    signature_codec: Option<ReasoningSignatureCodec>,
     text_block_index: Option<i32>,
     thinking_block_index: Option<i32>,
     text: String,
@@ -171,6 +172,7 @@ impl GrokStreamContext {
             output_tokens: None,
             thinking_enabled,
             credential_id: None,
+            signature_codec: None,
             text_block_index: None,
             thinking_block_index: None,
             text: String::new(),
@@ -197,6 +199,10 @@ impl GrokStreamContext {
     /// 记录实际上游凭据，用于打包 `thinking.signature`。
     pub fn set_credential_id(&mut self, credential_id: u64) {
         self.credential_id = Some(credential_id);
+    }
+
+    pub fn set_signature_codec(&mut self, codec: ReasoningSignatureCodec) {
+        self.signature_codec = Some(codec);
     }
 
     pub fn initial_events(&mut self) -> Vec<SseEvent> {
@@ -533,7 +539,11 @@ impl GrokStreamContext {
     }
 
     fn build_reasoning_signature(&self) -> Option<String> {
-        encode_signature(&self.model, self.credential_id, &self.reasoning_items)
+        self.signature_codec.as_ref()?.encode(
+            &self.model,
+            self.credential_id,
+            &self.reasoning_items,
+        )
     }
 
     /// 关闭 thinking 块；若有可回放的 reasoning items，先发 signature_delta。
@@ -1430,10 +1440,12 @@ mod tests {
     }
 
     #[test]
-    fn emits_xai_rs1_signature_before_thinking_stop_and_non_stream_carries_it() {
-        use super::super::reasoning_sig::decode_signature;
+    fn emits_xai_rs2_signature_before_thinking_stop_and_non_stream_carries_it() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
 
         let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        context.set_signature_codec(codec.clone());
         context.set_credential_id(42);
         context.process_event(&json!({
             "type": "response.reasoning_summary_text.delta",
@@ -1470,7 +1482,7 @@ mod tests {
         let signature = events[signature_pos].data["delta"]["signature"]
             .as_str()
             .unwrap();
-        let package = decode_signature(signature).expect("xai-rs1 package");
+        let package = codec.decode(signature).expect("xai-rs2 package");
         assert_eq!(package.credential_id, Some(42));
         assert_eq!(package.items[0]["id"], "rs_1");
         assert_eq!(package.items[0]["encrypted_content"], "enc_secret");
@@ -1482,7 +1494,7 @@ mod tests {
             response["content"][0]["signature"]
                 .as_str()
                 .unwrap()
-                .starts_with("xai-rs1.")
+                .starts_with("xai-rs2.")
         );
     }
 

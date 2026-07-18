@@ -23,6 +23,7 @@ use super::handlers::{
     post_messages_cc, post_video_generations,
 };
 use super::provider::SharedGrokProvider;
+use super::reasoning_sig::ReasoningSignatureCodec;
 
 /// 包含 multipart boundary、文件名与表单字段后的总请求体上限。xAI 的文件
 /// 本体可达 `MAX_UPLOAD_BYTES`，因此这里多留 2 MiB，避免合法 50 MiB 文件
@@ -36,6 +37,9 @@ pub struct GrokAppState {
     pub default_model: String,
     pub extract_thinking: bool,
     pub api_key_manager: Option<Arc<ApiKeyManager>>,
+    /// 使用持久化 server-only 随机密钥的 HMAC codec；防止客户端篡改
+    /// reasoning signature 中的凭据、模型和 encrypted content。
+    pub reasoning_signatures: ReasoningSignatureCodec,
     /// Anthropic `file_id` 与创建它的 xAI credential 的持久化绑定。
     pub file_store: GrokFileStore,
 }
@@ -48,12 +52,15 @@ impl GrokAppState {
         extract_thinking: bool,
         api_key_manager: Option<Arc<ApiKeyManager>>,
     ) -> Self {
+        let api_key = api_key.into();
+        let reasoning_signatures = provider.token_manager().reasoning_signature_codec();
         Self {
-            api_key: api_key.into(),
+            api_key,
             provider,
             default_model: default_model.into(),
             extract_thinking,
             api_key_manager,
+            reasoning_signatures,
             file_store: GrokFileStore::default(),
         }
     }

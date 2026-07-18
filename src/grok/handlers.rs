@@ -27,6 +27,7 @@ use super::media::{
 };
 use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
 use super::provider::GrokUpstreamResponse;
+use super::reasoning_sig::latest_verified_route_credential;
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
 use super::stream::{GrokStreamContext, XaiSseDecoder};
 
@@ -469,21 +470,39 @@ pub async fn post_messages(
         }
     };
 
-    // 2) 锁定路由凭据（推进 RR 游标），并用**该凭据**的 catalog 做 wire 转换，
-    //    再 pin 到 call_api，保证 convert 与 send 原子一致。
+    // 2) 锁定路由凭据，并用**该凭据**的 catalog 做 wire 转换。已通过 HMAC 的
+    //    reasoning signature 优先保持上一轮账号；没有 signature 时 metadata.user_id
+    //    在 eligible 账号间提供稳定会话亲和，最后才回退普通负载均衡。
+    let signature_credential_id = latest_verified_route_credential(
+        &state.reasoning_signatures,
+        &payload,
+        &plan.model,
+    );
+    let affinity_key = payload
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_deref());
+    let routing_backend = signature_credential_id
+        .map(|_| GrokApiBackend::Responses)
+        .or_else(|| plan.backend_constraint());
     let pinned_credential_id = match file_credential_id {
         Some(id) => Some(id),
-        None => state
+        None => match state
             .provider
             .token_manager()
-            .claim_routing_credential_id(
+            .claim_routing_credential_id_with_affinity(
+                signature_credential_id,
+                affinity_key,
                 Some(&plan.model),
                 plan.reasoning_effort,
-                plan.backend_constraint(),
+                routing_backend,
                 plan.needs_web_search,
                 Some(&allowed_pools.0),
             )
-            .ok(),
+        {
+            Ok(id) => Some(id),
+            Err(error) => return map_provider_error(error),
+        },
     };
     let routing_catalog = pinned_credential_id
         .and_then(|id| state.provider.token_manager().catalog_for(id))
@@ -496,6 +515,7 @@ pub async fn post_messages(
         &state.default_model,
         routing_catalog.as_deref(),
         pinned_credential_id,
+        Some(&state.reasoning_signatures),
     ) {
         Ok(converted) => converted,
         Err(error) => {
@@ -651,6 +671,7 @@ fn create_sse_stream(
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut context = GrokStreamContext::new(model.clone(), input_tokens, thinking_enabled);
+        context.set_signature_codec(state.reasoning_signatures.clone());
         for event in context.initial_events() {
             yield Ok(Bytes::from(event.to_sse_string()));
         }
@@ -804,6 +825,7 @@ async fn non_stream_response(
     };
 
     let mut context = GrokStreamContext::new(model, input_tokens, thinking_enabled);
+    context.set_signature_codec(state.reasoning_signatures.clone());
     context.set_credential_id(credential_id);
     let mut decoder = XaiSseDecoder::default();
     let events = decoder.feed(&bytes);

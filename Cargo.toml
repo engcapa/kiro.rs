@@ -27,6 +27,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
 fastrand = "2"
 sha2 = "0.10"
+hmac = "0.12"        # Grok reasoning signature 完整性保护
+getrandom = "0.3"    # 生成持久化的服务端-only reasoning HMAC key
 hex = "0.4"
 crc = "3"           # CRC32C 计算
 bytes = "1"         # 高效的字节缓冲区
