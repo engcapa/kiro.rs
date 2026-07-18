@@ -128,6 +128,12 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 采样温度；`/grok` 会透传到 Responses / Chat Completions（及 Messages backend）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// nucleus sampling；`/grok` 会透传到 Responses / Chat Completions（及 Messages backend）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

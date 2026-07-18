@@ -516,18 +516,33 @@ Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
 | `max_tokens` | → `max_output_tokens` / `max_completion_tokens` / `max_tokens` |
 | `stream` | 支持；Responses/Chat 上游统一拉 SSE 再聚合成 Anthropic 流或 JSON |
 | `tools` / `tool_choice` | function 与 hosted `web_search`（见下） |
-| `thinking` / `output_config.effort` | → Responses `reasoning` / Chat `reasoning_effort` / Messages adaptive |
-| `metadata.user_id` | → Responses `prompt_cache_key`（会话/缓存键） |
-| `temperature` / `top_p` / `top_k` | **当前未透传** |
-| `stop_sequences` | **当前未透传** |
+| `thinking` / `output_config.effort` | → Responses `reasoning.effort` / Chat `reasoning_effort` / Messages adaptive（见下节 summary 语义） |
+| `metadata.user_id` | → Responses `prompt_cache_key`（会话/缓存键）；并参与多账号 session 亲和 |
+| `temperature` / `top_p` | 有值时透传到 Responses / Chat Completions body，以及 Messages backend（`serde` 原样保留）；省略则用上游默认 |
+| `top_k` / `stop_sequences` | **当前未透传** |
 | `source.type=file`（image/document） | 仅 `responses` backend；须先 `/grok/v1/files` 上传 |
-| 多轮 `thinking` + `signature` | Responses 请求 `include: reasoning.encrypted_content`；把完整 reasoning items 打包进 `thinking.signature`（`xai-rs1.*`）。Claude Code 原样回传后展开为 Responses reasoning sibling；无包/凭据不匹配时回退为 thinking 文本 |
+| 多轮 `thinking` + `signature` | Responses 请求 `include: reasoning.encrypted_content`；把完整 reasoning items 打包进 `thinking.signature`（`xai-rs2.*` HMAC）。Claude Code 原样回传后展开为 Responses reasoning sibling；无包/凭据不匹配时回退为 thinking 文本 |
 
-对于 catalog 为 `responses` 的模型，代理遵循 Grok Build 的请求语义：始终发送
-`reasoning.summary: "concise"`，并把 Anthropic `thinking` 或 `output_config.effort` 映射为
-`reasoning.effort`。因此无需也不会再依赖模型名的 `-thinking` 后缀。收到的 xAI reasoning
-summary 会转换为 Anthropic `thinking` 内容块。`xhigh` 会原样保留；但若服务端给该模型提供
-了明确的 `reasoningEfforts` 菜单，则只接受菜单中声明的值。
+#### reasoning summary 语义（与 Grok Build 对齐，保持现状）
+
+对于 catalog 为 `responses` 的模型，代理**始终**按 Grok Build sampler 发送：
+
+```json
+"reasoning": { "summary": "concise" }
+```
+
+并把 Anthropic `thinking` 或 `output_config.effort` 映射为 `reasoning.effort`（未声明 effort
+时只省略 `effort` 字段，**不**省略 `summary`）。因此：
+
+1. **无需**再依赖模型名 `-thinking` 后缀；
+2. 客户端**未**开启 `thinking` / `output_config.effort` 时，上游仍可能产生 reasoning
+   summary 与对应 token 消耗；
+3. 代理仅在客户端声明了 thinking/effort（`thinking_enabled=true`）时，才把上游
+   reasoning 转为 Anthropic `thinking` 内容块并打包 `signature`；否则 summary
+   **不会**出现在 Anthropic 响应中。
+
+这是有意对齐 Grok Build 的 wire 行为，而不是按 Anthropic「未请求则不思考」语义做裁剪。
+`xhigh` 会原样保留；若服务端给该模型提供了明确的 `reasoningEfforts` 菜单，则只接受菜单中声明的值。
 
 #### Web Search
 

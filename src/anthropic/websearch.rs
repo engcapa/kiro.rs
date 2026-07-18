@@ -577,6 +577,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -617,6 +619,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -644,6 +648,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let query = extract_search_query(&req);
@@ -669,6 +675,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let query = extract_search_query(&req);

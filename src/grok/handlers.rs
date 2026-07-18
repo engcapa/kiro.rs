@@ -1047,6 +1047,15 @@ async fn messages_backend_response(
     let credential_id = upstream.credential_id;
     match upstream.response.bytes().await {
         Ok(bytes) => {
+            // HTTP 2xx 仍可能携带 Anthropic `type:error` JSON；不得记为凭据健康成功。
+            if let Some((error_type, message)) = anthropic_json_error_payload(&bytes) {
+                state.provider.token_manager().report_failure(credential_id);
+                return (
+                    status_for_anthropic_error_type(&error_type),
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
             state.provider.token_manager().report_success(credential_id);
             Response::builder()
                 .status(StatusCode::OK)
@@ -1068,6 +1077,53 @@ async fn messages_backend_response(
             )
                 .into_response()
         }
+    }
+}
+
+/// 识别 Anthropic Messages JSON 错误体（含 HTTP 200 + `type:error`）。
+/// 成功消息通常是 `type:message`；仅在显式 error 形状时返回。
+fn anthropic_json_error_payload(bytes: &[u8]) -> Option<(String, String)> {
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let type_str = value.get("type").and_then(Value::as_str);
+    let error_field = value.get("error");
+    let is_error = type_str == Some("error")
+        || (type_str != Some("message")
+            && error_field.is_some_and(|error| {
+                !error.is_null() && (error.is_object() || error.is_string())
+            }));
+    if !is_error {
+        return None;
+    }
+    let error_type = error_field
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("api_error")
+        .to_string();
+    let message = error_field
+        .and_then(|error| {
+            if let Some(text) = error.as_str() {
+                Some(text.to_string())
+            } else {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| "xAI Messages 上游返回错误响应".to_string());
+    Some((error_type, message))
+}
+
+fn status_for_anthropic_error_type(error_type: &str) -> StatusCode {
+    match error_type {
+        "authentication_error" => StatusCode::UNAUTHORIZED,
+        "permission_error" => StatusCode::FORBIDDEN,
+        "not_found_error" => StatusCode::NOT_FOUND,
+        "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+        "invalid_request_error" => StatusCode::BAD_REQUEST,
+        "overloaded_error" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -1425,5 +1481,27 @@ mod tests {
             .status(),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn messages_json_error_payload_detects_anthropic_error_object() {
+        let bytes = br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#;
+        assert_eq!(
+            anthropic_json_error_payload(bytes),
+            Some((
+                "invalid_request_error".to_string(),
+                "bad input".to_string()
+            ))
+        );
+        assert_eq!(
+            status_for_anthropic_error_type("invalid_request_error"),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn messages_json_success_payload_is_not_treated_as_error() {
+        let bytes = br#"{"id":"msg_1","type":"message","role":"assistant","content":[]}"#;
+        assert_eq!(anthropic_json_error_payload(bytes), None);
     }
 }

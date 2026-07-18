@@ -355,8 +355,11 @@ fn build_responses_body(
     if let Some(tool_choice) = request.tool_choice.as_ref().and_then(convert_tool_choice) {
         body["tool_choice"] = tool_choice;
     }
+    apply_sampling_params(&mut body, request);
     // 与 Grok Build Responses 适配器一致：始终请求 concise reasoning
     // summary；effort 未显式选择时只省略 `reasoning.effort`，不省略 summary。
+    // 客户端未声明 thinking/effort 时 summary 不会转成 Anthropic thinking 块
+    // （见 README「reasoning summary 语义」）。
     let mut reasoning = json!({ "summary": "concise" });
     if let Some(effort) = reasoning_effort {
         reasoning["effort"] = Value::String(effort.as_str().to_string());
@@ -392,10 +395,22 @@ fn build_chat_completions_body(
     {
         body["tool_choice"] = tool_choice;
     }
+    apply_sampling_params(&mut body, request);
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = Value::String(effort.as_str().to_string());
     }
     Ok(body)
+}
+
+/// 将 Anthropic 可选采样参数原样写入 Responses / Chat Completions body。
+/// `None` 不写入字段，交给上游默认值。
+fn apply_sampling_params(body: &mut Value, request: &MessagesRequest) {
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
 }
 
 fn build_messages_body(
@@ -1089,6 +1104,8 @@ mod tests {
             }),
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let converted = convert_request(&request, "grok-4.5", None).unwrap();
         assert_eq!(converted.model, "grok-4.5");
@@ -1154,6 +1171,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let converted = convert_request(&request, "grok-4.5", Some(&catalog)).unwrap();
         assert_eq!(converted.backend, GrokApiBackend::ChatCompletions);
@@ -1186,6 +1205,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let error = convert_request(&request, "grok-4.5", None)
             .expect_err("base64 document must not be dropped")
@@ -1282,6 +1303,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         }
     }
 
@@ -1306,6 +1329,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let converted = convert_request(&request, "grok-4.5", None).unwrap();
@@ -1338,6 +1363,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
 
         let converted = convert_request(&request, "grok-4.5", None).unwrap();
@@ -1370,6 +1397,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let catalog = GrokModelCatalog::from_upstream(
             &json!({"data":[{"model":"grok-chat","apiBackend":"chat_completions"}]}),
@@ -1439,6 +1468,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let converted = convert_request_for_credential(
             &request,
@@ -1497,6 +1528,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let converted = convert_request_for_credential(
             &request,
@@ -1591,6 +1624,8 @@ mod tests {
                 effort: "max".to_string(),
             }),
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let catalog = GrokModelCatalog::from_upstream(
             &json!({"data":[{
@@ -1628,6 +1663,8 @@ mod tests {
             }),
             output_config: None,
             metadata: None,
+            temperature: None,
+            top_p: None,
         };
         let catalog = GrokModelCatalog::from_upstream(
             &json!({"data":[{
@@ -1643,5 +1680,47 @@ mod tests {
         assert_eq!(converted.body["output_config"]["effort"], "medium");
         assert_eq!(converted.body["thinking"]["type"], "adaptive");
         assert_eq!(converted.body["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn responses_and_chat_forward_temperature_and_top_p() {
+        let mut request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 128,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hi"),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: Some(0.4),
+            top_p: Some(0.9),
+        };
+        let responses = convert_request(&request, "grok-4.5", None).unwrap();
+        assert_eq!(responses.body["temperature"], 0.4);
+        assert_eq!(responses.body["top_p"], 0.9);
+
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"chat_completions"
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let chat = convert_request(&request, "grok-4.5", Some(&catalog)).unwrap();
+        assert_eq!(chat.backend, GrokApiBackend::ChatCompletions);
+        assert_eq!(chat.body["temperature"], 0.4);
+        assert_eq!(chat.body["top_p"], 0.9);
+
+        request.temperature = None;
+        request.top_p = None;
+        let omitted = convert_request(&request, "grok-4.5", None).unwrap();
+        assert!(omitted.body.get("temperature").is_none());
+        assert!(omitted.body.get("top_p").is_none());
     }
 }
