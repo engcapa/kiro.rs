@@ -4,6 +4,10 @@
 /config.json
 /credentials.json
 /grok_credentials.json
+# HMAC key for /grok thinking.signature (xai-rs2); derived path is
+# {grok_credentials}.with_extension("reasoning.key")
+/grok_credentials.reasoning.key
+*.reasoning.key
 /grok_file_bindings.json
 /grok_file_bindings.json.tmp.*
 /.idea

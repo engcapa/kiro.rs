@@ -480,6 +480,7 @@ pub async fn get_models(State(state): State<GrokAppState>) -> impl IntoResponse 
             display_name: model.model_name,
             model_type: "chat".to_string(),
             max_tokens: model.max_completion_tokens.unwrap_or(16_384),
+            context_window: model.context_window,
         })
         .collect::<Vec<_>>();
     tracing::debug!(

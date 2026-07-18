@@ -48,7 +48,12 @@ pub struct Model {
     pub display_name: String,
     #[serde(rename = "type")]
     pub model_type: String,
+    /// 最大输出 tokens（Grok 来自 catalog `maxCompletionTokens`）。
     pub max_tokens: i32,
+    /// 上下文窗口 / 最大输入 tokens。Grok 来自 catalog `contextWindow`；
+    /// 目录未声明时省略该字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
 }
 
 /// 模型列表响应
