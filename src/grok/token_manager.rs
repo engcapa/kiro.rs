@@ -752,6 +752,41 @@ impl GrokTokenManager {
         Ok(candidates)
     }
 
+    /// 在候选列表生成后、真正发送请求前重新检查凭据的实时资格。管理面可以
+    /// 并发禁用凭据或修改 pools/catalog；provider 不应继续信任较早的候选
+    /// 快照。
+    pub fn ensure_credential_eligible(
+        &self,
+        id: u64,
+        model_id: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        backend: Option<GrokApiBackend>,
+        requires_backend_search: bool,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<()> {
+        let entries = self.entries.lock();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Grok 凭据 #{} 不存在", id))?;
+        if entry.disabled {
+            bail!("Grok 凭据 #{} 已禁用", id);
+        }
+        if !pool_matches(entry, allowed_pools) {
+            bail!("Grok 凭据 #{} 已无权访问当前 API Key 资源池", id);
+        }
+        if !credential_supports(
+            entry,
+            model_id,
+            reasoning_effort,
+            backend,
+            requires_backend_search,
+        ) {
+            bail!("Grok 凭据 #{} 已不再支持当前模型/backend", id);
+        }
+        Ok(())
+    }
+
     /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
     /// 时自动刷新。目录未加载的凭据会被保守地放行，保持控制平面抖动时的服务
     /// 可用性；目录已加载的凭据则严格按其模型能力过滤。`requires_backend_search`

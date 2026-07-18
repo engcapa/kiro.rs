@@ -107,6 +107,8 @@ pub struct FileListQuery {
 struct FileBinding {
     metadata: FileMetadata,
     credential_id: u64,
+    /// 仅保留创建时审计/向后兼容信息。授权必须查询 credential 当前 pools，
+    /// 否则管理员移出资源池后旧绑定仍会永久可见。
     pools: Vec<String>,
 }
 
@@ -203,13 +205,14 @@ impl GrokFileStore {
         Ok(())
     }
 
-    /// 返回指定文件绑定的上游凭据。访问控制沿用视频任务的池交集规则：调用
-    /// 方必须至少拥有创建凭据的一个 pool，且不存在时也返回 not found，避免
-    /// 暴露其他租户的 file id。
+    /// 返回指定文件绑定的上游凭据。访问控制查询凭据**当前** pools；注册表
+    /// 中的创建时快照只作审计。不存在、凭据已删除或无权访问均返回 not
+    /// found，避免暴露其他租户的 file id。
     pub fn binding_for(
         &self,
         file_id: &str,
         allowed_pools: &[String],
+        current_pools: &dyn Fn(u64) -> Option<Vec<String>>,
     ) -> Result<FileBindingInfo, FileStoreError> {
         let file_id = non_empty_id(file_id)?;
         let mut state = self.inner.state.lock();
@@ -219,7 +222,9 @@ impl GrokFileStore {
             .get(&file_id)
             .cloned()
             .ok_or_else(|| FileStoreError::NotFound(file_id.clone()))?;
-        if !pools_overlap(&binding.pools, allowed_pools) {
+        if !current_pools(binding.credential_id)
+            .is_some_and(|pools| pools_overlap(&pools, allowed_pools))
+        {
             return Err(FileStoreError::NotFound(file_id));
         }
         Ok(FileBindingInfo {
@@ -232,8 +237,11 @@ impl GrokFileStore {
         &self,
         file_id: &str,
         allowed_pools: &[String],
+        current_pools: &dyn Fn(u64) -> Option<Vec<String>>,
     ) -> Result<FileMetadata, FileStoreError> {
-        Ok(self.binding_for(file_id, allowed_pools)?.metadata)
+        Ok(self
+            .binding_for(file_id, allowed_pools, current_pools)?
+            .metadata)
     }
 
     /// 从本代理上传过的、当前 API Key 可访问的文件生成分页列表。无法可靠地
@@ -243,6 +251,7 @@ impl GrokFileStore {
         &self,
         query: &FileListQuery,
         allowed_pools: &[String],
+        current_pools: &dyn Fn(u64) -> Option<Vec<String>>,
     ) -> Result<FileListResponse, FileStoreError> {
         if query
             .scope_id
@@ -268,7 +277,10 @@ impl GrokFileStore {
         let mut files = state
             .bindings
             .values()
-            .filter(|binding| pools_overlap(&binding.pools, allowed_pools))
+            .filter(|binding| {
+                current_pools(binding.credential_id)
+                    .is_some_and(|pools| pools_overlap(&pools, allowed_pools))
+            })
             .map(|binding| binding.metadata.clone())
             .collect::<Vec<_>>();
         // RFC3339 字符串可按字典序排序；同一时刻的文件再用 id 打破平局。
@@ -316,7 +328,7 @@ impl GrokFileStore {
     }
 
     /// 在上游文件已成功删除后移除本地绑定。
-    pub fn remove(&self, file_id: &str, allowed_pools: &[String]) -> Result<(), FileStoreError> {
+    pub fn remove(&self, file_id: &str, credential_id: u64) -> Result<(), FileStoreError> {
         let file_id = non_empty_id(file_id)?;
         let mut state = self.inner.state.lock();
         self.ensure_loaded(&mut state)?;
@@ -325,7 +337,7 @@ impl GrokFileStore {
             .get(&file_id)
             .cloned()
             .ok_or_else(|| FileStoreError::NotFound(file_id.clone()))?;
-        if !pools_overlap(&binding.pools, allowed_pools) {
+        if binding.credential_id != credential_id {
             return Err(FileStoreError::NotFound(file_id));
         }
         state.bindings.remove(&file_id);
@@ -342,6 +354,7 @@ impl GrokFileStore {
         &self,
         messages: &[Message],
         allowed_pools: &[String],
+        current_pools: &dyn Fn(u64) -> Option<Vec<String>>,
     ) -> Result<Option<u64>, FileStoreError> {
         let mut credential_id = None;
         for message in messages {
@@ -387,7 +400,7 @@ impl GrokFileStore {
                             "source.type=file 必须提供非空 file_id".to_string(),
                         )
                     })?;
-                let binding = self.binding_for(file_id, allowed_pools)?;
+                let binding = self.binding_for(file_id, allowed_pools, current_pools)?;
                 match credential_id {
                     Some(expected) if expected != binding.credential_id => {
                         return Err(FileStoreError::MixedCredentialFiles);
@@ -616,13 +629,15 @@ mod tests {
         store
             .register(metadata("file_image"), 7, vec!["team-a".to_string()])
             .unwrap();
+        let current_pools =
+            |credential_id| (credential_id == 7).then(|| vec!["team-a".to_string()]);
         let binding = store
-            .binding_for("file_image", &["team-a".to_string()])
+            .binding_for("file_image", &["team-a".to_string()], &current_pools)
             .unwrap();
         assert_eq!(binding.credential_id, 7);
         assert!(
             store
-                .binding_for("file_image", &["team-b".to_string()])
+                .binding_for("file_image", &["team-b".to_string()], &current_pools)
                 .unwrap_err()
                 .is_not_found()
         );
@@ -630,7 +645,7 @@ mod tests {
         let reloaded = GrokFileStore::new(&path);
         assert_eq!(
             reloaded
-                .metadata_for("file_image", &["team-a".to_string()])
+                .metadata_for("file_image", &["team-a".to_string()], &current_pools)
                 .unwrap()
                 .filename,
             "diagram.png"
@@ -652,9 +667,11 @@ mod tests {
                 {"type":"document","source":{"type":"file","file_id":"file_image"}}
             ]),
         }];
+        let current_pools =
+            |credential_id| (credential_id == 7).then(|| vec!["default".to_string()]);
         assert_eq!(
             store
-                .credential_for_messages(&messages, &["default".to_string()])
+                .credential_for_messages(&messages, &["default".to_string()], &current_pools,)
                 .unwrap(),
             Some(7)
         );
@@ -678,10 +695,44 @@ mod tests {
                 {"type":"image","source":{"type":"file","file_id":"file_two"}}
             ]),
         }];
+        let current_pools =
+            |credential_id| matches!(credential_id, 7 | 8).then(|| vec!["default".to_string()]);
         assert!(matches!(
-            store.credential_for_messages(&messages, &["default".to_string()]),
+            store.credential_for_messages(&messages, &["default".to_string()], &current_pools,),
             Err(FileStoreError::MixedCredentialFiles)
         ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn current_credential_pools_revoke_old_file_access_immediately() {
+        let path = temp_registry_path();
+        let store = GrokFileStore::new(&path);
+        store
+            .register(metadata("file_moved"), 7, vec!["team-a".to_string()])
+            .unwrap();
+        let pools = Arc::new(Mutex::new(vec!["team-a".to_string()]));
+        let lookup_pools = pools.clone();
+        let current_pools =
+            move |credential_id| (credential_id == 7).then(|| lookup_pools.lock().clone());
+
+        assert!(
+            store
+                .binding_for("file_moved", &["team-a".to_string()], &current_pools)
+                .is_ok()
+        );
+        *pools.lock() = vec!["team-b".to_string()];
+        assert!(
+            store
+                .binding_for("file_moved", &["team-a".to_string()], &current_pools)
+                .unwrap_err()
+                .is_not_found()
+        );
+        assert!(
+            store
+                .binding_for("file_moved", &["team-b".to_string()], &current_pools)
+                .is_ok()
+        );
         fs::remove_file(path).unwrap();
     }
 

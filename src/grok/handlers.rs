@@ -146,7 +146,13 @@ pub async fn post_files(
         let path = format!("/files/{}", urlencoding::encode(&metadata.id));
         if let Ok(cleanup) = state
             .provider
-            .call_public_api_for_credential(credential_id, reqwest::Method::DELETE, &path, None)
+            .call_public_api_for_credential(
+                credential_id,
+                reqwest::Method::DELETE,
+                &path,
+                None,
+                None,
+            )
             .await
         {
             let _ = cleanup.response.bytes().await;
@@ -165,7 +171,11 @@ pub async fn get_files(
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     Query(query): Query<FileListQuery>,
 ) -> Response {
-    match state.file_store.list(&query, &allowed_pools.0) {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    match state
+        .file_store
+        .list(&query, &allowed_pools.0, &current_pools)
+    {
         Ok(files) => Json(files).into_response(),
         Err(error) => file_store_error(error),
     }
@@ -177,7 +187,11 @@ pub async fn get_file(
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     Path(file_id): Path<String>,
 ) -> Response {
-    match state.file_store.metadata_for(&file_id, &allowed_pools.0) {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    match state
+        .file_store
+        .metadata_for(&file_id, &allowed_pools.0, &current_pools)
+    {
         Ok(metadata) => Json(metadata).into_response(),
         Err(error) => file_store_error(error),
     }
@@ -189,14 +203,24 @@ pub async fn delete_file(
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     Path(file_id): Path<String>,
 ) -> Response {
-    let binding = match state.file_store.binding_for(&file_id, &allowed_pools.0) {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    let binding = match state
+        .file_store
+        .binding_for(&file_id, &allowed_pools.0, &current_pools)
+    {
         Ok(binding) => binding,
         Err(error) => return file_store_error(error),
     };
     let path = format!("/files/{}", urlencoding::encode(&binding.metadata.id));
     let upstream = match state
         .provider
-        .call_public_api_for_credential(binding.credential_id, reqwest::Method::DELETE, &path, None)
+        .call_public_api_for_credential(
+            binding.credential_id,
+            reqwest::Method::DELETE,
+            &path,
+            None,
+            Some(&allowed_pools.0),
+        )
         .await
     {
         Ok(upstream) => upstream,
@@ -207,7 +231,7 @@ pub async fn delete_file(
     }
     if let Err(error) = state
         .file_store
-        .remove(&binding.metadata.id, &allowed_pools.0)
+        .remove(&binding.metadata.id, binding.credential_id)
     {
         return file_store_error(error);
     }
@@ -224,7 +248,11 @@ pub async fn get_file_content(
     axum::extract::Extension(allowed_pools): axum::extract::Extension<AllowedPools>,
     Path(file_id): Path<String>,
 ) -> Response {
-    if let Err(error) = state.file_store.binding_for(&file_id, &allowed_pools.0) {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    if let Err(error) = state
+        .file_store
+        .binding_for(&file_id, &allowed_pools.0, &current_pools)
+    {
         return file_store_error(error);
     }
     (
@@ -473,10 +501,12 @@ pub async fn count_tokens(
 ) -> Response {
     // Token 估算器本身不展开文件字节，但仍检查 file_id 存在、可访问且来自
     // 同一凭据，确保 count_tokens 与真正 Messages 请求的权限语义一致。
-    if let Err(error) = state
-        .file_store
-        .credential_for_messages(&payload.messages, &allowed_pools.0)
-    {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    if let Err(error) = state.file_store.credential_for_messages(
+        &payload.messages,
+        &allowed_pools.0,
+        &current_pools,
+    ) {
         return file_store_error(error);
     }
     let input_tokens = token::count_all_tokens(
@@ -495,10 +525,12 @@ pub async fn post_messages(
     axum::extract::Extension(api_key_info): axum::extract::Extension<ApiKeyInfo>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    let file_credential_id = match state
-        .file_store
-        .credential_for_messages(&payload.messages, &allowed_pools.0)
-    {
+    let current_pools = |credential_id| state.provider.credential_pools(credential_id).ok();
+    let file_credential_id = match state.file_store.credential_for_messages(
+        &payload.messages,
+        &allowed_pools.0,
+        &current_pools,
+    ) {
         Ok(credential_id) => credential_id,
         Err(error) => return file_store_error(error),
     };

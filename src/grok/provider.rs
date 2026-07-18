@@ -127,7 +127,6 @@ pub enum GrokCredentialRoute {
 struct VideoJob {
     upstream_request_id: String,
     credential_id: u64,
-    pools: Vec<String>,
     created_at: Instant,
 }
 
@@ -322,6 +321,17 @@ impl GrokProvider {
                     break 'credentials;
                 }
                 total_attempts += 1;
+                if let Err(error) = self.token_manager.ensure_credential_eligible(
+                    credential_id,
+                    Some(model),
+                    reasoning_effort,
+                    Some(backend),
+                    requires_backend_search,
+                    allowed_pools,
+                ) {
+                    last_error = Some(error);
+                    break;
+                }
                 let context = match self.token_manager.acquire_context_for(credential_id).await {
                     Ok(context) => context,
                     Err(error) => {
@@ -384,6 +394,18 @@ impl GrokProvider {
                     &context.token,
                     cli_chat_proxy,
                 );
+
+                if let Err(error) = self.token_manager.ensure_credential_eligible(
+                    context.id,
+                    Some(model),
+                    reasoning_effort,
+                    Some(backend),
+                    requires_backend_search,
+                    allowed_pools,
+                ) {
+                    last_error = Some(error);
+                    break;
+                }
 
                 let response = match request.send().await {
                     Ok(response) => response,
@@ -497,6 +519,17 @@ impl GrokProvider {
                     break;
                 }
             };
+            if let Err(error) = self.token_manager.ensure_credential_eligible(
+                context.id,
+                None,
+                None,
+                Some(GrokApiBackend::Responses),
+                false,
+                allowed_pools,
+            ) {
+                last_error = Some(error);
+                continue;
+            }
             let response = match self.public_multipart_request(
                 &context,
                 "/files",
@@ -596,6 +629,17 @@ impl GrokProvider {
                     break;
                 }
             };
+            if let Err(error) = self.token_manager.ensure_credential_eligible(
+                context.id,
+                None,
+                None,
+                None,
+                false,
+                allowed_pools,
+            ) {
+                last_error = Some(error);
+                continue;
+            }
             let response = match self.public_request(&context, method.clone(), path, body) {
                 Ok(request) => match request.send().await {
                     Ok(response) => response,
@@ -679,6 +723,7 @@ impl GrokProvider {
         method: Method,
         path: &str,
         body: Option<&Value>,
+        allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
         let mut last_error = None;
         let mut forced_refresh = false;
@@ -691,6 +736,14 @@ impl GrokProvider {
                     break;
                 }
             };
+            self.token_manager.ensure_credential_eligible(
+                context.id,
+                None,
+                None,
+                None,
+                false,
+                allowed_pools,
+            )?;
             let response = match self.public_request(&context, method.clone(), path, body) {
                 Ok(request) => match request.send().await {
                     Ok(response) => response,
@@ -756,7 +809,8 @@ impl GrokProvider {
     }
 
     /// 将 xAI 的视频 request id 包装成不可猜测的代理 id，并绑定创建任务的
-    /// 实际凭据资源池。调用方只需轮询这个 opaque id。
+    /// 实际凭据。调用方只需轮询这个 opaque id；资源池授权在每次轮询时查询
+    /// 凭据实时配置。
     pub fn register_video_job(
         &self,
         upstream_request_id: &str,
@@ -766,11 +820,9 @@ impl GrokProvider {
         if upstream_request_id.is_empty() {
             anyhow::bail!("xAI 视频生成响应缺少 request_id");
         }
-        let pools = self
-            .token_manager
-            .credential(credential_id)
-            .map(|credential| credential.effective_pools())
-            .ok_or_else(|| anyhow::anyhow!("创建视频任务的 Grok 凭据已不存在"))?;
+        if self.token_manager.credential(credential_id).is_none() {
+            anyhow::bail!("创建视频任务的 Grok 凭据已不存在");
+        }
         let request_id = format!("video_{}", Uuid::new_v4().simple());
         let mut jobs = self.video_jobs.lock();
         cleanup_video_jobs(&mut jobs);
@@ -779,7 +831,6 @@ impl GrokProvider {
             VideoJob {
                 upstream_request_id: upstream_request_id.to_string(),
                 credential_id,
-                pools,
                 created_at: Instant::now(),
             },
         );
@@ -795,19 +846,31 @@ impl GrokProvider {
         let job = {
             let mut jobs = self.video_jobs.lock();
             cleanup_video_jobs(&mut jobs);
-            let job = jobs
-                .get(request_id)
+            jobs.get(request_id)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("视频任务不存在或已过期"))?;
-            if !job.pools.iter().any(|pool| allowed_pools.contains(pool)) {
-                anyhow::bail!("当前 API Key 无权访问该视频任务");
-            }
-            job
+                .ok_or_else(|| anyhow::anyhow!("视频任务不存在或已过期"))?
         };
+        let current_pools = self
+            .token_manager
+            .credential(job.credential_id)
+            .map(|credential| credential.effective_pools())
+            .ok_or_else(|| anyhow::anyhow!("视频任务所用的 Grok 凭据已不存在"))?;
+        if !current_pools
+            .iter()
+            .any(|pool| allowed_pools.contains(pool))
+        {
+            anyhow::bail!("当前 API Key 无权访问该视频任务");
+        }
         let encoded_request_id = urlencoding::encode(&job.upstream_request_id);
         let path = format!("/videos/{encoded_request_id}");
-        self.call_public_api_for_credential(job.credential_id, Method::GET, &path, None)
-            .await
+        self.call_public_api_for_credential(
+            job.credential_id,
+            Method::GET,
+            &path,
+            None,
+            Some(allowed_pools),
+        )
+        .await
     }
 
     fn public_request(
@@ -1126,7 +1189,11 @@ pub type SharedGrokProvider = Arc<GrokProvider>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use axum::{
+        Json, Router,
+        http::HeaderMap,
+        routing::{get, post},
+    };
     use serde_json::json;
 
     use crate::model::config::Config;
@@ -1239,6 +1306,64 @@ mod tests {
             2
         );
         assert_eq!(*built_for.lock(), vec![1, 2]);
+
+        server.abort();
+        let _ = std::fs::remove_file(&credentials_path);
+        let _ = std::fs::remove_file(credentials_path.with_extension("reasoning.key"));
+    }
+
+    #[tokio::test]
+    async fn video_job_authorization_uses_current_credential_pools() {
+        async fn video_status() -> Json<Value> {
+            Json(json!({"status":"done"}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/videos/upstream-video", get(video_status)),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = Config::default();
+        config.grok_base_url = format!("http://{address}");
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-rs-video-pool-revocation-{}.json",
+            Uuid::new_v4()
+        ));
+        let manager = Arc::new(
+            GrokTokenManager::new(
+                config,
+                vec![GrokCredentials {
+                    id: Some(1),
+                    access_token: Some("token-one".to_string()),
+                    pools: Some(vec!["team-a".to_string()]),
+                    ..Default::default()
+                }],
+                None,
+                credentials_path.clone(),
+            )
+            .unwrap(),
+        );
+        let provider = GrokProvider::new(manager.clone(), None).unwrap();
+        let request_id = provider.register_video_job("upstream-video", 1).unwrap();
+
+        manager.set_pools(1, vec!["team-b".to_string()]).unwrap();
+        let old_pool_error = provider
+            .poll_video_job(&request_id, &["team-a".to_string()])
+            .await
+            .err()
+            .unwrap();
+        assert!(old_pool_error.to_string().contains("无权访问"));
+
+        let upstream = provider
+            .poll_video_job(&request_id, &["team-b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(upstream.response.status(), reqwest::StatusCode::OK);
 
         server.abort();
         let _ = std::fs::remove_file(&credentials_path);
