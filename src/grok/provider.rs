@@ -39,6 +39,81 @@ pub struct GrokUpstreamResponse {
     pub credential_id: u64,
 }
 
+/// 可由 HTTP handler 稳定映射的上游响应错误。状态码和类别来自实际
+/// `reqwest::Response`，不再要求调用方从包含任意响应正文的文案中猜测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokProviderError {
+    operation: String,
+    status: reqwest::StatusCode,
+    kind: GrokProviderErrorKind,
+    body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokProviderErrorKind {
+    Authentication,
+    Permission,
+    NotFound,
+    Quota,
+    RateLimit,
+    InvalidRequest,
+    RequestTimeout,
+    Upstream,
+}
+
+impl GrokProviderError {
+    pub fn from_upstream(
+        operation: impl Into<String>,
+        status: reqwest::StatusCode,
+        body: impl Into<String>,
+    ) -> Self {
+        let body = body.into();
+        let kind = if is_quota_exhausted(status.as_u16(), &body) {
+            GrokProviderErrorKind::Quota
+        } else {
+            match status.as_u16() {
+                401 => GrokProviderErrorKind::Authentication,
+                403 => GrokProviderErrorKind::Permission,
+                404 => GrokProviderErrorKind::NotFound,
+                408 => GrokProviderErrorKind::RequestTimeout,
+                429 => GrokProviderErrorKind::RateLimit,
+                400..=499 => GrokProviderErrorKind::InvalidRequest,
+                _ => GrokProviderErrorKind::Upstream,
+            }
+        };
+        Self {
+            operation: operation.into(),
+            status,
+            kind,
+            body,
+        }
+    }
+
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    pub fn kind(&self) -> GrokProviderErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for GrokProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.body.trim().is_empty() {
+            write!(formatter, "{}: {}", self.operation, self.status)
+        } else {
+            write!(
+                formatter,
+                "{}: {} {}",
+                self.operation, self.status, self.body
+            )
+        }
+    }
+}
+
+impl std::error::Error for GrokProviderError {}
+
 /// 一次 Messages 请求的凭据约束。Files 等上游资源只能由创建账号消费，必须
 /// Required；普通推理仅把会话账号作为 Preferred，发生可重试错误时允许切换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,11 +409,10 @@ impl GrokProvider {
                 let response_body = response.text().await.unwrap_or_default();
                 if is_quota_exhausted(status.as_u16(), &response_body) {
                     self.token_manager.report_quota_exhausted(context.id);
-                    last_error = Some(anyhow::anyhow!(
-                        "xAI {} API 配额已用尽: {} {}",
-                        backend.as_str(),
+                    last_error = Some(provider_http_error(
+                        format!("xAI {} API 配额已用尽", backend.as_str()),
                         status,
-                        response_body
+                        &response_body,
                     ));
                     break;
                 }
@@ -366,11 +440,10 @@ impl GrokProvider {
                     || status.as_u16() == 400 && response_body.contains("encrypted_content");
                 if retryable {
                     self.token_manager.report_failure(context.id);
-                    last_error = Some(anyhow::anyhow!(
-                        "xAI {} API 请求失败: {} {}",
-                        backend.as_str(),
+                    last_error = Some(provider_http_error(
+                        format!("xAI {} API 请求失败", backend.as_str()),
                         status,
-                        response_body
+                        &response_body,
                     ));
                     if credential_attempt + 1 < MAX_RETRIES_PER_CREDENTIAL {
                         sleep(retry_delay(credential_attempt)).await;
@@ -378,11 +451,10 @@ impl GrokProvider {
                     continue;
                 }
 
-                return Err(anyhow::anyhow!(
-                    "xAI {} API 请求失败: {} {}",
-                    backend.as_str(),
+                return Err(provider_http_error(
+                    format!("xAI {} API 请求失败", backend.as_str()),
                     status,
-                    response_body
+                    &response_body,
                 ));
             }
         }
@@ -858,7 +930,7 @@ impl GrokProvider {
             if report_runtime_result {
                 self.token_manager.report_failure(context.id);
             }
-            anyhow::bail!("xAI /models 请求失败: {} {}", status, body);
+            return Err(provider_http_error("xAI /models 请求失败", status, &body));
         }
         if report_runtime_result {
             self.token_manager.report_success(context.id);
@@ -975,7 +1047,7 @@ impl GrokProvider {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             self.token_manager.report_failure(context.id);
-            anyhow::bail!("xAI billing 请求失败: {} {}", status, body);
+            return Err(provider_http_error("xAI billing 请求失败", status, &body));
         }
         self.token_manager.report_success(context.id);
         Ok(response.json().await.context("解析 xAI billing 响应失败")?)
@@ -1008,7 +1080,15 @@ fn cleanup_video_jobs(jobs: &mut HashMap<String, VideoJob>) {
 }
 
 fn public_api_error(path: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    anyhow::anyhow!("xAI 公共 API 请求失败: {status} {path} {body}")
+    provider_http_error(format!("xAI 公共 API 请求失败: {path}"), status, body)
+}
+
+fn provider_http_error(
+    operation: impl Into<String>,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    GrokProviderError::from_upstream(operation, status, body).into()
 }
 
 fn retry_delay(attempt: usize) -> Duration {

@@ -27,7 +27,9 @@ use super::media::{
     build_image_edit_body, build_image_generation_body, build_video_generation_body,
 };
 use super::model_catalog::{GrokApiBackend, GrokModelCatalog, ReasoningEffort};
-use super::provider::{GrokCredentialRoute, GrokUpstreamResponse};
+use super::provider::{
+    GrokCredentialRoute, GrokProviderError, GrokProviderErrorKind, GrokUpstreamResponse,
+};
 use super::reasoning_sig::{ReasoningSignatureCodec, latest_verified_route_credential};
 use super::router::{AllowedPools, ApiKeyInfo, GrokAppState};
 use super::stream::{AnthropicSseFailure, AnthropicSseObserver, GrokStreamContext, XaiSseDecoder};
@@ -1091,68 +1093,34 @@ fn create_messages_sse_stream(
 
 fn map_provider_error(error: anyhow::Error) -> Response {
     let message = error.to_string();
-    let status = status_from_provider_message(&message);
-    (status, Json(ErrorResponse::new("api_error", message))).into_response()
-}
-
-/// 从 provider 错误文案中提取 HTTP 状态；优先识别数字状态码，再回退中文语义。
-fn status_from_provider_message(message: &str) -> StatusCode {
-    for code in [401_u16, 403, 404, 408, 413, 422, 429, 400, 500, 502, 503] {
-        let patterns = [
-            format!("请求失败: {code}"),
-            format!(": {code} "),
-            format!(" {code} "),
-            format!(" {code}\n"),
-            format!("API 请求失败: {code}"),
-        ];
-        if patterns.iter().any(|pattern| message.contains(pattern.as_str()))
-            || message.contains(&format!(": {code}"))
-                && message
-                    .split(": ")
-                    .any(|part| part.starts_with(&format!("{code} ")) || part == code.to_string())
-        {
-            // 上游 5xx 对客户端仍映射为 502。
-            return match code {
-                500 | 502 | 503 => StatusCode::BAD_GATEWAY,
-                other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
-            };
-        }
+    if let Some(provider_error) = error.downcast_ref::<GrokProviderError>() {
+        let upstream_status = StatusCode::from_u16(provider_error.status().as_u16())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = if upstream_status.is_client_error() {
+            upstream_status
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        let error_type = match provider_error.kind() {
+            GrokProviderErrorKind::Authentication => "authentication_error",
+            GrokProviderErrorKind::Permission => "permission_error",
+            GrokProviderErrorKind::NotFound => "not_found_error",
+            GrokProviderErrorKind::Quota | GrokProviderErrorKind::RateLimit => "rate_limit_error",
+            GrokProviderErrorKind::InvalidRequest => "invalid_request_error",
+            GrokProviderErrorKind::RequestTimeout | GrokProviderErrorKind::Upstream => "api_error",
+        };
+        return (status, Json(ErrorResponse::new(error_type, message))).into_response();
     }
-    // reqwest::StatusCode Display 形如 "401 Unauthorized"
-    for (code, status) in [
-        (401, StatusCode::UNAUTHORIZED),
-        (403, StatusCode::FORBIDDEN),
-        (404, StatusCode::NOT_FOUND),
-        (429, StatusCode::TOO_MANY_REQUESTS),
-        (400, StatusCode::BAD_REQUEST),
-        (413, StatusCode::PAYLOAD_TOO_LARGE),
-        (422, StatusCode::UNPROCESSABLE_ENTITY),
-        (408, StatusCode::REQUEST_TIMEOUT),
-    ] {
-        if message.contains(&format!("{code} ")) || message.ends_with(&code.to_string()) {
-            // 避免把 body 里的随机数字误判：要求出现标准短语或 "请求失败"
-            if message.contains("Unauthorized")
-                || message.contains("Forbidden")
-                || message.contains("Not Found")
-                || message.contains("Too Many Requests")
-                || message.contains("Bad Request")
-                || message.contains("请求失败")
-                || message.contains("API 请求失败")
-                || message.contains("配额")
-            {
-                return status;
-            }
-        }
-    }
-    if message.contains("无权访问") {
-        StatusCode::FORBIDDEN
+    let (status, error_type) = if message.contains("无权访问") {
+        (StatusCode::FORBIDDEN, "permission_error")
     } else if message.contains("视频任务不存在或已过期") {
-        StatusCode::NOT_FOUND
+        (StatusCode::NOT_FOUND, "not_found_error")
     } else if message.contains("没有可用") || message.contains("未配置 Grok 凭据") {
-        StatusCode::SERVICE_UNAVAILABLE
+        (StatusCode::SERVICE_UNAVAILABLE, "api_error")
     } else {
-        StatusCode::BAD_GATEWAY
-    }
+        (StatusCode::BAD_GATEWAY, "api_error")
+    };
+    (status, Json(ErrorResponse::new(error_type, message))).into_response()
 }
 
 fn file_store_error(error: FileStoreError) -> Response {
@@ -1341,18 +1309,37 @@ mod tests {
     }
 
     #[test]
-    fn status_mapping_recognizes_401_and_429() {
+    fn typed_provider_errors_map_status_without_scanning_messages() {
         assert_eq!(
-            status_from_provider_message("xAI responses API 请求失败: 401 Unauthorized {}"),
+            map_provider_error(
+                GrokProviderError::from_upstream(
+                    "xAI responses API 请求失败",
+                    StatusCode::UNAUTHORIZED,
+                    r#"{"request_id":429}"#,
+                )
+                .into(),
+            )
+            .status(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            status_from_provider_message("xAI responses API 请求失败: 429 Too Many Requests {}"),
-            StatusCode::TOO_MANY_REQUESTS
+            map_provider_error(
+                GrokProviderError::from_upstream(
+                    "xAI responses API 配额已用尽",
+                    StatusCode::PAYMENT_REQUIRED,
+                    r#"{"remaining":0}"#,
+                )
+                .into(),
+            )
+            .status(),
+            StatusCode::PAYMENT_REQUIRED
         );
         assert_eq!(
-            status_from_provider_message("xAI responses API 请求失败: 403 Forbidden {}"),
-            StatusCode::FORBIDDEN
+            map_provider_error(anyhow::anyhow!(
+                "连接被对端关闭；响应正文碰巧包含 401 Unauthorized 和 429"
+            ))
+            .status(),
+            StatusCode::BAD_GATEWAY
         );
     }
 }
