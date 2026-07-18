@@ -276,6 +276,10 @@ pub struct ImageSource {
     /// 字段，因此保持可选且不影响既有请求。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Anthropic Files API 的已上传文件 ID。`source.type = "file"` 时使用；
+    /// `/grok` 会把它映射为 xAI Responses 的 `input_file.file_id`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

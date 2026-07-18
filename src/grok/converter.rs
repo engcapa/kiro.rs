@@ -31,6 +31,7 @@ pub enum ConversionError {
     },
     WebSearchRequiresResponses(String),
     WebSearchUnsupported(String),
+    FilesRequireResponses(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -54,6 +55,10 @@ impl std::fmt::Display for ConversionError {
                 formatter,
                 "模型 {model} 的 Grok Build catalog 未声明 supportsBackendSearch，无法启用 hosted web_search"
             ),
+            Self::FilesRequireResponses(model) => write!(
+                formatter,
+                "模型 {model} 使用非 Responses backend；Anthropic source.type=file 需要 xAI Responses backend"
+            ),
         }
     }
 }
@@ -76,6 +81,13 @@ pub fn convert_request(
         // 真实 catalog 尚未拉取时沿用已有 `/responses` 兼容行为；真实
         // catalog 一到位后则严格按它的 apiBackend 分派。
         .unwrap_or(GrokApiBackend::Responses);
+    let requests_file_inputs = request_has_file_inputs(request);
+    // xAI 公开文档把上传的 file_id 定义在 Responses 的 `input_file` item。
+    // Chat Completions 没有等价稳定字段；Messages catalog backend 虽然形状接近
+    // Anthropic，但文件实际存储在 xAI Files API，不能假定其会识别同一 source。
+    if requests_file_inputs && backend != GrokApiBackend::Responses {
+        return Err(ConversionError::FilesRequireResponses(model));
+    }
     let requests_web_search = request
         .tools
         .as_ref()
@@ -493,11 +505,32 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
                     "output": value_to_text(&block.content.unwrap_or(Value::Null)),
                 }));
             }
-            "image" | "image_url" => {
+            "image" => {
+                if let Some(file_id) = file_id_from_block(&block) {
+                    content_parts.push(json!({
+                        "type": "input_file",
+                        "file_id": file_id,
+                    }));
+                } else if let Some(url) = image_url_from_block(&block) {
+                    content_parts.push(json!({
+                        "type": "input_image",
+                        "image_url": url,
+                    }));
+                }
+            }
+            "image_url" => {
                 if let Some(url) = image_url_from_block(&block) {
                     content_parts.push(json!({
                         "type": "input_image",
                         "image_url": url,
+                    }));
+                }
+            }
+            "document" => {
+                if let Some(file_id) = file_id_from_block(&block) {
+                    content_parts.push(json!({
+                        "type": "input_file",
+                        "file_id": file_id,
                     }));
                 }
             }
@@ -623,6 +656,30 @@ fn image_url_from_block(block: &ContentBlock) -> Option<String> {
             .and_then(non_empty_trimmed),
         _ => None,
     }
+}
+
+/// Anthropic Files API 的 image/document source。
+fn file_id_from_block(block: &ContentBlock) -> Option<String> {
+    let source = block.source.as_ref()?;
+    if source.source_type.trim() != "file" {
+        return None;
+    }
+    source.file_id.as_deref().and_then(non_empty_trimmed)
+}
+
+fn request_has_file_inputs(request: &MessagesRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .and_then(|source| source.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|source_type| source_type == "file")
+            })
+        })
+    })
 }
 
 fn non_empty_trimmed(value: &str) -> Option<String> {
@@ -973,6 +1030,70 @@ mod tests {
             content[3]["image_url"],
             "https://example.com/openai-shape.jpg"
         );
+    }
+
+    #[test]
+    fn converts_anthropic_file_sources_to_xai_input_files() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"text","text":"compare these files"},
+                    {"type":"image","source":{"type":"file","file_id":"file_image"}},
+                    {"type":"document","source":{"type":"file","file_id":"file_document"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        let content = converted.body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[1],
+            json!({"type":"input_file","file_id":"file_image"})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"input_file","file_id":"file_document"})
+        );
+    }
+
+    #[test]
+    fn rejects_file_sources_for_non_responses_catalog_models() {
+        let request = MessagesRequest {
+            model: "grok-chat".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"document","source":{"type":"file","file_id":"file_document"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{"model":"grok-chat","apiBackend":"chat_completions"}]}),
+            "https://api.x.ai/v1",
+        );
+
+        assert!(matches!(
+            convert_request(&request, "grok-4.5", Some(&catalog)),
+            Err(ConversionError::FilesRequireResponses(model)) if model == "grok-chat"
+        ));
     }
 
     #[test]

@@ -321,11 +321,14 @@ async fn main() {
     tracing::info!("  GET  /grok/v1/models");
     tracing::info!("  POST /grok/v1/messages");
     tracing::info!("  POST /grok/v1/messages/count_tokens");
+    tracing::info!("  GET/POST /grok/v1/files");
+    tracing::info!("  GET/DELETE /grok/v1/files/:file_id");
     tracing::info!("  POST /grok/v1/images/generations");
     tracing::info!("  POST /grok/v1/images/edits");
     tracing::info!("  POST /grok/v1/videos/generations");
     tracing::info!("  GET  /grok/v1/videos/:request_id");
     tracing::info!("  POST /grok/cc/v1/messages");
+    tracing::info!("  GET/POST /grok/cc/v1/files (Files API alias)");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");

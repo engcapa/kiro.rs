@@ -467,12 +467,16 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/grok/v1/models` | GET | 返回所有已加载凭据目录的模型并集；目录未加载时返回 bootstrap 清单 |
 | `/grok/v1/messages` | POST | Anthropic Messages → catalog 指定的 xAI Responses / Chat Completions / Messages，支持流式、工具调用、图片与 thinking |
 | `/grok/v1/messages/count_tokens` | POST | 估算请求 Token 数量 |
+| `/grok/v1/files` | GET, POST | Anthropic Files API：列出本代理上传的文件，或以 multipart 上传文件 |
+| `/grok/v1/files/{file_id}` | GET, DELETE | 查询元数据或删除文件 |
+| `/grok/v1/files/{file_id}/content` | GET | 路由已兼容；调用方上传的文件为 `downloadable=false`，因此返回 400 |
 | `/grok/v1/images/generations` | POST | Grok Build Imagine 文生图扩展；返回 xAI `data[].b64_json` |
 | `/grok/v1/images/edits` | POST | Grok Build Imagine 图像编辑扩展，支持一张或多张参考图 |
 | `/grok/v1/videos/generations` | POST | Grok Build image-to-video / reference-to-video 扩展，返回可轮询任务 ID |
 | `/grok/v1/videos/{request_id}` | GET | 轮询视频生成状态；完成时返回 xAI `video.url` |
 | `/grok/cc/v1/messages` | POST | Claude Code 兼容路径 |
 | `/grok/cc/v1/messages/count_tokens` | POST | Token 估算 |
+| `/grok/cc/v1/files*` | GET, POST, DELETE | 与 `/grok/v1/files*` 使用同一存储的 Claude Code 路径别名 |
 
 请求模型名为 `claude-*`、`grok-build` 或为空时，会使用 `grokDefaultModel`；其他模型会
 按已加载 catalog 的实际 wire model ID、显示名或唯一简写规范化（例如 catalog 中唯一的
@@ -516,6 +520,61 @@ backend 没有 Grok Build 的 hosted-tools 通道，因此此组合会明确返�
 `responses` 的模型，而不会悄悄降级成普通 function。
 `max_uses` 会被接受以兼容 Anthropic 请求，但 xAI Responses 没有对应 wire 字段，实际调用次数由
 xAI 的 hosted-tool sampler 决定。
+
+#### Anthropic Files API（`source.type: "file"`）
+
+`/grok/v1/files` 兼容 Anthropic Files API 的上传、列出、查询和删除流程；标准
+Anthropic SDK 发送的 `anthropic-beta: files-api-2025-04-14` 会被接受。文件字节直接上传到
+xAI `/v1/files`，代理只保存 `file_id → 创建 xAI 凭据` 的绑定，因此轮询凭据池时仍能回到
+正确的 xAI 账号。`/grok/cc/v1/files` 是相同存储的别名，供 Claude Code 将 base URL 指向
+`/grok/cc` 时使用。
+
+```bash
+# 上传：单个 multipart file 字段，最大 50 MiB
+curl -X POST http://127.0.0.1:8080/grok/v1/files \
+  -H 'x-api-key: <apiKey>' \
+  -H 'anthropic-beta: files-api-2025-04-14' \
+  -F 'file=@./architecture.pdf;type=application/pdf'
+
+# 结果包含 Anthropic 风格的 {"id":"file_...","type":"file",...}
+curl -H 'x-api-key: <apiKey>' \
+  http://127.0.0.1:8080/grok/v1/files
+```
+
+把上传返回的 `id` 放入标准 Anthropic Messages content block 即可。`image` 和 `document`
+均支持，代理会分别统一映射为 xAI Responses 的 `input_file.file_id`；xAI 会自动进行文件/文档
+搜索和推理，不会把文件字节塞进 prompt。
+
+```json
+{
+  "model": "grok-4.5",
+  "max_tokens": 2048,
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "image", "source": {"type": "file", "file_id": "file_image"}},
+      {"type": "document", "source": {"type": "file", "file_id": "file_report"}},
+      {"type": "text", "text": "比较图片与报告中的结论"}
+    ]
+  }]
+}
+```
+
+有几个与多凭据和上游协议相关的边界：
+
+- 文件输入只适用于 catalog 标记为 `responses` 的模型；`chat_completions` 和 `messages` backend
+  会在请求前返回 400，而不是发送无效 payload。
+- 一个 Messages 请求中的全部 `file_id` 必须来自同一张 Grok 凭据；若需要跨账号文件，请分开请求或用
+  同一凭据重新上传。
+- 默认在进程工作目录保存 `grok_file_bindings.json`，其中只有文件元数据和凭据/资源池绑定、不含文件
+  字节；可用 `GROK_FILE_BINDINGS_PATH` 改到持久卷。删除这个注册表或直接绕过代理上传的 xAI 文件，代理
+  无法安全判断应使用哪张凭据，因而不能在 `/grok` Messages 中引用。
+- `GET /files` 只列出经本代理上传、且当前 API Key 资源池可访问的文件。调用方上传的文件与 Anthropic
+  语义一致为 `downloadable=false`，所以 `GET /files/{file_id}/content` 返回 400；模型生成文件的注册/下载
+  尚未实现。
+
+协议细节分别可参照 [Anthropic Files API](https://platform.claude.com/docs/en/build-with-claude/files)
+与 [xAI Chat with Files](https://docs.x.ai/developers/model-capabilities/files/chat-with-files)。
 
 #### 图片输入与 Imagine 图片/视频生成
 

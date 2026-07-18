@@ -16,13 +16,18 @@ use crate::anthropic::types::ErrorResponse;
 use crate::common::auth;
 use crate::model::api_key_manager::ApiKeyManager;
 
+use super::files::{GrokFileStore, MAX_UPLOAD_BYTES};
 use super::handlers::{
-    count_tokens, get_models, get_video_generation, post_image_edits, post_image_generations,
-    post_messages, post_messages_cc, post_video_generations,
+    count_tokens, delete_file, get_file, get_file_content, get_files, get_models,
+    get_video_generation, post_files, post_image_edits, post_image_generations, post_messages,
+    post_messages_cc, post_video_generations,
 };
 use super::provider::SharedGrokProvider;
 
-const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
+/// 包含 multipart boundary、文件名与表单字段后的总请求体上限。xAI 的文件
+/// 本体可达 `MAX_UPLOAD_BYTES`，因此这里多留 2 MiB，避免合法 50 MiB 文件
+/// 被代理层提前拒绝。
+const MAX_BODY_SIZE: usize = MAX_UPLOAD_BYTES + 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct GrokAppState {
@@ -31,6 +36,8 @@ pub struct GrokAppState {
     pub default_model: String,
     pub extract_thinking: bool,
     pub api_key_manager: Option<Arc<ApiKeyManager>>,
+    /// Anthropic `file_id` 与创建它的 xAI credential 的持久化绑定。
+    pub file_store: GrokFileStore,
 }
 
 impl GrokAppState {
@@ -47,6 +54,7 @@ impl GrokAppState {
             default_model: default_model.into(),
             extract_thinking,
             api_key_manager,
+            file_store: GrokFileStore::default(),
         }
     }
 }
@@ -78,6 +86,9 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        .route("/files", get(get_files).post(post_files))
+        .route("/files/{file_id}/content", get(get_file_content))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
         // Grok Build 的 Imagine 工具使用独立 xAI endpoint；这些路由保留
         // Anthropic `/messages` 兼容性，同时给需要媒体生成的调用方一个
         // 不伪造 content block 的 Build-style API。
@@ -92,6 +103,11 @@ pub fn create_router_with_provider(
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
+        // Claude Code 兼容的 base URL 有时会指向 `/grok/cc`，所以 Files API
+        // 也作为同一存储的别名暴露，避免上传和 Messages 落在不同前缀。
+        .route("/files", get(get_files).post(post_files))
+        .route("/files/{file_id}/content", get(get_file_content))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -4,6 +4,8 @@
 /config.json
 /credentials.json
 /grok_credentials.json
+/grok_file_bindings.json
+/grok_file_bindings.json.tmp.*
 /.idea
 /test.json
 /admin-ui/node_modules/

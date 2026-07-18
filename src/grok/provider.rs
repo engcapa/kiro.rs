@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use bytes::Bytes;
 use futures::future::join_all;
 use parking_lot::Mutex;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Method, RequestBuilder, multipart};
 use serde_json::Value;
 use tokio::time::sleep;
 use url::Url;
@@ -179,24 +180,51 @@ impl GrokProvider {
         reasoning_effort: Option<ReasoningEffort>,
         requires_backend_search: bool,
         allowed_pools: Option<&[String]>,
+        pinned_credential_id: Option<u64>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
         let total = self.token_manager.total_count();
-        let max_retries = (total * MAX_RETRIES_PER_CREDENTIAL).clamp(1, MAX_TOTAL_RETRIES);
+        let max_retries = if pinned_credential_id.is_some() {
+            MAX_RETRIES_PER_CREDENTIAL
+        } else {
+            (total * MAX_RETRIES_PER_CREDENTIAL).clamp(1, MAX_TOTAL_RETRIES)
+        };
         let mut last_error = None;
         let mut forced_refresh = HashSet::new();
 
+        if let Some(credential_id) = pinned_credential_id {
+            if self.token_manager.credential(credential_id).is_none() {
+                anyhow::bail!("文件绑定的 Grok 凭据 #{credential_id} 已不存在");
+            }
+            if let Some(catalog) = self.token_manager.catalog_for(credential_id) {
+                let file_model = catalog.model_by_id(model).ok_or_else(|| {
+                    anyhow::anyhow!("上传文件所用的 Grok 凭据 #{credential_id} 不支持模型 {model}")
+                })?;
+                if file_model.api_backend != backend {
+                    anyhow::bail!(
+                        "上传文件所用的 Grok 凭据 #{credential_id} 对模型 {model} 使用 {} backend，无法按当前 {} backend 请求",
+                        file_model.api_backend.as_str(),
+                        backend.as_str()
+                    );
+                }
+            }
+        }
+
         for attempt in 0..max_retries {
-            let context = match self
-                .token_manager
-                .acquire_context(
-                    Some(model),
-                    reasoning_effort,
-                    Some(backend),
-                    requires_backend_search,
-                    allowed_pools,
-                )
-                .await
-            {
+            let context_result = match pinned_credential_id {
+                Some(credential_id) => self.token_manager.acquire_context_for(credential_id).await,
+                None => {
+                    self.token_manager
+                        .acquire_context(
+                            Some(model),
+                            reasoning_effort,
+                            Some(backend),
+                            requires_backend_search,
+                            allowed_pools,
+                        )
+                        .await
+                }
+            };
+            let context = match context_result {
                 Ok(context) => context,
                 Err(error) => {
                     last_error = Some(error);
@@ -330,7 +358,102 @@ impl GrokProvider {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI {} API 请求失败", backend.as_str())))
     }
 
-    /// 调用 Grok Build 的公共 Imagine API（`/images/*`、`/videos/*`）。
+    /// 上传文件到 xAI 公共 Files API。上传不是幂等操作：网络中断时无法判断
+    /// 服务端是否已保存文件，因此不自动重试传输错误，避免同一文件产生多份。
+    /// 已明确返回的配额/认证失败可以安全切换或刷新凭据后再试。
+    pub async fn upload_file(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Bytes,
+        allowed_pools: Option<&[String]>,
+    ) -> anyhow::Result<GrokUpstreamResponse> {
+        let total = self.token_manager.total_count();
+        let max_attempts = (total * MAX_RETRIES_PER_CREDENTIAL).clamp(1, MAX_TOTAL_RETRIES);
+        let mut last_error = None;
+        let mut forced_refresh = HashSet::new();
+
+        for attempt in 0..max_attempts {
+            let context = match self
+                .token_manager
+                .acquire_context(None, None, None, false, allowed_pools)
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            };
+            let response = match self.public_multipart_request(
+                &context,
+                "/files",
+                filename,
+                mime_type,
+                bytes.clone(),
+            ) {
+                Ok(request) => match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "xAI Files 上传连接中断，结果未知；为避免重复上传，代理未自动重试: {error}"
+                        ));
+                    }
+                },
+                Err(error) => return Err(error),
+            };
+            let status = response.status();
+            if status.is_success() {
+                self.token_manager.report_success(context.id);
+                return Ok(GrokUpstreamResponse {
+                    response,
+                    credential_id: context.id,
+                });
+            }
+
+            let response_body = response.text().await.unwrap_or_default();
+            if is_quota_exhausted(status.as_u16(), &response_body) {
+                let available = self.token_manager.report_quota_exhausted(context.id);
+                last_error = Some(public_api_error("/files", status, &response_body));
+                if !available {
+                    break;
+                }
+                continue;
+            }
+            if matches!(status.as_u16(), 401 | 403)
+                && context.credentials.is_oauth()
+                && forced_refresh.insert(context.id)
+            {
+                tracing::info!(
+                    credential_id = context.id,
+                    "xAI Files 上传认证失败，尝试刷新 OAuth token"
+                );
+                if self
+                    .token_manager
+                    .force_refresh_token_for(context.id)
+                    .await
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
+
+            last_error = Some(public_api_error("/files", status, &response_body));
+            if matches!(status.as_u16(), 401 | 403 | 408 | 429) || status.is_server_error() {
+                let available = self.token_manager.report_failure(context.id);
+                if !available || attempt + 1 >= max_attempts {
+                    break;
+                }
+                sleep(retry_delay(attempt)).await;
+                continue;
+            }
+            break;
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI Files 上传失败")))
+    }
+
+    /// 调用 xAI 公共 API（例如 `/images/*`、`/videos/*`）。
     ///
     /// Grok Build 对 API token 和 OAuth session 都直连 `xai_api_base_url`，
     /// 而不是 OAuth 推理所用的 CLI chat proxy。因此这里总以全局
@@ -405,7 +528,7 @@ impl GrokProvider {
                 tracing::info!(
                     credential_id = context.id,
                     path,
-                    "xAI Imagine API 返回认证错误，尝试强制刷新 OAuth token"
+                    "xAI 公共 API 返回认证错误，尝试强制刷新 OAuth token"
                 );
                 if self
                     .token_manager
@@ -433,11 +556,11 @@ impl GrokProvider {
             return Err(public_api_error(path, status, &response_body));
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI Imagine API 请求失败: {path}")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI 公共 API 请求失败: {path}")))
     }
 
-    /// 使用已绑定的凭据调用公共 Imagine API。视频生成任务必须固定到创建
-    /// 它的 OAuth/API token，不能在轮询时被负载均衡到其他账号。
+    /// 使用已绑定的凭据调用 xAI 公共 API。文件或视频任务必须固定到创建
+    /// 它的 OAuth/API token，不能在后续操作时被负载均衡到其他账号。
     pub async fn call_public_api_for_credential(
         &self,
         credential_id: u64,
@@ -493,7 +616,7 @@ impl GrokProvider {
                 tracing::info!(
                     credential_id = context.id,
                     path,
-                    "视频轮询认证失败，尝试刷新 OAuth token"
+                    "xAI 公共 API 认证失败，尝试刷新 OAuth token"
                 );
                 if self
                     .token_manager
@@ -517,7 +640,7 @@ impl GrokProvider {
             }
             break;
         }
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI Imagine API 请求失败: {path}")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("xAI 公共 API 请求失败: {path}")))
     }
 
     /// 将 xAI 的视频 request id 包装成不可猜测的代理 id，并绑定创建任务的
@@ -601,6 +724,45 @@ impl GrokProvider {
             &context.credentials,
             &context.token,
         ))
+    }
+
+    fn public_multipart_request(
+        &self,
+        context: &GrokCallContext,
+        path: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: Bytes,
+    ) -> anyhow::Result<RequestBuilder> {
+        let url = self.public_api_url(path)?;
+        let file_part = multipart::Part::bytes(bytes.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(mime_type)
+            .with_context(|| format!("无效的上传文件 MIME type: {mime_type}"))?;
+        let form = multipart::Form::new()
+            // xAI 的 Files API 兼容 OpenAI 的 purpose 字段；显式固定为
+            // assistants，使 Files storage 可用于 Responses input_file。
+            .text("purpose", "assistants")
+            .part("file", file_part);
+        let request = self
+            .client_for(&context.credentials)?
+            .post(url)
+            .header("accept", "application/json")
+            .multipart(form);
+        Ok(Self::authenticated_media_request(
+            request,
+            &context.credentials,
+            &context.token,
+        ))
+    }
+
+    /// 读取凭据当前 pool 快照，用于把 xAI Files 的访问权绑定到代理 API Key
+    /// 的资源池模型。和视频任务一样，绑定时保存快照避免泄露其他 pool。
+    pub fn credential_pools(&self, credential_id: u64) -> anyhow::Result<Vec<String>> {
+        self.token_manager
+            .credential(credential_id)
+            .map(|credential| credential.effective_pools())
+            .ok_or_else(|| anyhow::anyhow!("Grok 凭据 #{credential_id} 不存在"))
     }
 
     fn public_api_url(&self, path: &str) -> anyhow::Result<String> {
@@ -781,7 +943,12 @@ impl GrokProvider {
 }
 
 fn public_method_is_idempotent(method: &Method) -> bool {
-    method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
+    method == Method::GET
+        || method == Method::HEAD
+        || method == Method::OPTIONS
+        // 删除同一 file/video resource 多次的可见结果相同；对网络中断进行
+        // 有界重试比留下无法清理的 Files orphan 更安全。
+        || method == Method::DELETE
 }
 
 /// 对齐 Grok Build video client：创建任务最长等 60 秒；单次轮询最长等 30
@@ -801,7 +968,7 @@ fn cleanup_video_jobs(jobs: &mut HashMap<String, VideoJob>) {
 }
 
 fn public_api_error(path: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    anyhow::anyhow!("xAI Imagine API 请求失败: {status} {path} {body}")
+    anyhow::anyhow!("xAI 公共 API 请求失败: {status} {path} {body}")
 }
 
 fn retry_delay(attempt: usize) -> Duration {
