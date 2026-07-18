@@ -20,7 +20,7 @@ use crate::anthropic::types::{
 };
 use crate::token;
 
-use super::converter::{convert_request, plan_request};
+use super::converter::{convert_request_for_credential, plan_request};
 use super::files::{FileListQuery, FileMetadata, FileStoreError, MAX_UPLOAD_BYTES};
 use super::media::{
     build_image_edit_body, build_image_generation_body, build_video_generation_body,
@@ -491,10 +491,11 @@ pub async fn post_messages(
     // 规范化为 wire model id，避免目标凭据 catalog 只有正式 id、没有别名。
     payload.model = plan.model.clone();
 
-    let converted = match convert_request(
+    let converted = match convert_request_for_credential(
         &payload,
         &state.default_model,
         routing_catalog.as_deref(),
+        routing_credential_id,
     ) {
         Ok(converted) => converted,
         Err(error) => {
@@ -678,7 +679,10 @@ fn create_sse_stream(
         let response = loop {
             tokio::select! {
                 result = &mut connect => match result {
-                    Ok(response) => break Some(response.response),
+                    Ok(upstream) => {
+                        context.set_credential_id(upstream.credential_id);
+                        break Some(upstream.response);
+                    }
                     Err(error) => {
                         // 已发 message_start：先 error，再收尾未关闭块 / message_stop，
                         // 避免部分客户端挂在半开 message 上。
@@ -775,6 +779,7 @@ async fn non_stream_response(
         Ok(upstream) => upstream,
         Err(error) => return map_provider_error(error),
     };
+    let credential_id = upstream.credential_id;
     let bytes = match upstream.response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -790,6 +795,7 @@ async fn non_stream_response(
     };
 
     let mut context = GrokStreamContext::new(model, input_tokens, thinking_enabled);
+    context.set_credential_id(credential_id);
     let mut decoder = XaiSseDecoder::default();
     let events = decoder.feed(&bytes);
     for event in events.into_iter().chain(decoder.finish()) {

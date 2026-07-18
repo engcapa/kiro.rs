@@ -521,7 +521,7 @@ Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
 | `temperature` / `top_p` / `top_k` | **当前未透传** |
 | `stop_sequences` | **当前未透传** |
 | `source.type=file`（image/document） | 仅 `responses` backend；须先 `/grok/v1/files` 上传 |
-| 多轮 `thinking` + Anthropic `signature` | 历史 thinking 折成可见文本；**不**回放 xAI `encrypted_content`（协议限制，后续另议） |
+| 多轮 `thinking` + `signature` | Responses 请求 `include: reasoning.encrypted_content`；把完整 reasoning items 打包进 `thinking.signature`（`xai-rs1.*`）。Claude Code 原样回传后展开为 Responses reasoning sibling；无包/凭据不匹配时回退为 thinking 文本 |
 
 对于 catalog 为 `responses` 的模型，代理遵循 Grok Build 的请求语义：始终发送
 `reasoning.summary: "concise"`，并把 Anthropic `thinking` 或 `output_config.effort` 映射为

@@ -6,6 +6,9 @@ use uuid::Uuid;
 use crate::anthropic::types::{ContentBlock, MessagesRequest, Tool};
 
 use super::model_catalog::{GrokApiBackend, GrokModel, GrokModelCatalog, ReasoningEffort};
+use super::reasoning_sig::{
+    decode_signature, package_matches_credential, package_to_input_items,
+};
 
 #[derive(Debug)]
 pub struct ConvertedGrokRequest {
@@ -123,6 +126,17 @@ pub fn convert_request(
     default_model: &str,
     catalog: Option<&GrokModelCatalog>,
 ) -> Result<ConvertedGrokRequest, ConversionError> {
+    convert_request_for_credential(request, default_model, catalog, None)
+}
+
+/// 与 [`convert_request`] 相同，但携带路由凭据 id，用于校验历史
+/// `thinking.signature` 中打包的 xAI reasoning 是否可安全回放。
+pub fn convert_request_for_credential(
+    request: &MessagesRequest,
+    default_model: &str,
+    catalog: Option<&GrokModelCatalog>,
+    replay_credential_id: Option<u64>,
+) -> Result<ConvertedGrokRequest, ConversionError> {
     if request.messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
     }
@@ -166,7 +180,9 @@ pub fn convert_request(
     };
 
     let body = match backend {
-        GrokApiBackend::Responses => build_responses_body(request, &model, reasoning_effort),
+        GrokApiBackend::Responses => {
+            build_responses_body(request, &model, reasoning_effort, replay_credential_id)
+        }
         GrokApiBackend::ChatCompletions => {
             build_chat_completions_body(request, &model, reasoning_effort)
         }
@@ -254,6 +270,7 @@ fn build_responses_body(
     request: &MessagesRequest,
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
+    replay_credential_id: Option<u64>,
 ) -> Value {
     let mut input = Vec::new();
     let mut instructions = Vec::new();
@@ -275,7 +292,9 @@ fn build_responses_body(
                     instructions.push(text);
                 }
             }
-            "assistant" => append_assistant_message(&mut input, &message.content),
+            "assistant" => {
+                append_assistant_message(&mut input, &message.content, replay_credential_id)
+            }
             _ => append_user_message(&mut input, &message.content),
         }
     }
@@ -285,6 +304,9 @@ fn build_responses_body(
         "input": input,
         "max_output_tokens": request.max_tokens.max(1),
         "store": false,
+        // 与 Grok Build sampler 一致：请求 encrypted reasoning，便于 Claude Code
+        // 通过 thinking.signature 原样回传后做多轮 reasoning 回放。
+        "include": ["reasoning.encrypted_content"],
     });
     if !instructions.is_empty() {
         body["instructions"] = Value::String(instructions.join("\n\n"));
@@ -605,7 +627,11 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) {
     flush_message(input, "user", &mut content_parts);
 }
 
-fn append_assistant_message(input: &mut Vec<Value>, content: &Value) {
+fn append_assistant_message(
+    input: &mut Vec<Value>,
+    content: &Value,
+    replay_credential_id: Option<u64>,
+) {
     let blocks = parse_content_blocks(content);
     if blocks.is_empty() {
         let text = value_to_text(content);
@@ -643,9 +669,26 @@ fn append_assistant_message(input: &mut Vec<Value>, content: &Value) {
                     }
                 }
             }
-            // Anthropic thinking 没有可重放的 xAI reasoning item；保留其文本到
-            // assistant 输出，避免历史上下文突然丢失，同时不伪造 xAI 签名。
+            // Claude Code 会原样回传 thinking + signature。若 signature 是我们
+            // 打包的 xai-rs1 完整 reasoning items，则展开为 Responses sibling；
+            // 否则回退为 output_text，避免历史上下文丢失。
             "thinking" => {
+                if let Some(signature) = block.signature.as_deref() {
+                    if let Some(package) = decode_signature(signature) {
+                        if package_matches_credential(&package, replay_credential_id) {
+                            flush_message(input, "assistant", &mut content_parts);
+                            for item in package_to_input_items(&package) {
+                                input.push(item);
+                            }
+                            continue;
+                        }
+                        tracing::debug!(
+                            package_credential = ?package.credential_id,
+                            replay_credential = ?replay_credential_id,
+                            "xai-rs1 reasoning signature 与当前路由凭据不匹配，回退为 thinking 文本"
+                        );
+                    }
+                }
                 if let Some(text) = block.thinking.or(block.text) {
                     if !text.is_empty() {
                         content_parts.push(json!({ "type": "output_text", "text": text }));
@@ -1207,6 +1250,108 @@ mod tests {
             resolve_model("claude-opus-4-6", "grok-4.5", None).unwrap(),
             "grok-4.5"
         );
+    }
+
+    #[test]
+    fn responses_body_includes_encrypted_reasoning_and_replays_signature_items() {
+        use super::super::reasoning_sig::encode_signature;
+
+        let signature = encode_signature(
+            "grok-4.5",
+            Some(3),
+            &[json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "completed",
+                "summary": [{"type":"summary_text","text":"plan"}],
+                "encrypted_content": "enc_blob",
+            })],
+        )
+        .unwrap();
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 128,
+            stream: false,
+            system: None,
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: json!([{
+                        "type": "thinking",
+                        "thinking": "plan",
+                        "signature": signature,
+                    }, {
+                        "type": "text",
+                        "text": "done",
+                    }]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: json!("continue"),
+                },
+            ],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(3)).unwrap();
+        assert_eq!(
+            converted.body["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "enc_blob");
+        assert!(input[0].get("status").is_none());
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "done");
+        assert_eq!(input[2]["role"], "user");
+    }
+
+    #[test]
+    fn mismatched_reasoning_signature_falls_back_to_thinking_text() {
+        use super::super::reasoning_sig::encode_signature;
+
+        let signature = encode_signature(
+            "grok-4.5",
+            Some(1),
+            &[json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_blob",
+            })],
+        )
+        .unwrap();
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "thinking",
+                    "thinking": "visible plan",
+                    "signature": signature,
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(99)).unwrap();
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], "visible plan");
     }
 
     #[test]

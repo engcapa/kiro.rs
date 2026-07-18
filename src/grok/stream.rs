@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::anthropic::{SseEvent, SseStateManager};
 
+use super::reasoning_sig::{encode_signature, extract_reasoning_item};
+
 #[derive(Default)]
 pub struct XaiSseDecoder {
     buffer: String,
@@ -87,10 +89,16 @@ pub struct GrokStreamContext {
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
     thinking_enabled: bool,
+    /// 签发 xai-rs1 signature 时写入，供 Claude Code 多轮回传后做凭据校验。
+    credential_id: Option<u64>,
     text_block_index: Option<i32>,
     thinking_block_index: Option<i32>,
     text: String,
     thinking: String,
+    /// 本轮收集到的完整 xAI reasoning items（含 encrypted_content），按出现顺序。
+    reasoning_items: Vec<Value>,
+    /// 是否已对当前 thinking 块发出 signature_delta（避免重复）。
+    reasoning_signature_emitted: bool,
     tool_blocks: HashMap<String, ToolBlock>,
     tool_aliases: HashMap<String, String>,
     tool_order: Vec<String>,
@@ -110,10 +118,13 @@ impl GrokStreamContext {
             input_tokens: None,
             output_tokens: None,
             thinking_enabled,
+            credential_id: None,
             text_block_index: None,
             thinking_block_index: None,
             text: String::new(),
             thinking: String::new(),
+            reasoning_items: Vec::new(),
+            reasoning_signature_emitted: false,
             tool_blocks: HashMap::new(),
             tool_aliases: HashMap::new(),
             tool_order: Vec::new(),
@@ -122,6 +133,11 @@ impl GrokStreamContext {
             stop_reason: None,
             completed: false,
         }
+    }
+
+    /// 记录实际上游凭据，用于打包 `thinking.signature`。
+    pub fn set_credential_id(&mut self, credential_id: u64) {
+        self.credential_id = Some(credential_id);
     }
 
     pub fn initial_events(&mut self) -> Vec<SseEvent> {
@@ -368,6 +384,12 @@ impl GrokStreamContext {
                 let (key, id, name) = function_call_identity(item, event);
                 self.ensure_tool_block(&key, &id, &name)
             }
+            Some("reasoning") => {
+                // 部分网关在 added 就带 encrypted_content；尽早入库以便关
+                // thinking 前能发出完整 signature。
+                self.record_reasoning_item(item);
+                Vec::new()
+            }
             Some("web_search_call") => {
                 let (key, id, input) = web_search_identity(item, event);
                 // `response.output_item.added` 通常只携带 in_progress 状态；
@@ -414,9 +436,73 @@ impl GrokStreamContext {
                 }
                 events
             }
+            Some("reasoning") => {
+                self.record_reasoning_item(item);
+                // 若流式 summary delta 已发过，这里只补全 encrypted；否则用 summary 文本补展示。
+                let mut events = Vec::new();
+                for summary in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(text) = summary.get("text").and_then(Value::as_str) {
+                        events.extend(self.process_thinking_done(&json!({ "text": text })));
+                    }
+                }
+                events
+            }
             Some("web_search_call") => self.finish_web_search(item, event),
             _ => Vec::new(),
         }
+    }
+
+    fn record_reasoning_item(&mut self, item: &Value) {
+        let Some(item) = extract_reasoning_item(item) else {
+            return;
+        };
+        let id = item.get("id").and_then(Value::as_str);
+        if let Some(id) = id {
+            if let Some(position) = self.reasoning_items.iter().position(|existing| {
+                existing.get("id").and_then(Value::as_str) == Some(id)
+            }) {
+                self.reasoning_items[position] = item;
+                return;
+            }
+        }
+        self.reasoning_items.push(item);
+    }
+
+    fn build_reasoning_signature(&self) -> Option<String> {
+        encode_signature(&self.model, self.credential_id, &self.reasoning_items)
+    }
+
+    /// 关闭 thinking 块；若有可回放的 reasoning items，先发 signature_delta。
+    fn close_thinking_block(&mut self) -> Vec<SseEvent> {
+        let Some(index) = self.thinking_block_index.take() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        if !self.reasoning_signature_emitted {
+            if let Some(signature) = self.build_reasoning_signature() {
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": signature,
+                        }
+                    }),
+                ));
+                self.reasoning_signature_emitted = true;
+            }
+        }
+        if let Some(stop) = self.state.handle_content_block_stop(index) {
+            events.push(stop);
+        }
+        events
     }
 
     fn process_tool_delta(&mut self, event: &Value) -> Vec<SseEvent> {
@@ -468,9 +554,8 @@ impl GrokStreamContext {
         let mut events = Vec::new();
         // Grok Build 的 reasoning summary 在普通文本前也可能仍处于打开
         // 状态。Anthropic 要求 thinking 块先结束，随后才能开始 text 块。
-        if let Some(index) = self.thinking_block_index.take() {
-            events.extend(self.state.handle_content_block_stop(index));
-        }
+        // 关闭时附带 signature_delta，供 Claude Code 多轮原样回传。
+        events.extend(self.close_thinking_block());
         let index = self.state.next_block_index();
         self.text_block_index = Some(index);
         events.extend(self.state.handle_content_block_start(
@@ -510,10 +595,8 @@ impl GrokStreamContext {
         }
         let mut events = Vec::new();
         // Responses API 的 reasoning summary 可位于 tool call 之前。Anthropic
-        // 要求在开启 tool_use 前关闭 thinking 块。
-        if let Some(index) = self.thinking_block_index.take() {
-            events.extend(self.state.handle_content_block_stop(index));
-        }
+        // 要求在开启 tool_use 前关闭 thinking 块（含 signature_delta）。
+        events.extend(self.close_thinking_block());
         let index = self.state.next_block_index();
         let id = if id.is_empty() {
             key.clone()
@@ -555,9 +638,7 @@ impl GrokStreamContext {
         let mut events = Vec::new();
         // `server_tool_use` 不是 client tool_use，SseStateManager 不会替它
         // 自动关闭 text；显式收束前序文本/思考以满足 Anthropic 的块顺序。
-        if let Some(index) = self.thinking_block_index.take() {
-            events.extend(self.state.handle_content_block_stop(index));
-        }
+        events.extend(self.close_thinking_block());
         if let Some(index) = self.text_block_index.take() {
             events.extend(self.state.handle_content_block_stop(index));
         }
@@ -746,6 +827,18 @@ impl GrokStreamContext {
             .cloned()
             .collect::<Vec<_>>();
         let mut events = Vec::new();
+        // 若 thinking 仍打开（例如只有 reasoning、无 text/tool），在收尾前
+        // 发出 signature 并关闭，避免 Claude Code 丢掉可回放包。
+        if self.thinking_enabled
+            && self.thinking_block_index.is_none()
+            && !self.reasoning_items.is_empty()
+            && !self.reasoning_signature_emitted
+            && self.thinking.is_empty()
+        {
+            // 仅有 encrypted / 空 summary 时也要开一个 thinking 块挂 signature。
+            let _ = self.ensure_thinking_block();
+        }
+        events.extend(self.close_thinking_block());
         for key in pending_web_searches {
             events.extend(self.finish_web_search_block(&key, Vec::new()));
         }
@@ -777,6 +870,8 @@ impl GrokStreamContext {
         {
             let item_type = item.get("type").and_then(Value::as_str);
             if item_type == Some("reasoning") {
+                // completed 是完整 item 的权威来源（含 encrypted_content）。
+                self.record_reasoning_item(item);
                 for summary in item
                     .get("summary")
                     .and_then(Value::as_array)
@@ -808,8 +903,16 @@ impl GrokStreamContext {
 
     pub fn to_anthropic_response(&self) -> Value {
         let mut content = Vec::new();
-        if self.thinking_enabled && !self.thinking.is_empty() {
-            content.push(json!({ "type": "thinking", "thinking": self.thinking }));
+        let signature = self.build_reasoning_signature();
+        if self.thinking_enabled && (!self.thinking.is_empty() || signature.is_some()) {
+            let mut thinking = json!({
+                "type": "thinking",
+                "thinking": self.thinking,
+            });
+            if let Some(signature) = signature {
+                thinking["signature"] = Value::String(signature);
+            }
+            content.push(thinking);
         }
         for key in &self.web_search_order {
             if let Some(web_search) = self.web_search_blocks.get(key) {
@@ -1126,6 +1229,63 @@ mod tests {
         let response = context.to_anthropic_response();
         assert_eq!(response["content"][0]["thinking"], "considering");
         assert_eq!(response["content"][1]["text"], "answer");
+    }
+
+    #[test]
+    fn emits_xai_rs1_signature_before_thinking_stop_and_non_stream_carries_it() {
+        use super::super::reasoning_sig::decode_signature;
+
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.set_credential_id(42);
+        context.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "plan "
+        }));
+        context.process_event(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "status": "completed",
+                "summary": [{"type":"summary_text","text":"plan "}],
+                "encrypted_content": "enc_secret"
+            }
+        }));
+
+        let events = context.process_event(&json!({
+            "type": "response.output_text.delta",
+            "delta": "ok"
+        }));
+        let signature_pos = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("signature_delta before thinking stop");
+        let thinking_stop = events
+            .iter()
+            .position(|event| event.event == "content_block_stop" && event.data["index"] == 0)
+            .expect("thinking stop");
+        assert!(signature_pos < thinking_stop);
+
+        let signature = events[signature_pos].data["delta"]["signature"]
+            .as_str()
+            .unwrap();
+        let package = decode_signature(signature).expect("xai-rs1 package");
+        assert_eq!(package.credential_id, Some(42));
+        assert_eq!(package.items[0]["id"], "rs_1");
+        assert_eq!(package.items[0]["encrypted_content"], "enc_secret");
+
+        let response = context.to_anthropic_response();
+        assert_eq!(response["content"][0]["type"], "thinking");
+        assert_eq!(response["content"][0]["thinking"], "plan ");
+        assert!(
+            response["content"][0]["signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("xai-rs1.")
+        );
     }
 
     #[test]

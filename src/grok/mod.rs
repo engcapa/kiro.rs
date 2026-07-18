@@ -13,6 +13,7 @@ pub mod media;
 pub mod model_catalog;
 pub mod oauth;
 pub mod provider;
+pub mod reasoning_sig;
 mod router;
 pub mod stream;
 pub mod token_manager;
