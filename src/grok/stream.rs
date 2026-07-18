@@ -1,6 +1,6 @@
 //! xAI Responses SSE → Anthropic SSE 转换。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -26,10 +26,7 @@ impl XaiSseDecoder {
             let block = match String::from_utf8(block_bytes) {
                 Ok(block) => block,
                 Err(error) => {
-                    tracing::debug!(
-                        "xAI SSE 事件块含非法 UTF-8，按 lossy 解码: {}",
-                        error
-                    );
+                    tracing::debug!("xAI SSE 事件块含非法 UTF-8，按 lossy 解码: {}", error);
                     String::from_utf8_lossy(error.as_bytes()).into_owned()
                 }
             };
@@ -124,10 +121,24 @@ struct WebSearchBlock {
 /// 非流式 Anthropic `content` 组装顺序，镜像上游 `response.output` 交错顺序。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OrderedBlock {
-    Thinking,
-    Text,
+    Thinking(usize),
+    Text(usize),
     WebSearch(String),
     Tool(String),
+}
+
+#[derive(Debug)]
+struct TextContentBlock {
+    index: i32,
+    text: String,
+}
+
+#[derive(Debug)]
+struct ThinkingContentBlock {
+    index: i32,
+    thinking: String,
+    reasoning_items: Vec<Value>,
+    signature_emitted: bool,
 }
 
 /// 同时驱动流式事件和非流式聚合的状态机。
@@ -142,14 +153,10 @@ pub struct GrokStreamContext {
     /// 签发 xai-rs2 signature 时写入，供 Claude Code 多轮回传后做凭据校验。
     credential_id: Option<u64>,
     signature_codec: Option<ReasoningSignatureCodec>,
-    text_block_index: Option<i32>,
-    thinking_block_index: Option<i32>,
-    text: String,
-    thinking: String,
-    /// 本轮收集到的完整 xAI reasoning items（含 encrypted_content），按出现顺序。
-    reasoning_items: Vec<Value>,
-    /// 是否已对当前 thinking 块发出 signature_delta（避免重复）。
-    reasoning_signature_emitted: bool,
+    active_text_block: Option<usize>,
+    active_thinking_block: Option<usize>,
+    text_blocks: Vec<TextContentBlock>,
+    thinking_blocks: Vec<ThinkingContentBlock>,
     tool_blocks: HashMap<String, ToolBlock>,
     tool_aliases: HashMap<String, String>,
     tool_order: Vec<String>,
@@ -157,6 +164,13 @@ pub struct GrokStreamContext {
     web_search_order: Vec<String>,
     /// 内容块出现顺序（thinking / web_search / text / tools 交错）。
     content_order: Vec<OrderedBlock>,
+    /// 已完整消费的 Responses output item，防止 `response.completed` 权威快照
+    /// 与先前 output_item.done 重复生成内容块。
+    completed_item_keys: HashSet<String>,
+    /// reasoning item 尚无 encrypted_content 时，暂缓后续输出，等待 done 或
+    /// terminal response 补齐后再按原顺序发出。
+    awaiting_reasoning_terminal: bool,
+    deferred_events: Vec<Value>,
     stop_reason: Option<String>,
     completed: bool,
 }
@@ -173,27 +187,26 @@ impl GrokStreamContext {
             thinking_enabled,
             credential_id: None,
             signature_codec: None,
-            text_block_index: None,
-            thinking_block_index: None,
-            text: String::new(),
-            thinking: String::new(),
-            reasoning_items: Vec::new(),
-            reasoning_signature_emitted: false,
+            active_text_block: None,
+            active_thinking_block: None,
+            text_blocks: Vec::new(),
+            thinking_blocks: Vec::new(),
             tool_blocks: HashMap::new(),
             tool_aliases: HashMap::new(),
             tool_order: Vec::new(),
             web_search_blocks: HashMap::new(),
             web_search_order: Vec::new(),
             content_order: Vec::new(),
+            completed_item_keys: HashSet::new(),
+            awaiting_reasoning_terminal: false,
+            deferred_events: Vec::new(),
             stop_reason: None,
             completed: false,
         }
     }
 
     fn note_content_order(&mut self, entry: OrderedBlock) {
-        if !self.content_order.contains(&entry) {
-            self.content_order.push(entry);
-        }
+        self.content_order.push(entry);
     }
 
     /// 记录实际上游凭据，用于打包 `thinking.signature`。
@@ -225,6 +238,32 @@ impl GrokStreamContext {
     }
 
     pub fn process_event(&mut self, event: &Value) -> Vec<SseEvent> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let supplies_reasoning_item = event_type == "response.output_item.done"
+            && event.pointer("/item/type").and_then(Value::as_str) == Some("reasoning");
+        let terminal = matches!(
+            event_type,
+            "response.completed" | "response.incomplete" | "response.failed" | "error"
+        );
+        if self.awaiting_reasoning_terminal && !supplies_reasoning_item && !terminal {
+            self.deferred_events.push(event.clone());
+            return Vec::new();
+        }
+
+        let mut events = self.process_event_now(event);
+        if !self.awaiting_reasoning_terminal && !self.deferred_events.is_empty() {
+            let deferred = std::mem::take(&mut self.deferred_events);
+            for event in deferred {
+                events.extend(self.process_event(&event));
+            }
+        }
+        events
+    }
+
+    fn process_event_now(&mut self, event: &Value) -> Vec<SseEvent> {
         if event.get("choices").is_some() {
             return self.process_chat_completion_event(event);
         }
@@ -240,6 +279,7 @@ impl GrokStreamContext {
             "response.function_call_arguments.delta" => self.process_tool_delta(event),
             "response.function_call_arguments.done" => self.process_tool_done(event),
             "response.completed" => {
+                self.deferred_events.clear();
                 self.ingest_completed_response(event.get("response").unwrap_or(event))
             }
             "done" => {
@@ -247,11 +287,13 @@ impl GrokStreamContext {
                 Vec::new()
             }
             "response.incomplete" => {
+                self.deferred_events.clear();
                 let events = self.ingest_completed_response(event.get("response").unwrap_or(event));
                 self.stop_reason = Some("max_tokens".to_string());
                 events
             }
             "response.failed" | "error" => {
+                self.deferred_events.clear();
                 self.stop_reason = Some("end_turn".to_string());
                 Vec::new()
             }
@@ -368,8 +410,8 @@ impl GrokStreamContext {
         if delta.is_empty() {
             return Vec::new();
         }
-        let (index, mut events) = self.ensure_text_block();
-        self.text.push_str(delta);
+        let (block_position, index, mut events) = self.ensure_text_block();
+        self.text_blocks[block_position].text.push_str(delta);
         events.extend(
             self.state
                 .handle_content_block_delta(
@@ -390,7 +432,12 @@ impl GrokStreamContext {
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let suffix = suffix_after(&self.text, text);
+        let existing = self
+            .active_text_block
+            .and_then(|position| self.text_blocks.get(position))
+            .map(|block| block.text.as_str())
+            .unwrap_or_default();
+        let suffix = suffix_after(existing, text);
         if suffix.is_empty() {
             return Vec::new();
         }
@@ -409,8 +456,10 @@ impl GrokStreamContext {
         if delta.is_empty() {
             return Vec::new();
         }
-        let (index, mut events) = self.ensure_thinking_block();
-        self.thinking.push_str(delta);
+        let (block_position, index, mut events) = self.ensure_thinking_block();
+        self.thinking_blocks[block_position]
+            .thinking
+            .push_str(delta);
         events.extend(
             self.state
                 .handle_content_block_delta(
@@ -435,7 +484,12 @@ impl GrokStreamContext {
             .or_else(|| event.get("summary"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let suffix = suffix_after(&self.thinking, text);
+        let existing = self
+            .active_thinking_block
+            .and_then(|position| self.thinking_blocks.get(position))
+            .map(|block| block.thinking.as_str())
+            .unwrap_or_default();
+        let suffix = suffix_after(existing, text);
         if suffix.is_empty() {
             return Vec::new();
         }
@@ -452,8 +506,7 @@ impl GrokStreamContext {
             Some("reasoning") => {
                 // 部分网关在 added 就带 encrypted_content；尽早入库以便关
                 // thinking 前能发出完整 signature。
-                self.record_reasoning_item(item);
-                Vec::new()
+                self.record_reasoning_item(item)
             }
             Some("web_search_call") => {
                 let (key, id, input) = web_search_identity(item, event);
@@ -473,7 +526,15 @@ impl GrokStreamContext {
 
     fn process_output_item_done(&mut self, event: &Value) -> Vec<SseEvent> {
         let item = event.get("item").unwrap_or(&Value::Null);
-        match item.get("type").and_then(Value::as_str) {
+        let item_key = output_item_key(item, event);
+        if item_key
+            .as_ref()
+            .is_some_and(|key| self.completed_item_keys.contains(key))
+        {
+            return Vec::new();
+        }
+        let mut completed = true;
+        let events = match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
                 let (key, id, name) = function_call_identity(item, event);
                 let mut events = self.ensure_tool_block(&key, &id, &name);
@@ -499,12 +560,12 @@ impl GrokStreamContext {
                         }
                     }
                 }
+                events.extend(self.close_text_block());
                 events
             }
             Some("reasoning") => {
-                self.record_reasoning_item(item);
+                let mut events = self.record_reasoning_item(item);
                 // 若流式 summary delta 已发过，这里只补全 encrypted；否则用 summary 文本补展示。
-                let mut events = Vec::new();
                 for summary in item
                     .get("summary")
                     .and_then(Value::as_array)
@@ -515,45 +576,69 @@ impl GrokStreamContext {
                         events.extend(self.process_thinking_done(&json!({ "text": text })));
                     }
                 }
+                if reasoning_has_encrypted_content(item) {
+                    self.awaiting_reasoning_terminal = false;
+                    events.extend(self.close_thinking_block());
+                } else {
+                    // id-only reasoning 不能形成可回放签名。保持 thinking 打开并
+                    // 暂缓后续块，等待 response.completed 中的权威 item。
+                    self.awaiting_reasoning_terminal = true;
+                    completed = false;
+                }
                 events
             }
             Some("web_search_call") => self.finish_web_search(item, event),
             _ => Vec::new(),
-        }
-    }
-
-    fn record_reasoning_item(&mut self, item: &Value) {
-        let Some(item) = extract_reasoning_item(item) else {
-            return;
         };
-        let id = item.get("id").and_then(Value::as_str);
-        if let Some(id) = id {
-            if let Some(position) = self.reasoning_items.iter().position(|existing| {
-                existing.get("id").and_then(Value::as_str) == Some(id)
-            }) {
-                self.reasoning_items[position] = item;
-                return;
+        if completed {
+            if let Some(key) = item_key {
+                self.completed_item_keys.insert(key);
             }
         }
-        self.reasoning_items.push(item);
+        events
     }
 
-    fn build_reasoning_signature(&self) -> Option<String> {
+    fn record_reasoning_item(&mut self, item: &Value) -> Vec<SseEvent> {
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+        let Some(item) = extract_reasoning_item(item) else {
+            return Vec::new();
+        };
+        let (block_position, _, events) = self.ensure_thinking_block();
+        let items = &mut self.thinking_blocks[block_position].reasoning_items;
+        let id = item.get("id").and_then(Value::as_str);
+        if let Some(id) = id {
+            if let Some(position) = items
+                .iter()
+                .position(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+            {
+                items[position] = item;
+                return events;
+            }
+        }
+        items.push(item);
+        events
+    }
+
+    fn build_reasoning_signature(&self, block_position: usize) -> Option<String> {
+        let block = self.thinking_blocks.get(block_position)?;
         self.signature_codec.as_ref()?.encode(
             &self.model,
             self.credential_id,
-            &self.reasoning_items,
+            &block.reasoning_items,
         )
     }
 
     /// 关闭 thinking 块；若有可回放的 reasoning items，先发 signature_delta。
     fn close_thinking_block(&mut self) -> Vec<SseEvent> {
-        let Some(index) = self.thinking_block_index.take() else {
+        let Some(block_position) = self.active_thinking_block.take() else {
             return Vec::new();
         };
+        let index = self.thinking_blocks[block_position].index;
         let mut events = Vec::new();
-        if !self.reasoning_signature_emitted {
-            if let Some(signature) = self.build_reasoning_signature() {
+        if !self.thinking_blocks[block_position].signature_emitted {
+            if let Some(signature) = self.build_reasoning_signature(block_position) {
                 events.push(SseEvent::new(
                     "content_block_delta",
                     json!({
@@ -565,13 +650,23 @@ impl GrokStreamContext {
                         }
                     }),
                 ));
-                self.reasoning_signature_emitted = true;
+                self.thinking_blocks[block_position].signature_emitted = true;
             }
         }
         if let Some(stop) = self.state.handle_content_block_stop(index) {
             events.push(stop);
         }
         events
+    }
+
+    fn close_text_block(&mut self) -> Vec<SseEvent> {
+        let Some(block_position) = self.active_text_block.take() else {
+            return Vec::new();
+        };
+        self.state
+            .handle_content_block_stop(self.text_blocks[block_position].index)
+            .into_iter()
+            .collect()
     }
 
     fn process_tool_delta(&mut self, event: &Value) -> Vec<SseEvent> {
@@ -616,9 +711,13 @@ impl GrokStreamContext {
         events
     }
 
-    fn ensure_text_block(&mut self) -> (i32, Vec<SseEvent>) {
-        if let Some(index) = self.text_block_index {
-            return (index, Vec::new());
+    fn ensure_text_block(&mut self) -> (usize, i32, Vec<SseEvent>) {
+        if let Some(block_position) = self.active_text_block {
+            return (
+                block_position,
+                self.text_blocks[block_position].index,
+                Vec::new(),
+            );
         }
         let mut events = Vec::new();
         // Grok Build 的 reasoning summary 在普通文本前也可能仍处于打开
@@ -626,8 +725,13 @@ impl GrokStreamContext {
         // 关闭时附带 signature_delta，供 Claude Code 多轮原样回传。
         events.extend(self.close_thinking_block());
         let index = self.state.next_block_index();
-        self.text_block_index = Some(index);
-        self.note_content_order(OrderedBlock::Text);
+        let block_position = self.text_blocks.len();
+        self.text_blocks.push(TextContentBlock {
+            index,
+            text: String::new(),
+        });
+        self.active_text_block = Some(block_position);
+        self.note_content_order(OrderedBlock::Text(block_position));
         events.extend(self.state.handle_content_block_start(
             index,
             "text",
@@ -637,17 +741,29 @@ impl GrokStreamContext {
                 "content_block": { "type": "text", "text": "" }
             }),
         ));
-        (index, events)
+        (block_position, index, events)
     }
 
-    fn ensure_thinking_block(&mut self) -> (i32, Vec<SseEvent>) {
-        if let Some(index) = self.thinking_block_index {
-            return (index, Vec::new());
+    fn ensure_thinking_block(&mut self) -> (usize, i32, Vec<SseEvent>) {
+        if let Some(block_position) = self.active_thinking_block {
+            return (
+                block_position,
+                self.thinking_blocks[block_position].index,
+                Vec::new(),
+            );
         }
+        let mut events = self.close_text_block();
         let index = self.state.next_block_index();
-        self.thinking_block_index = Some(index);
-        self.note_content_order(OrderedBlock::Thinking);
-        let events = self.state.handle_content_block_start(
+        let block_position = self.thinking_blocks.len();
+        self.thinking_blocks.push(ThinkingContentBlock {
+            index,
+            thinking: String::new(),
+            reasoning_items: Vec::new(),
+            signature_emitted: false,
+        });
+        self.active_thinking_block = Some(block_position);
+        self.note_content_order(OrderedBlock::Thinking(block_position));
+        events.extend(self.state.handle_content_block_start(
             index,
             "thinking",
             json!({
@@ -655,8 +771,8 @@ impl GrokStreamContext {
                 "index": index,
                 "content_block": { "type": "thinking", "thinking": "" }
             }),
-        );
-        (index, events)
+        ));
+        (block_position, index, events)
     }
 
     fn ensure_tool_block(&mut self, raw_key: &str, id: &str, name: &str) -> Vec<SseEvent> {
@@ -668,6 +784,7 @@ impl GrokStreamContext {
         // Responses API 的 reasoning summary 可位于 tool call 之前。Anthropic
         // 要求在开启 tool_use 前关闭 thinking 块（含 signature_delta）。
         events.extend(self.close_thinking_block());
+        events.extend(self.close_text_block());
         let index = self.state.next_block_index();
         let id = if id.is_empty() {
             key.clone()
@@ -697,9 +814,6 @@ impl GrokStreamContext {
                 "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
             }),
         ));
-        // `SseStateManager` 会在上方自动关闭 text 块；清空本地索引以允许
-        // 后续 Responses text item 创建新的 Anthropic text 块。
-        self.text_block_index = None;
         events
     }
 
@@ -711,9 +825,7 @@ impl GrokStreamContext {
         // `server_tool_use` 不是 client tool_use，SseStateManager 不会替它
         // 自动关闭 text；显式收束前序文本/思考以满足 Anthropic 的块顺序。
         events.extend(self.close_thinking_block());
-        if let Some(index) = self.text_block_index.take() {
-            events.extend(self.state.handle_content_block_stop(index));
-        }
+        events.extend(self.close_text_block());
         let index = self.state.next_block_index();
         let id = if id.trim().is_empty() {
             key.to_string()
@@ -900,18 +1012,8 @@ impl GrokStreamContext {
             .cloned()
             .collect::<Vec<_>>();
         let mut events = Vec::new();
-        // 若 thinking 仍打开（例如只有 reasoning、无 text/tool），在收尾前
-        // 发出 signature 并关闭，避免 Claude Code 丢掉可回放包。
-        if self.thinking_enabled
-            && self.thinking_block_index.is_none()
-            && !self.reasoning_items.is_empty()
-            && !self.reasoning_signature_emitted
-            && self.thinking.is_empty()
-        {
-            // 仅有 encrypted / 空 summary 时也要开一个 thinking 块挂 signature。
-            let _ = self.ensure_thinking_block();
-        }
         events.extend(self.close_thinking_block());
+        events.extend(self.close_text_block());
         for key in pending_web_searches {
             events.extend(self.finish_web_search_block(&key, Vec::new()));
         }
@@ -935,28 +1037,22 @@ impl GrokStreamContext {
     /// Anthropic Message 格式。
     pub fn ingest_completed_response(&mut self, response: &Value) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        for item in response
+        for (output_index, item) in response
             .get("output")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
-            let item_type = item.get("type").and_then(Value::as_str);
-            if item_type == Some("reasoning") {
-                // completed 是完整 item 的权威来源（含 encrypted_content）。
-                self.record_reasoning_item(item);
-                for summary in item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(text) = summary.get("text").and_then(Value::as_str) {
-                        events.extend(self.process_thinking_done(&json!({ "text": text })));
-                    }
-                }
-            } else {
-                events.extend(self.process_output_item_done(&json!({ "item": item })));
+            events.extend(self.process_output_item_done(&json!({
+                "item": item,
+                "output_index": output_index,
+            })));
+            if self.awaiting_reasoning_terminal {
+                // terminal 已是最后权威来源；若仍没有 encrypted content，只能
+                // 以无 signature 的 thinking 块收束，不能继续阻塞后续 output。
+                self.awaiting_reasoning_terminal = false;
+                events.extend(self.close_thinking_block());
             }
         }
         self.completed = true;
@@ -970,28 +1066,49 @@ impl GrokStreamContext {
 
     pub fn output_tokens(&self) -> i32 {
         self.output_tokens.unwrap_or_else(|| {
-            crate::token::count_tokens(&(self.text.clone() + &self.thinking)) as i32
+            let text = self
+                .content_order
+                .iter()
+                .filter_map(|entry| match entry {
+                    OrderedBlock::Text(position) => self
+                        .text_blocks
+                        .get(*position)
+                        .map(|block| block.text.as_str()),
+                    OrderedBlock::Thinking(position) => self
+                        .thinking_blocks
+                        .get(*position)
+                        .map(|block| block.thinking.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            crate::token::count_tokens(&text) as i32
         })
     }
 
     pub fn to_anthropic_response(&self) -> Value {
         let mut content = Vec::new();
-        let signature = self.build_reasoning_signature();
-        let push_thinking = |content: &mut Vec<Value>| {
-            if self.thinking_enabled && (!self.thinking.is_empty() || signature.is_some()) {
+        let push_thinking = |content: &mut Vec<Value>, block_position: usize| {
+            let Some(block) = self.thinking_blocks.get(block_position) else {
+                return;
+            };
+            let signature = self.build_reasoning_signature(block_position);
+            if self.thinking_enabled && (!block.thinking.is_empty() || signature.is_some()) {
                 let mut thinking = json!({
                     "type": "thinking",
-                    "thinking": self.thinking,
+                    "thinking": block.thinking,
                 });
-                if let Some(signature) = signature.clone() {
+                if let Some(signature) = signature {
                     thinking["signature"] = Value::String(signature);
                 }
                 content.push(thinking);
             }
         };
-        let push_text = |content: &mut Vec<Value>| {
-            if !self.text.is_empty() {
-                content.push(json!({ "type": "text", "text": self.text }));
+        let push_text = |content: &mut Vec<Value>, block_position: usize| {
+            let Some(block) = self.text_blocks.get(block_position) else {
+                return;
+            };
+            if !block.text.is_empty() {
+                content.push(json!({ "type": "text", "text": block.text }));
             }
         };
         let push_web_search = |content: &mut Vec<Value>, key: &str| {
@@ -1023,33 +1140,26 @@ impl GrokStreamContext {
 
         if self.content_order.is_empty() {
             // 兼容未走过 ensure_* 的聚合路径：回退到历史固定顺序。
-            push_thinking(&mut content);
+            for position in 0..self.thinking_blocks.len() {
+                push_thinking(&mut content, position);
+            }
             for key in &self.web_search_order {
                 push_web_search(&mut content, key);
             }
-            push_text(&mut content);
+            for position in 0..self.text_blocks.len() {
+                push_text(&mut content, position);
+            }
             for key in &self.tool_order {
                 push_tool(&mut content, key);
             }
         } else {
             for entry in &self.content_order {
                 match entry {
-                    OrderedBlock::Thinking => push_thinking(&mut content),
-                    OrderedBlock::Text => push_text(&mut content),
+                    OrderedBlock::Thinking(position) => push_thinking(&mut content, *position),
+                    OrderedBlock::Text(position) => push_text(&mut content, *position),
                     OrderedBlock::WebSearch(key) => push_web_search(&mut content, key),
                     OrderedBlock::Tool(key) => push_tool(&mut content, key),
                 }
-            }
-            // 若某些块在 order 中遗漏（例如仅有 signature 的 thinking），补齐。
-            if self.thinking_enabled
-                && (!self.thinking.is_empty() || signature.is_some())
-                && !self.content_order.contains(&OrderedBlock::Thinking)
-            {
-                // 插到最前以贴近常见 reasoning-first 形态。
-                let mut prefix = Vec::new();
-                push_thinking(&mut prefix);
-                prefix.append(&mut content);
-                content = prefix;
             }
         }
         let stop_reason = self.stop_reason.clone().unwrap_or_else(|| {
@@ -1100,6 +1210,29 @@ impl GrokStreamContext {
             }
         }
     }
+}
+
+fn output_item_key(item: &Value, event: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let identity = item
+        .get("id")
+        .or_else(|| item.get("call_id"))
+        .or_else(|| event.get("item_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| index.to_string())
+        })?;
+    Some(format!("{item_type}:{identity}"))
+}
+
+fn reasoning_has_encrypted_content(item: &Value) -> bool {
+    item.get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn function_call_identity(item: &Value, event: &Value) -> (String, String, String) {
@@ -1451,7 +1584,7 @@ mod tests {
             "type": "response.reasoning_summary_text.delta",
             "delta": "plan "
         }));
-        context.process_event(&json!({
+        let events = context.process_event(&json!({
             "type": "response.output_item.done",
             "item": {
                 "type": "reasoning",
@@ -1462,7 +1595,7 @@ mod tests {
             }
         }));
 
-        let events = context.process_event(&json!({
+        let text_events = context.process_event(&json!({
             "type": "response.output_text.delta",
             "delta": "ok"
         }));
@@ -1478,6 +1611,9 @@ mod tests {
             .position(|event| event.event == "content_block_stop" && event.data["index"] == 0)
             .expect("thinking stop");
         assert!(signature_pos < thinking_stop);
+        assert!(text_events.iter().any(|event| {
+            event.event == "content_block_start" && event.data["content_block"]["type"] == "text"
+        }));
 
         let signature = events[signature_pos].data["delta"]["signature"]
             .as_str()
@@ -1496,6 +1632,199 @@ mod tests {
                 .unwrap()
                 .starts_with("xai-rs2.")
         );
+    }
+
+    #[test]
+    fn preserves_multiple_reasoning_items_around_hosted_tools() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.set_signature_codec(codec.clone());
+        context.set_credential_id(42);
+        let events = context.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type":"summary_text","text":"first"}],
+                    "encrypted_content": "enc_1"
+                }, {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type":"search","query":"rust","sources":[]}
+                }, {
+                    "type": "reasoning",
+                    "id": "tco_2",
+                    "summary": [],
+                    "encrypted_content": "enc_2"
+                }, {
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [{"type":"output_text","text":"answer"}]
+                }]
+            }
+        }));
+
+        let signatures = events
+            .iter()
+            .filter(|event| {
+                event.data.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+            })
+            .map(|event| event.data["delta"]["signature"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(codec.decode(signatures[0]).unwrap().items[0]["id"], "rs_1");
+        assert_eq!(codec.decode(signatures[1]).unwrap().items[0]["id"], "tco_2");
+
+        let response = context.to_anthropic_response();
+        let types = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                "thinking",
+                "server_tool_use",
+                "web_search_tool_result",
+                "thinking",
+                "text"
+            ]
+        );
+        let response_signatures = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block.get("signature").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(response_signatures, signatures);
+    }
+
+    #[test]
+    fn terminal_encrypted_reasoning_unblocks_deferred_text_with_complete_signature() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.set_signature_codec(codec.clone());
+        context.set_credential_id(42);
+        context.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "plan"
+        }));
+        let done_events = context.process_event(&json!({
+            "type": "response.output_item.done",
+            "item": {"type":"reasoning","id":"rs_terminal","summary":[]}
+        }));
+        assert!(done_events.iter().all(|event| {
+            event.data.pointer("/delta/type").and_then(Value::as_str) != Some("signature_delta")
+        }));
+        assert!(
+            context
+                .process_event(&json!({
+                    "type": "response.output_text.delta",
+                    "delta": "must defer"
+                }))
+                .is_empty()
+        );
+
+        let terminal_events = context.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "reasoning",
+                    "id": "rs_terminal",
+                    "summary": [{"type":"summary_text","text":"plan"}],
+                    "encrypted_content": "enc_terminal"
+                }, {
+                    "type": "message",
+                    "id": "msg_terminal",
+                    "content": [{"type":"output_text","text":"answer"}]
+                }]
+            }
+        }));
+        let signature = terminal_events
+            .iter()
+            .find(|event| {
+                event.data.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+            })
+            .and_then(|event| event.data.pointer("/delta/signature"))
+            .and_then(Value::as_str)
+            .expect("terminal must supply a complete signature");
+        assert_eq!(
+            codec.decode(signature).unwrap().items[0]["encrypted_content"],
+            "enc_terminal"
+        );
+        let response = context.to_anthropic_response();
+        assert_eq!(response["content"][0]["thinking"], "plan");
+        assert_eq!(response["content"][1]["text"], "answer");
+    }
+
+    #[test]
+    fn repeated_text_items_remain_separate_around_web_search() {
+        let mut context = GrokStreamContext::new("grok-4.5", 10, false);
+        context.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_a",
+                    "content": [{"type":"output_text","text":"A"}]
+                }, {
+                    "type": "web_search_call",
+                    "id": "ws_mid",
+                    "action": {"type":"search","query":"q","sources":[]}
+                }, {
+                    "type": "message",
+                    "id": "msg_b",
+                    "content": [{"type":"output_text","text":"B"}]
+                }]
+            }
+        }));
+        let response = context.to_anthropic_response();
+        assert_eq!(response["content"][0], json!({"type":"text","text":"A"}));
+        assert_eq!(response["content"][1]["type"], "server_tool_use");
+        assert_eq!(response["content"][2]["type"], "web_search_tool_result");
+        assert_eq!(response["content"][3], json!({"type":"text","text":"B"}));
+    }
+
+    #[test]
+    fn terminal_snapshot_does_not_duplicate_completed_stream_items() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        let mut context = GrokStreamContext::new("grok-4.5", 10, true);
+        context.set_signature_codec(ReasoningSignatureCodec::new(b"test-server-secret"));
+        context.set_credential_id(42);
+        let reasoning = json!({
+            "type":"reasoning",
+            "id":"rs_done",
+            "summary":[{"type":"summary_text","text":"plan"}],
+            "encrypted_content":"enc_done"
+        });
+        let message = json!({
+            "type":"message",
+            "id":"msg_done",
+            "content":[{"type":"output_text","text":"answer"}]
+        });
+        context.process_event(&json!({"type":"response.output_item.done","item":reasoning}));
+        context.process_event(&json!({"type":"response.output_item.done","item":message}));
+        context.process_event(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed","output":[reasoning,message]}
+        }));
+
+        let response = context.to_anthropic_response();
+        assert_eq!(response["content"].as_array().unwrap().len(), 2);
+        assert_eq!(response["content"][0]["type"], "thinking");
+        assert_eq!(response["content"][1]["text"], "answer");
     }
 
     #[test]

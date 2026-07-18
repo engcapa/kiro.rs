@@ -1513,6 +1513,67 @@ mod tests {
     }
 
     #[test]
+    fn multiple_reasoning_signatures_replay_around_hosted_tool_history_in_order() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let first = codec
+            .encode(
+                "grok-4.5",
+                Some(3),
+                &[json!({
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "encrypted_content":"enc_1"
+                })],
+            )
+            .unwrap();
+        let second = codec
+            .encode(
+                "grok-4.5",
+                Some(3),
+                &[json!({
+                    "type":"reasoning",
+                    "id":"tco_2",
+                    "encrypted_content":"enc_2"
+                })],
+            )
+            .unwrap();
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"grok-4.5",
+            "max_tokens":128,
+            "messages":[{
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"first","signature":first},
+                    {"type":"server_tool_use","id":"ws_1","name":"web_search","input":{"query":"rust"}},
+                    {"type":"web_search_tool_result","content":[]},
+                    {"type":"thinking","thinking":"second","signature":second},
+                    {"type":"text","text":"answer"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let converted = convert_request_for_credential(
+            &request,
+            "grok-4.5",
+            None,
+            Some(3),
+            Some(&codec),
+        )
+        .unwrap();
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[1]["type"], "message");
+        assert!(input[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("server_tool_use"));
+        assert_eq!(input[2]["id"], "tco_2");
+        assert_eq!(input[3]["content"][0]["text"], "answer");
+    }
+
+    #[test]
     fn responses_effort_requests_concise_summary_and_preserves_xhigh() {
         let request = MessagesRequest {
             model: "grok-4.5".to_string(),

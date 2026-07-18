@@ -122,7 +122,14 @@ impl ReasoningSignatureCodec {
             .iter()
             .filter_map(sanitize_reasoning_item_for_storage)
             .collect::<Vec<_>>();
-        if items.is_empty() || items.len() > MAX_REASONING_ITEMS {
+        if items.is_empty()
+            || items.len() > MAX_REASONING_ITEMS
+            || items.iter().any(|item| {
+                item.get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+        {
             return None;
         }
         let package = ReasoningSignaturePackage {
@@ -165,6 +172,11 @@ impl ReasoningSignatureCodec {
             || package.backend != "responses"
             || package.items.is_empty()
             || package.items.len() > MAX_REASONING_ITEMS
+            || package.items.iter().any(|item| {
+                item.get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
         {
             return None;
         }
@@ -348,6 +360,15 @@ mod tests {
         assert!(codec.decode("xai-rs1.legacy-unsigned").is_none());
         assert!(codec.decode("xai-rs2.!!!not-base64!!!.bad").is_none());
         assert!(codec.encode("grok-4.5", None, &[]).is_none());
+        assert!(
+            codec
+                .encode(
+                    "grok-4.5",
+                    Some(7),
+                    &[json!({"type":"reasoning","id":"id_only"})]
+                )
+                .is_none()
+        );
 
         let encoded = codec
             .encode("grok-4.5", Some(7), &[sample_item("rs_1", "enc")])
