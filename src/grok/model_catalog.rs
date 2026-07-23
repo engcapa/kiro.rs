@@ -170,11 +170,11 @@ pub struct GrokModel {
     pub supported_in_api: bool,
     #[serde(default)]
     pub supports_reasoning_effort: bool,
-    /// Grok Build 仅在目录明确声明该能力时，才将 Responses hosted
-    /// Web Search 注入该模型的请求。这个字段也参与每凭据路由，避免合并
-    /// catalog 后把搜索请求负载到不支持它的账号。
-    #[serde(default)]
-    pub supports_backend_search: bool,
+    /// `Some(true)` 表示支持 Responses hosted Web Search，`Some(false)`
+    /// 表示明确不支持，`None` 表示目录未声明、允许尝试并交给上游裁决。
+    /// 三态值参与每凭据路由，避免把“字段缺失”误判成“不支持”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_backend_search: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -293,10 +293,9 @@ impl GrokModelCatalog {
                     }),
                     supported_in_api: true,
                     supports_reasoning_effort: true,
-                    // bootstrap 用于真实 catalog 还未加载的兼容窗口；保持
-                    // `/grok` 既有 Responses Web Search 可用性。真实 catalog
-                    // 到位后会严格以 supportsBackendSearch 为准。
-                    supports_backend_search: true,
+                    // bootstrap 用于真实 catalog 还未加载的兼容窗口；明确
+                    // 标记支持 Responses Web Search。
+                    supports_backend_search: Some(true),
                     reasoning_effort: None,
                     // 缺少服务端菜单时 Grok Build 使用 legacy 的
                     // low/medium/high/xhigh fallback，而不是把 xhigh 压缩。
@@ -395,8 +394,7 @@ impl GrokModel {
                 meta,
                 &["supportsBackendSearch", "supports_backend_search"],
             )
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .and_then(Value::as_bool),
             reasoning_effort,
             reasoning_efforts,
         })
@@ -413,7 +411,7 @@ pub struct GrokCredentialModelIndex {
 struct GrokModelCapability {
     backend: GrokApiBackend,
     supports_reasoning_effort: bool,
-    supports_backend_search: bool,
+    supports_backend_search: Option<bool>,
     efforts: HashSet<ReasoningEffort>,
     uses_legacy_effort_menu: bool,
 }
@@ -457,7 +455,7 @@ impl GrokCredentialModelIndex {
         if backend.is_some_and(|backend| model.backend != backend) {
             return false;
         }
-        if requires_backend_search && !model.supports_backend_search {
+        if requires_backend_search && model.supports_backend_search == Some(false) {
             return false;
         }
         let Some(effort) = effort else {
@@ -517,7 +515,10 @@ pub fn merge_catalogs(catalogs: &[GrokModelCatalog]) -> GrokModelCatalog {
 fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
     existing.supported_in_api |= incoming.supported_in_api;
     existing.supports_reasoning_effort |= incoming.supports_reasoning_effort;
-    existing.supports_backend_search |= incoming.supports_backend_search;
+    existing.supports_backend_search = merge_backend_search_capability(
+        existing.supports_backend_search,
+        incoming.supports_backend_search,
+    );
     // 并集目录仅用于 /models 展示与别名解析。异构凭据的 apiBackend 可能不同：
     // 优先保留 Responses（Files / hosted Web Search 所需），其次 Messages，
     // 最后 Chat Completions。真正发送时 handlers 会按**单凭据 catalog** 再
@@ -545,6 +546,19 @@ fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
         {
             existing.reasoning_efforts.push(option.clone());
         }
+    }
+}
+
+/// 合并后的 catalog 代表凭据并集：任一凭据明确支持即为支持；没有明确支持
+/// 时，只要存在未声明能力的凭据就保持未知；只有全部明确拒绝才是 false。
+fn merge_backend_search_capability(
+    existing: Option<bool>,
+    incoming: Option<bool>,
+) -> Option<bool> {
+    match (existing, incoming) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, _) | (_, None) => None,
+        (Some(false), Some(false)) => Some(false),
     }
 }
 
@@ -706,7 +720,7 @@ mod tests {
         );
         let model = catalog.model_by_id("grok-composer-2.5-fast").unwrap();
         assert_eq!(model.api_backend, GrokApiBackend::Responses);
-        assert!(model.supports_backend_search);
+        assert_eq!(model.supports_backend_search, Some(true));
         assert!(model.supports_effort(ReasoningEffort::Xhigh));
         assert_eq!(model.resolve_effort("deep"), Some(ReasoningEffort::Xhigh));
         assert_eq!(
@@ -760,6 +774,41 @@ mod tests {
             catalog.models[0].api_backend,
             GrokApiBackend::ChatCompletions
         );
+        assert_eq!(catalog.models[0].supports_backend_search, None);
+    }
+
+    #[test]
+    fn catalog_index_allows_missing_backend_search_but_rejects_explicit_false() {
+        let missing = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses"
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let missing_index = GrokCredentialModelIndex::from_catalog(&missing);
+        assert!(missing_index.supports(
+            "grok-4.5",
+            None,
+            Some(GrokApiBackend::Responses),
+            true,
+        ));
+
+        let explicit_false = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportsBackendSearch":false
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let explicit_false_index = GrokCredentialModelIndex::from_catalog(&explicit_false);
+        assert!(!explicit_false_index.supports(
+            "grok-4.5",
+            None,
+            Some(GrokApiBackend::Responses),
+            true,
+        ));
     }
 
     #[test]
@@ -784,12 +833,47 @@ mod tests {
         let merged = merge_catalogs(&[chat.clone(), responses.clone()]);
         let model = merged.model_by_id("grok-4.5").unwrap();
         assert_eq!(model.api_backend, GrokApiBackend::Responses);
-        assert!(model.supports_backend_search);
+        assert_eq!(model.supports_backend_search, Some(true));
         // 反序合并也应稳定为 Responses。
         let merged_rev = merge_catalogs(&[responses, chat]);
         assert_eq!(
             merged_rev.model_by_id("grok-4.5").unwrap().api_backend,
             GrokApiBackend::Responses
+        );
+    }
+
+    #[test]
+    fn merge_catalogs_preserves_unknown_backend_search_capability() {
+        let explicit_false = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportsBackendSearch":false
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let missing = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses"
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let merged = merge_catalogs(&[explicit_false.clone(), missing.clone()]);
+        assert_eq!(
+            merged
+                .model_by_id("grok-4.5")
+                .unwrap()
+                .supports_backend_search,
+            None
+        );
+        let merged_rev = merge_catalogs(&[missing, explicit_false]);
+        assert_eq!(
+            merged_rev
+                .model_by_id("grok-4.5")
+                .unwrap()
+                .supports_backend_search,
+            None
         );
     }
 }
