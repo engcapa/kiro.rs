@@ -1081,10 +1081,27 @@ impl GrokStreamContext {
                     "type": "server_tool_use",
                     "id": id,
                     "name": "web_search",
-                    "input": input,
+                    "input": {},
                 }
             }),
         ));
+        if !input.as_object().is_some_and(|input| input.is_empty()) {
+            let partial_json =
+                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+            if let Some(event) = self.state.handle_content_block_delta(
+                index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": partial_json,
+                    }
+                }),
+            ) {
+                events.push(event);
+            }
+        }
         events
     }
 
@@ -1128,11 +1145,11 @@ impl GrokStreamContext {
         if !emit_result {
             return events;
         }
-        let content = self
+        let (tool_use_id, content) = self
             .web_search_blocks
             .get(key)
-            .map(|block| block.results.clone())
-            .unwrap_or_default();
+            .map(|block| (block.id.clone(), block.results.clone()))
+            .unwrap_or_else(|| (key.to_string(), Vec::new()));
         let index = self.state.next_block_index();
         events.extend(self.state.handle_content_block_start(
             index,
@@ -1142,6 +1159,7 @@ impl GrokStreamContext {
                 "index": index,
                 "content_block": {
                     "type": "web_search_tool_result",
+                    "tool_use_id": tool_use_id,
                     "content": content,
                 }
             }),
@@ -1347,6 +1365,7 @@ impl GrokStreamContext {
                 }));
                 content.push(json!({
                     "type": "web_search_tool_result",
+                    "tool_use_id": web_search.id,
                     "content": web_search.results,
                 }));
             }
@@ -2242,11 +2261,20 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.event == "content_block_start"
                 && event.data["content_block"]["type"] == "server_tool_use"
-                && event.data["content_block"]["input"]["query"] == "latest Rust release"
+                && event.data["content_block"]["input"] == json!({})
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"]
+                    .as_str()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .is_some_and(|input| input["query"] == "latest Rust release")
         }));
         assert!(events.iter().any(|event| {
             event.event == "content_block_start"
                 && event.data["content_block"]["type"] == "web_search_tool_result"
+                && event.data["content_block"]["tool_use_id"] == "ws_1"
                 && event.data["content_block"]["content"][0]["url"] == "https://blog.rust-lang.org/"
         }));
 
@@ -2254,6 +2282,7 @@ mod tests {
         assert_eq!(response["stop_reason"], "end_turn");
         assert_eq!(response["content"][0]["type"], "server_tool_use");
         assert_eq!(response["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(response["content"][1]["tool_use_id"], "ws_1");
         assert_eq!(
             response["usage"]["server_tool_use"]["web_search_requests"],
             1

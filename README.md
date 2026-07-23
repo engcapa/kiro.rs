@@ -546,8 +546,10 @@ Key 的资源池授权规则，但不会共享 Kiro 或 xAI 的实际凭据。
 
 #### Web Search
 
-`/grok/v1/messages` 接受 Anthropic 的 Web Search tool，并按 Grok Build 的
-Responses hosted-tool 形状转发，而不是把它降级成普通 function：
+`/grok/v1/messages` 与 `/grok/cc/v1/messages` 接受 Anthropic 的 Web Search
+tool，也会识别 Claude Code 注册的普通 `WebSearch` / `web_search` function。
+它们都会按 Grok Build 的 Responses hosted-tool 形状转发，而不是继续作为
+普通 function 交给 xAI 生成客户端工具参数：
 
 ```json
 {
@@ -562,16 +564,20 @@ Responses hosted-tool 形状转发，而不是把它降级成普通 function：
 }
 ```
 
-上游实际得到 `{"type":"web_search","filters":{"allowed_domains":[...]}}`；若同时定义了同名普通
-function，和 Grok Build 一样由 hosted Web Search 优先，避免 xAI 的重复工具名错误。
-对于 catalog 为 `responses` 的模型，流式与非流式响应都会将 xAI `web_search_call` 转换为 Anthropic
-`server_tool_use` 和 `web_search_tool_result` 内容块，保留 query、来源 URL、标题和摘要，并在
-`usage.server_tool_use.web_search_requests` 中计数。catalog 为 `messages` 的模型本身使用 Anthropic
-wire protocol，会将该工具和服务端事件原样透传。
-真实 catalog 已加载时，只有声明 `supportsBackendSearch: true` 的 `responses` 凭据才会被选中；多个
-凭据的模型并集即使包含该模型，也不会把带搜索的请求负载到不支持搜索的账号。`chat_completions`
-backend 没有 Grok Build 的 hosted-tools 通道，因此此组合会明确返回 400，需改用 catalog 标记为
-`responses` 的模型，而不会悄悄降级成普通 function。
+上游实际得到 `{"type":"web_search","filters":{"allowed_domains":[...]}}`；若显式 hosted
+tool 与普通 `WebSearch` / `web_search` function 同时存在，和 Grok Build 一样由显式 hosted
+Web Search 优先，避免 xAI 的重复工具名错误。指定 `tool_choice` 为这两个普通函数名时，也会改写为
+`{"type":"web_search"}`。
+
+带 Web Search 的请求只允许使用 catalog 为 `responses` 的模型。流式与非流式响应都会将 xAI
+`web_search_call` 转换为配对的 Anthropic `server_tool_use` 和 `web_search_tool_result`
+内容块，使用 `tool_use_id` 关联二者，保留 query、来源 URL、标题和摘要，并在
+`usage.server_tool_use.web_search_requests` 中计数。
+真实 catalog 已加载时，明确声明 `supportsBackendSearch: false` 的凭据会被排除；声明为 `true`
+或未返回该字段的 `responses` 凭据均可尝试，字段缺失时由 xAI 上游最终裁决。多个凭据的模型并集
+即使包含该模型，也不会把带搜索的请求负载到明确不支持搜索的账号。`chat_completions`
+与 `messages` backend 都没有本代理所需的 xAI Responses hosted-tools 通道，因此这些组合会明确
+返回 400，需改用 catalog 标记为 `responses` 的模型，而不会悄悄降级成普通 function。
 `max_uses` 会被接受以兼容 Anthropic 请求，但 xAI Responses 没有对应 wire 字段，实际调用次数由
 xAI 的 hosted-tool sampler 决定。
 

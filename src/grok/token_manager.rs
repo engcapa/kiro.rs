@@ -789,9 +789,9 @@ impl GrokTokenManager {
 
     /// 获得支持指定模型/effort/backend 的可用凭据，并在 OAuth token 接近过期
     /// 时自动刷新。目录未加载的凭据会被保守地放行，保持控制平面抖动时的服务
-    /// 可用性；目录已加载的凭据则严格按其模型能力过滤。`requires_backend_search`
-    /// 对应 Grok Build catalog 的 `supportsBackendSearch`，避免把 Responses
-    /// hosted search 投递给不支持它的凭据。
+    /// 可用性；目录已加载的凭据则按其模型能力过滤。`requires_backend_search`
+    /// 会排除 Grok Build catalog 明确声明 `supportsBackendSearch=false` 的
+    /// 凭据；字段缺失时允许尝试，由 Responses 上游最终裁决。
     pub async fn acquire_context(
         &self,
         model_id: Option<&str>,
@@ -1114,7 +1114,7 @@ impl GrokTokenManager {
                     .map(|effort| format!("、effort={effort}"))
                     .unwrap_or_default();
                 let backend_search = requires_backend_search
-                    .then_some("、supportsBackendSearch=true")
+                    .then_some("、supportsBackendSearch!=false")
                     .unwrap_or_default();
                 bail!(
                     "没有 Grok 凭据支持模型 {}（backend={}{}{}）或当前 API Key 资源池",
@@ -1270,8 +1270,8 @@ fn pool_matches(entry: &CredentialEntry, allowed_pools: Option<&[String]>) -> bo
     }
 }
 
-/// 已加载目录时严格过滤；目录尚未取得时未知放行。这样模型控制平面短暂故障
-/// 不会把本来可推理的 OAuth/API-token 凭据排除在外。
+/// 已加载目录时只排除明确不满足的能力；目录或单项能力尚未取得时未知放行。
+/// 这样模型控制平面短暂故障或公共 `/models` 省略扩展字段时，仍可由上游裁决。
 fn credential_supports(
     entry: &CredentialEntry,
     model_id: Option<&str>,
@@ -1910,5 +1910,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(context.id, 2);
+    }
+
+    #[tokio::test]
+    async fn backend_search_allows_credential_when_catalog_omits_capability() {
+        let manager = manager(vec![GrokCredentials {
+            id: Some(1),
+            access_token: Some("token-one".to_string()),
+            ..Default::default()
+        }]);
+        manager
+            .set_model_catalog(
+                1,
+                GrokModelCatalog::from_upstream(
+                    &json!({"data":[{
+                        "model":"grok-4.5",
+                        "apiBackend":"responses"
+                    }]}),
+                    "https://api.x.ai/v1",
+                ),
+            )
+            .unwrap();
+
+        let context = manager
+            .acquire_context(
+                Some("grok-4.5"),
+                None,
+                Some(GrokApiBackend::Responses),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.id, 1);
     }
 }

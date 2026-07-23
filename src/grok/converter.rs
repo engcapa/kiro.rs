@@ -18,8 +18,8 @@ pub struct ConvertedGrokRequest {
     pub backend: GrokApiBackend,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// 是否把 Anthropic Web Search 转换成 xAI Responses 的 hosted tool。
-    /// 该标记会继续传给凭据选择器，保证在多账号场景中只选择 catalog
-    /// `supportsBackendSearch=true` 的凭据。
+    /// 该标记会继续传给凭据选择器，保证在多账号场景中排除 catalog
+    /// 明确声明 `supportsBackendSearch=false` 的凭据。
     pub uses_hosted_web_search: bool,
 }
 
@@ -55,7 +55,10 @@ pub enum ConversionError {
         model: String,
         effort: ReasoningEffort,
     },
-    WebSearchRequiresResponses(String),
+    WebSearchRequiresResponses {
+        model: String,
+        backend: GrokApiBackend,
+    },
     WebSearchUnsupported(String),
     FilesRequireResponses(String),
     UnsupportedContentBlock(String),
@@ -74,13 +77,14 @@ impl std::fmt::Display for ConversionError {
             Self::UnsupportedReasoningEffort { model, effort } => {
                 write!(formatter, "模型 {model} 不支持 reasoning effort={effort}")
             }
-            Self::WebSearchRequiresResponses(model) => write!(
+            Self::WebSearchRequiresResponses { model, backend } => write!(
                 formatter,
-                "模型 {model} 使用 chat_completions backend，无法承载 Grok Build 的 hosted web_search；请选择 Responses backend 模型"
+                "模型 {model} 使用 {} backend，无法承载 Grok Build 的 hosted web_search；请选择 Responses backend 模型",
+                backend.as_str(),
             ),
             Self::WebSearchUnsupported(model) => write!(
                 formatter,
-                "模型 {model} 的 Grok Build catalog 未声明 supportsBackendSearch，无法启用 hosted web_search"
+                "模型 {model} 的 Grok Build catalog 明确声明 supportsBackendSearch=false，无法启用 hosted web_search"
             ),
             Self::FilesRequireResponses(model) => write!(
                 formatter,
@@ -165,16 +169,18 @@ pub fn convert_request_for_credential(
         .tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(is_web_search_tool));
-    // Grok Build 只会把 backend-hosted tool 加入 Responses 请求；Chat
-    // Completions 的转换器没有 hosted_tools 通道。显式拒绝比把一个无效的
-    // `type:web_search` 混进 Chat payload 更可预测。
-    if requests_web_search && backend == GrokApiBackend::ChatCompletions {
-        return Err(ConversionError::WebSearchRequiresResponses(model));
+    // Grok Build 只会把 backend-hosted tool 加入 Responses 请求。即使目标
+    // catalog 暴露 Messages backend，也不能把 Claude Code 的普通 WebSearch
+    // function 原样透传，否则 xAI 仍会生成客户端工具参数（例如 num_results）。
+    if requests_web_search && backend != GrokApiBackend::Responses {
+        return Err(ConversionError::WebSearchRequiresResponses { model, backend });
     }
-    let uses_hosted_web_search = requests_web_search && backend == GrokApiBackend::Responses;
-    // 无真实 catalog 时沿用 bootstrap/原有兼容路径。真实目录一旦取得，需
-    // 按 Grok Build 的 supportsBackendSearch capability 进行前置校验。
-    if uses_hosted_web_search && model_entry.is_some_and(|model| !model.supports_backend_search) {
+    let uses_hosted_web_search = requests_web_search;
+    // 未声明 supportsBackendSearch 时允许尝试，由 xAI Responses 最终裁决；
+    // 只有 catalog 明确声明 false 时才前置拒绝。
+    if uses_hosted_web_search
+        && model_entry.is_some_and(|model| model.supports_backend_search == Some(false))
+    {
         return Err(ConversionError::WebSearchUnsupported(model));
     }
     let reasoning_effort = resolve_reasoning_effort(request, model_entry, &model)?;
@@ -978,27 +984,20 @@ fn convert_tool(tool: &Tool) -> Option<Value> {
 }
 
 /// Grok Build 会让 hosted `web_search` 胜过同名 function，避免 xAI
-/// Responses 拒绝 `Duplicate tool names: web_search`。将该规则用于
-/// Anthropic 转换，既允许 web search 与普通工具并存，也不会丢失 hosted
-/// tool 的优先级。
+/// Responses 拒绝 `Duplicate tool names: web_search`。显式声明
+/// `type:web_search_*` 的 hosted tool 始终优先；没有显式声明时，Claude Code
+/// 的普通 `WebSearch` / `web_search` function 会提升为一个 hosted tool。
 fn convert_tools(tools: &[Tool], converter: fn(&Tool) -> Option<Value>) -> Vec<Value> {
-    let has_web_search = tools.iter().any(is_web_search_tool);
-    let mut hosted_web_search_added = false;
+    let preferred_web_search = tools
+        .iter()
+        .position(is_declared_web_search_tool)
+        .or_else(|| tools.iter().position(is_named_web_search_tool));
     tools
         .iter()
-        .filter_map(|tool| {
-            if has_web_search && !is_web_search_tool(tool) && tool.name == "web_search" {
+        .enumerate()
+        .filter_map(|(index, tool)| {
+            if is_web_search_tool(tool) && Some(index) != preferred_web_search {
                 return None;
-            }
-            // Anthropic 请求理论上只会有一个 Web Search tool；若兼容客户端
-            // 重复发送，保留首个（及其 allowed_domains），避免 xAI 拒绝重复的
-            // hosted tool 名称。这与 Grok Build 为一个 agent turn 注入单个
-            // HostedTool::WebSearch 的行为一致。
-            if is_web_search_tool(tool) {
-                if hosted_web_search_added {
-                    return None;
-                }
-                hosted_web_search_added = true;
             }
             converter(tool)
         })
@@ -1006,9 +1005,21 @@ fn convert_tools(tools: &[Tool], converter: fn(&Tool) -> Option<Value>) -> Vec<V
 }
 
 fn is_web_search_tool(tool: &Tool) -> bool {
+    is_declared_web_search_tool(tool) || is_named_web_search_tool(tool)
+}
+
+fn is_declared_web_search_tool(tool: &Tool) -> bool {
     tool.tool_type
         .as_deref()
         .is_some_and(|tool_type| tool_type.starts_with("web_search"))
+}
+
+fn is_named_web_search_tool(tool: &Tool) -> bool {
+    is_web_search_tool_name(&tool.name)
+}
+
+fn is_web_search_tool_name(name: &str) -> bool {
+    matches!(name, "WebSearch" | "web_search")
 }
 
 fn convert_chat_tool(tool: &Tool) -> Option<Value> {
@@ -1037,7 +1048,13 @@ fn convert_tool_choice(value: &Value) -> Option<Value> {
         "tool" => value
             .get("name")
             .and_then(Value::as_str)
-            .map(|name| json!({ "type": "function", "name": name })),
+            .map(|name| {
+                if is_web_search_tool_name(name) {
+                    json!({ "type": "web_search" })
+                } else {
+                    json!({ "type": "function", "name": name })
+                }
+            }),
         _ => None,
     }
 }
@@ -1127,6 +1144,47 @@ mod tests {
         assert_eq!(
             tools[0]["filters"]["allowed_domains"],
             json!(["docs.rs", "example.com"])
+        );
+    }
+
+    #[test]
+    fn promotes_claude_code_web_search_function_names_to_hosted_tool() {
+        for name in ["WebSearch", "web_search"] {
+            let request = named_web_search_request(name);
+            let plan = plan_request(&request, "grok-4.5", None).unwrap();
+            assert!(
+                plan.needs_web_search,
+                "{name} must constrain routing to Responses"
+            );
+            assert_eq!(plan.backend_constraint(), Some(GrokApiBackend::Responses));
+
+            let converted = convert_request(&request, "grok-4.5", None).unwrap();
+            assert_eq!(converted.backend, GrokApiBackend::Responses);
+            assert!(converted.uses_hosted_web_search);
+            assert_eq!(
+                converted.body["tools"],
+                json!([{ "type": "web_search" }])
+            );
+            assert_eq!(
+                converted.body["tool_choice"],
+                json!({ "type": "web_search" })
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_function_name_matching_is_exact() {
+        let request = named_web_search_request("websearch");
+        let plan = plan_request(&request, "grok-4.5", None).unwrap();
+        assert!(!plan.needs_web_search);
+
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        assert!(!converted.uses_hosted_web_search);
+        assert_eq!(converted.body["tools"][0]["type"], "function");
+        assert_eq!(converted.body["tools"][0]["name"], "websearch");
+        assert_eq!(
+            converted.body["tool_choice"],
+            json!({ "type": "function", "name": "websearch" })
         );
     }
 
@@ -1231,6 +1289,22 @@ mod tests {
     }
 
     #[test]
+    fn allows_hosted_web_search_when_catalog_capability_is_missing() {
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses"
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let converted =
+            convert_request(&web_search_request(), "grok-4.5", Some(&catalog)).unwrap();
+        assert_eq!(converted.backend, GrokApiBackend::Responses);
+        assert!(converted.uses_hosted_web_search);
+        assert_eq!(converted.body["tools"][0]["type"], "web_search");
+    }
+
+    #[test]
     fn rejects_hosted_web_search_for_chat_completions_backend() {
         let catalog = GrokModelCatalog::from_upstream(
             &json!({"data":[{
@@ -1244,6 +1318,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("chat_completions"));
+    }
+
+    #[test]
+    fn rejects_named_web_search_for_messages_backend() {
+        let catalog = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"messages",
+                "supportsBackendSearch":true
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let error = convert_request(
+            &named_web_search_request("WebSearch"),
+            "grok-4.5",
+            Some(&catalog),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("messages"));
+        assert!(error.contains("Responses"));
     }
 
     #[test]
@@ -1277,6 +1372,15 @@ mod tests {
                 content: json!("search the docs"),
             }],
             tools: Some(vec![
+                // 即使普通 function 排在前面，显式 hosted tool 仍必须胜出。
+                Tool {
+                    tool_type: None,
+                    name: "web_search".to_string(),
+                    description: "incorrect function duplicate".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    allowed_domains: None,
+                },
                 Tool {
                     tool_type: Some("web_search_20250305".to_string()),
                     name: "web_search".to_string(),
@@ -1289,17 +1393,51 @@ mod tests {
                         "example.com".to_string(),
                     ]),
                 },
-                // Grok Build drops this collision: hosted web_search wins.
-                Tool {
-                    tool_type: None,
-                    name: "web_search".to_string(),
-                    description: "incorrect function duplicate".to_string(),
-                    input_schema: Default::default(),
-                    max_uses: None,
-                    allowed_domains: None,
-                },
             ]),
             tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        }
+    }
+
+    fn named_web_search_request(name: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 1024,
+            stream: true,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("search the docs"),
+            }],
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: name.to_string(),
+                description: "Search the web".to_string(),
+                input_schema: serde_json::from_value(json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "allowed_domains": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "blocked_domains": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }))
+                .unwrap(),
+                max_uses: None,
+                allowed_domains: None,
+            }]),
+            tool_choice: Some(json!({ "type": "tool", "name": name })),
             thinking: None,
             output_config: None,
             metadata: None,
