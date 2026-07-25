@@ -6,9 +6,7 @@ use uuid::Uuid;
 use crate::anthropic::types::{ContentBlock, MessagesRequest, Tool};
 
 use super::model_catalog::{GrokApiBackend, GrokModel, GrokModelCatalog, ReasoningEffort};
-use super::reasoning_sig::{
-    ReasoningSignatureCodec, package_matches_route, package_to_input_items,
-};
+use super::reasoning_sig::{ReasoningSignatureCodec, package_to_input_items};
 
 #[derive(Debug)]
 pub struct ConvertedGrokRequest {
@@ -311,7 +309,7 @@ fn build_responses_body(
                 }
             }
             "assistant" => {
-                append_assistant_message(&mut input, &message.content, model, signature_codec)?;
+                append_assistant_message(&mut input, &message.content, signature_codec)?;
             }
             _ => append_user_message(&mut input, &message.content)?,
         }
@@ -727,7 +725,6 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
 fn append_assistant_message(
     input: &mut Vec<Value>,
     content: &Value,
-    replay_model: &str,
     signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
@@ -767,31 +764,24 @@ fn append_assistant_message(
                     }
                 }
             }
-            // Claude Code 会原样回传 thinking + signature。仅当 xai-rs2 包通过
-            // HMAC 且 model/backend 与本次真实路由一致时展开；旧格式、篡改包与
-            // 跨模型包回退为可见文本。跨账号（failover）不再回退——encrypted_content
-            // 非账户作用域，可安全跨凭据回放，保住多轮 KV-cache。
+            // Claude Code 会原样回传 thinking + signature。只要 xai-rs2 包通过
+            // HMAC 解码（decode 内部已强制 backend==responses、结构与大小合法）
+            // 即展开回放；旧格式/篡改包 decode 失败，回退为可见文本。
+            //
+            // 不再按 model 或 credential 过滤：encrypted_content 非账户作用域，
+            // 跨凭据 failover 可安全回放；model 亦放宽（同一会话通常同模型，
+            // 换模型时上游若拒会以 400+encrypted_content 触发既有重试）。这样
+            // 多轮 reasoning / KV-cache 在 failover 与目录漂移下都能保住。
             "thinking" => {
                 if let (Some(codec), Some(signature)) =
                     (signature_codec, block.signature.as_deref())
                 {
                     if let Some(package) = codec.decode(signature) {
-                        if package_matches_route(
-                            &package,
-                            replay_model,
-                            GrokApiBackend::Responses.as_str(),
-                        ) {
-                            flush_message(input, "assistant", &mut content_parts);
-                            for item in package_to_input_items(&package) {
-                                input.push(item);
-                            }
-                            continue;
+                        flush_message(input, "assistant", &mut content_parts);
+                        for item in package_to_input_items(&package) {
+                            input.push(item);
                         }
-                        tracing::debug!(
-                            package_model = %package.model,
-                            replay_model,
-                            "xai-rs2 reasoning signature 与当前 model/backend 不匹配，回退为 thinking 文本"
-                        );
+                        continue;
                     }
                 }
                 if let Some(text) = block.thinking.or(block.text) {
@@ -1771,11 +1761,12 @@ mod tests {
     }
 
     #[test]
-    fn model_mismatched_reasoning_signature_falls_back_to_thinking_text() {
+    fn cross_model_reasoning_signature_still_replays() {
         use super::super::reasoning_sig::ReasoningSignatureCodec;
 
-        // 签发时 model=grok-4.5，但本轮请求路由到 grok-4.6：model 仍是硬门槛
-        // （encrypted_content 是否跨模型可用未确认），因此回退为可见文本。
+        // 签发时 model=grok-4.5，本轮换到 grok-4.6：model gate 已放宽，只要
+        // HMAC 解码通过就回放 reasoning（不再降级成纯文本）。若上游因跨模型
+        // 拒收，会以 400+encrypted_content 触发既有重试，而不是这里前置降级。
         let codec = ReasoningSignatureCodec::new(b"test-server-secret");
         let signature = codec
             .encode(
@@ -1811,6 +1802,54 @@ mod tests {
         };
         let converted =
             convert_request_for_credential(&request, "grok-4.5", None, Some(&codec)).unwrap();
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "enc_blob");
+    }
+
+    #[test]
+    fn tampered_reasoning_signature_falls_back_to_thinking_text() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        // 用不同密钥签发 → 本 codec HMAC 校验失败，decode 返回 None，回退为
+        // 可见文本（旧格式 / 篡改包同理）。
+        let signer = ReasoningSignatureCodec::new(b"other-secret");
+        let signature = signer
+            .encode(
+                "grok-4.5",
+                Some(1),
+                &[json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_blob",
+                })],
+            )
+            .unwrap();
+        let verifier = ReasoningSignatureCodec::new(b"server-secret");
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "thinking",
+                    "thinking": "visible plan",
+                    "signature": signature,
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&verifier)).unwrap();
         let input = converted.body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
