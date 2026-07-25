@@ -546,6 +546,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> Option<String> {
         let id = self
@@ -554,6 +555,7 @@ impl GrokTokenManager {
                 reasoning_effort,
                 backend,
                 requires_backend_search,
+                requires_image,
                 allowed_pools,
             )
             .ok()?;
@@ -576,6 +578,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         self.find_credential_id(
@@ -583,6 +586,7 @@ impl GrokTokenManager {
             reasoning_effort,
             backend,
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )
     }
@@ -597,6 +601,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         self.choose_credential_id(
@@ -604,6 +609,7 @@ impl GrokTokenManager {
             reasoning_effort,
             backend,
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )
     }
@@ -622,6 +628,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         let affinity_key = affinity_key.map(str::trim).filter(|key| !key.is_empty());
@@ -638,6 +645,7 @@ impl GrokTokenManager {
                             reasoning_effort,
                             backend,
                             requires_backend_search,
+                            requires_image,
                         )
                 })
                 .collect::<Vec<_>>();
@@ -668,6 +676,7 @@ impl GrokTokenManager {
             reasoning_effort,
             backend,
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )
     }
@@ -683,6 +692,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<Vec<u64>> {
         let entries = self.entries.lock();
@@ -698,6 +708,7 @@ impl GrokTokenManager {
                     reasoning_effort,
                     backend,
                     requires_backend_search,
+                    requires_image,
                 )
         };
         if let Some(required_id) = required_id {
@@ -762,6 +773,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<()> {
         let entries = self.entries.lock();
@@ -781,6 +793,7 @@ impl GrokTokenManager {
             reasoning_effort,
             backend,
             requires_backend_search,
+            requires_image,
         ) {
             bail!("Grok 凭据 #{} 已不再支持当前模型/backend", id);
         }
@@ -798,6 +811,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<GrokCallContext> {
         let attempts = self.total_count().max(1) * MAX_FAILURES_PER_CREDENTIAL as usize;
@@ -808,6 +822,7 @@ impl GrokTokenManager {
                 reasoning_effort,
                 backend,
                 requires_backend_search,
+                requires_image,
                 allowed_pools,
             ) {
                 Ok(id) => id,
@@ -1064,6 +1079,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         let id = self.find_credential_id(
@@ -1071,6 +1087,7 @@ impl GrokTokenManager {
             reasoning_effort,
             backend,
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )?;
         *self.current_id.lock() = id;
@@ -1084,6 +1101,7 @@ impl GrokTokenManager {
         reasoning_effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
     ) -> anyhow::Result<u64> {
         let entries = self.entries.lock();
@@ -1104,6 +1122,7 @@ impl GrokTokenManager {
                         reasoning_effort,
                         backend,
                         requires_backend_search,
+                        requires_image,
                     )
             })
             .collect::<Vec<_>>();
@@ -1116,12 +1135,16 @@ impl GrokTokenManager {
                 let backend_search = requires_backend_search
                     .then_some("、supportsBackendSearch!=false")
                     .unwrap_or_default();
+                let image = requires_image
+                    .then_some("、supportsImageInput!=false")
+                    .unwrap_or_default();
                 bail!(
-                    "没有 Grok 凭据支持模型 {}（backend={}{}{}）或当前 API Key 资源池",
+                    "没有 Grok 凭据支持模型 {}（backend={}{}{}{}）或当前 API Key 资源池",
                     model_id,
                     backend,
                     effort,
                     backend_search,
+                    image,
                 );
             }
             bail!("没有可用于当前 API Key 资源池的 Grok 凭据");
@@ -1155,6 +1178,7 @@ impl GrokTokenManager {
                                 reasoning_effort,
                                 backend,
                                 requires_backend_search,
+                                requires_image,
                             ))
                         .then_some(entry.id)
                     })
@@ -1278,14 +1302,19 @@ fn credential_supports(
     reasoning_effort: Option<ReasoningEffort>,
     backend: Option<GrokApiBackend>,
     requires_backend_search: bool,
+    requires_image: bool,
 ) -> bool {
     entry
         .model_index
         .as_ref()
         .is_none_or(|index| match model_id {
-            Some(model_id) => {
-                index.supports(model_id, reasoning_effort, backend, requires_backend_search)
-            }
+            Some(model_id) => index.supports(
+                model_id,
+                reasoning_effort,
+                backend,
+                requires_backend_search,
+                requires_image,
+            ),
             None => backend.is_none_or(|backend| index.supports_backend(backend)),
         })
 }
@@ -1372,7 +1401,7 @@ mod tests {
         ]);
         let pools = vec!["two".to_string()];
         let context = manager
-            .acquire_context(None, None, None, false, Some(&pools))
+            .acquire_context(None, None, None, false, false, Some(&pools))
             .await
             .unwrap();
         assert_eq!(context.id, 2);
@@ -1394,19 +1423,19 @@ mod tests {
         ]);
         let before = manager.snapshot().current_id;
         let first = manager
-            .peek_next_credential_name(None, None, None, false, None)
+            .peek_next_credential_name(None, None, None, false, false, None)
             .unwrap();
         let second = manager
-            .peek_next_credential_name(None, None, None, false, None)
+            .peek_next_credential_name(None, None, None, false, false, None)
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(manager.snapshot().current_id, before);
         let routing = manager
-            .find_routing_credential_id(None, None, None, false, None)
+            .find_routing_credential_id(None, None, None, false, false, None)
             .unwrap();
         assert_eq!(manager.snapshot().current_id, before);
         // choose/acquire 才会推进游标
-        let _ = manager.choose_credential_id(None, None, None, false, None);
+        let _ = manager.choose_credential_id(None, None, None, false, false, None);
         assert_ne!(manager.snapshot().current_id, before);
         assert_eq!(
             manager.credential_display_name(routing).as_deref(),
@@ -1429,10 +1458,10 @@ mod tests {
             },
         ]);
         let claimed_a = manager
-            .claim_routing_credential_id(None, None, None, false, None)
+            .claim_routing_credential_id(None, None, None, false, false, None)
             .unwrap();
         let claimed_b = manager
-            .claim_routing_credential_id(None, None, None, false, None)
+            .claim_routing_credential_id(None, None, None, false, false, None)
             .unwrap();
         assert_ne!(claimed_a, claimed_b);
         // pin 路径：acquire_context_for 使用 claim 得到的 id，不重新 round-robin。
@@ -1465,6 +1494,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 None,
             )
             .unwrap();
@@ -1475,6 +1505,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 None,
             )
@@ -1491,6 +1522,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    false,
                     None,
                 )
                 .unwrap(),
@@ -1505,6 +1537,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     false,
                     None,
                 )
@@ -1533,7 +1566,7 @@ mod tests {
             },
         ]);
         let candidates = manager
-            .routing_candidate_ids(Some(2), None, None, None, None, false, None)
+            .routing_candidate_ids(Some(2), None, None, None, None, false, false, None)
             .unwrap();
         assert_eq!(candidates[0], 2);
         assert_eq!(candidates.len(), 3);
@@ -1544,7 +1577,7 @@ mod tests {
         assert_eq!(unique.len(), candidates.len());
         assert_eq!(
             manager
-                .routing_candidate_ids(None, Some(1), None, None, None, false, None)
+                .routing_candidate_ids(None, Some(1), None, None, None, false, false, None)
                 .unwrap(),
             vec![1]
         );
@@ -1790,6 +1823,7 @@ mod tests {
                 Some(ReasoningEffort::Xhigh),
                 Some(GrokApiBackend::Responses),
                 false,
+                false,
                 None,
             )
             .await
@@ -1801,6 +1835,7 @@ mod tests {
                 Some("grok-4.5"),
                 Some(ReasoningEffort::Xhigh),
                 Some(GrokApiBackend::Responses),
+                false,
                 false,
                 None,
             )
@@ -1852,7 +1887,7 @@ mod tests {
             .unwrap();
 
         let context = manager
-            .acquire_context(None, None, Some(GrokApiBackend::Responses), false, None)
+            .acquire_context(None, None, Some(GrokApiBackend::Responses), false, false, None)
             .await
             .unwrap();
         assert_eq!(context.id, 2);
@@ -1905,6 +1940,7 @@ mod tests {
                 None,
                 Some(GrokApiBackend::Responses),
                 true,
+                false,
                 None,
             )
             .await
@@ -1938,6 +1974,7 @@ mod tests {
                 None,
                 Some(GrokApiBackend::Responses),
                 true,
+                false,
                 None,
             )
             .await

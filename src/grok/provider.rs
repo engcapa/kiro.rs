@@ -262,6 +262,7 @@ impl GrokProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
         pinned_credential_id: Option<u64>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
@@ -273,6 +274,7 @@ impl GrokProvider {
             model,
             reasoning_effort,
             requires_backend_search,
+            requires_image,
             allowed_pools,
             route,
             |_| Ok(body.clone()),
@@ -289,6 +291,7 @@ impl GrokProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
         route: GrokCredentialRoute,
         mut body_for_credential: F,
@@ -308,6 +311,7 @@ impl GrokProvider {
             reasoning_effort,
             Some(backend),
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )?;
         candidates.truncate(MAX_TOTAL_RETRIES);
@@ -327,6 +331,7 @@ impl GrokProvider {
                     reasoning_effort,
                     Some(backend),
                     requires_backend_search,
+                    requires_image,
                     allowed_pools,
                 ) {
                     last_error = Some(error);
@@ -401,6 +406,7 @@ impl GrokProvider {
                     reasoning_effort,
                     Some(backend),
                     requires_backend_search,
+                    requires_image,
                     allowed_pools,
                 ) {
                     last_error = Some(error);
@@ -509,6 +515,7 @@ impl GrokProvider {
                     None,
                     Some(GrokApiBackend::Responses),
                     false,
+                    false,
                     allowed_pools,
                 )
                 .await
@@ -524,6 +531,7 @@ impl GrokProvider {
                 None,
                 None,
                 Some(GrokApiBackend::Responses),
+                false,
                 false,
                 allowed_pools,
             ) {
@@ -620,7 +628,7 @@ impl GrokProvider {
         for attempt in 0..max_retries {
             let context = match self
                 .token_manager
-                .acquire_context(None, None, None, false, allowed_pools)
+                .acquire_context(None, None, None, false, false, allowed_pools)
                 .await
             {
                 Ok(context) => context,
@@ -634,6 +642,7 @@ impl GrokProvider {
                 None,
                 None,
                 None,
+                false,
                 false,
                 allowed_pools,
             ) {
@@ -741,6 +750,7 @@ impl GrokProvider {
                 None,
                 None,
                 None,
+                false,
                 false,
                 allowed_pools,
             )?;
@@ -1286,6 +1296,7 @@ mod tests {
                 GrokApiBackend::Responses,
                 "grok-4.5",
                 None,
+                false,
                 false,
                 None,
                 GrokCredentialRoute::Preferred(1),

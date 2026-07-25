@@ -205,19 +205,21 @@ pub struct ReasoningSignaturePackage {
     pub items: Vec<Value>,
 }
 
-/// 仅在签发时的 model/backend/credential 与当前真实路由完全一致时允许回放。
+/// 仅在签发时的 model 与 backend 与当前真实路由一致时允许回放。
+///
+/// **不**再要求 credential 一致：xAI 的 `encrypted_content` 不是账户作用域，
+/// A 账号产生的 reasoning 在 B 账号同样可解密，因此 failover 到别的凭据后仍能
+/// 安全回放并保住多轮 KV-cache。包的真实性由 HMAC 保证（客户端只能回放代理
+/// 先前签发给它的包，不能伪造/篡改），故 credential gate 既不防泄露也不保
+/// 正确性。`credential_id` 仍保留在包里，仅供 [`latest_verified_route_credential`]
+/// 做性能亲和提示。model 仍需匹配：encrypted_content 是否跨模型可用尚未确认，
+/// 保守保留该约束。
 pub fn package_matches_route(
     package: &ReasoningSignaturePackage,
     replay_model: &str,
     replay_backend: &str,
-    replay_credential_id: Option<u64>,
 ) -> bool {
-    package.model.eq_ignore_ascii_case(replay_model)
-        && package.backend == replay_backend
-        && matches!(
-            (package.credential_id, replay_credential_id),
-            (Some(expected), Some(actual)) if expected == actual
-        )
+    package.model.eq_ignore_ascii_case(replay_model) && package.backend == replay_backend
 }
 
 /// 将包展开为 Responses `input` 可接受的 reasoning items（去掉 `status`）。
@@ -397,29 +399,16 @@ mod tests {
             credential_id: Some(1),
             items: vec![sample_item("rs_1", "enc")],
         };
-        assert!(package_matches_route(
-            &package,
-            "grok-4.5",
-            "responses",
-            Some(1)
-        ));
+        assert!(package_matches_route(&package, "grok-4.5", "responses"));
+        // credential 不再是门槛：跨账号回放（failover）允许。
+        assert!(package_matches_route(&package, "grok-4.5", "responses"));
+        // model 仍需匹配。
+        assert!(!package_matches_route(&package, "grok-4.6", "responses"));
+        // backend 仍需匹配。
         assert!(!package_matches_route(
             &package,
             "grok-4.5",
-            "responses",
-            Some(2)
-        ));
-        assert!(!package_matches_route(
-            &package,
-            "grok-4.6",
-            "responses",
-            Some(1)
-        ));
-        assert!(!package_matches_route(
-            &package,
-            "grok-4.5",
-            "chat_completions",
-            Some(1)
+            "chat_completions"
         ));
     }
 
