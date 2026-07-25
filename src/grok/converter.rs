@@ -499,6 +499,7 @@ fn append_chat_user_message(
             }
             "image" | "image_url" => {
                 if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "image_url",
                         "image_url": {
@@ -648,6 +649,7 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
                         "file_id": file_id,
                     }));
                 } else if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "input_image",
                         "image_url": url,
@@ -664,6 +666,7 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
             }
             "image_url" => {
                 if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "input_image",
                         "image_url": url,
@@ -878,6 +881,47 @@ fn image_url_from_block(block: &ContentBlock) -> Option<String> {
             .and_then(non_empty_trimmed),
         _ => None,
     }
+}
+
+/// 解码后图片字节的上限（20 MiB）。与 Grok Build 持久化历史的
+/// `MAX_LOADED_IMAGE_BYTES` 一致，仅作 sanity 上限，拦掉明显过大的 data URL，
+/// 避免把巨型 base64 原样打给上游再被拒/超时。
+const MAX_IMAGE_DECODED_BYTES: usize = 20 * 1024 * 1024;
+
+/// 校验一个即将作为 input_image / image_url 发送的图片 URL。
+///
+/// 仅对**可本地检查**的 `data:` URL 生效：
+/// * 拒绝 xAI vision 明确不接受的格式（gif/bmp/tiff）——Grok Build 对这些
+///   格式要么转码要么判为 "API-rejected format"；代理无法转码，故给出清晰
+///   400，而不是把注定失败的请求打给上游。
+/// * 拒绝解码后超过 [`MAX_IMAGE_DECODED_BYTES`] 的负载。
+///
+/// 远程 http(s) URL 无法本地检查，原样放行、交上游裁决。
+fn validate_image_url(url: &str) -> Result<(), ConversionError> {
+    let Some(after_data) = url.strip_prefix("data:") else {
+        return Ok(());
+    };
+    let Some(comma) = after_data.find(',') else {
+        return Err(ConversionError::UnsupportedContentBlock(
+            "data URL 图片缺少 base64 负载分隔符".to_string(),
+        ));
+    };
+    let header = &after_data[..comma];
+    let mime = header.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(mime.as_str(), "image/gif" | "image/bmp" | "image/tiff") {
+        return Err(ConversionError::UnsupportedContentBlock(format!(
+            "xAI vision 不接受 {mime} 图片，请转换为 PNG/JPEG/WebP"
+        )));
+    }
+    // base64 解码后约为原长度的 3/4；直接用长度估算避免真的解码大字符串。
+    let payload_len = after_data[comma + 1..].len();
+    if payload_len / 4 * 3 > MAX_IMAGE_DECODED_BYTES {
+        return Err(ConversionError::UnsupportedContentBlock(format!(
+            "图片超过 {} MiB 上限，请压缩后再发送",
+            MAX_IMAGE_DECODED_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
 }
 
 /// Anthropic Files API 的 image/document source。
@@ -1572,6 +1616,49 @@ mod tests {
                 "detail":"auto"
             })
         );
+    }
+
+    #[test]
+    fn validate_image_url_rejects_gif_and_oversize_but_allows_png_and_remote() {
+        // xAI vision 不接受 gif → 明确拒绝。
+        assert!(validate_image_url("data:image/gif;base64,R0lGODdh").is_err());
+        // bmp/tiff 同样拒绝。
+        assert!(validate_image_url("data:image/bmp;base64,Qk0=").is_err());
+        // png data URL 放行。
+        assert!(validate_image_url("data:image/png;base64,iVBORw0KGgo=").is_ok());
+        // 远程 URL 无法本地检查，放行交上游裁决。
+        assert!(validate_image_url("https://example.com/a.gif").is_ok());
+        // 超过 20 MiB 解码上限 → 拒绝（base64 长度约为解码后的 4/3）。
+        let huge_payload = "A".repeat(28 * 1024 * 1024);
+        let huge = format!("data:image/png;base64,{huge_payload}");
+        assert!(validate_image_url(&huge).is_err());
+        // 刚好在上限内的小图放行。
+        assert!(validate_image_url("data:image/jpeg;base64,/9j/4AAQ").is_ok());
+    }
+
+    #[test]
+    fn converts_rejects_gif_image_block_with_clear_error() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 128,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"image","source":{"type":"base64","media_type":"image/gif","data":"R0lGODdh"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+        let err = convert_request(&request, "grok-4.5", None).unwrap_err();
+        assert!(matches!(err, ConversionError::UnsupportedContentBlock(_)));
     }
 
     #[test]
