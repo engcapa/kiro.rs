@@ -36,21 +36,26 @@ impl ProxyConfig {
     }
 }
 
-/// 构建 HTTP Client
-///
-/// # Arguments
-/// * `proxy` - 可选的代理配置
-/// * `timeout_secs` - 超时时间（秒）
-///
-/// # Returns
-/// 配置好的 reqwest::Client
-pub fn build_client(
-    proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
-    tls_backend: TlsBackend,
-) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+/// 流式上游客户端的连接超时：足够快地探测掉线的代理/上游握手。
+const STREAMING_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// 流式上游客户端的**每次读**超时（读到数据即重置）。不是总时限：只在
+/// 连续这么久收不到任何字节时才判定为假死。取值需宽到能容忍 reasoning 模型
+/// 首 token 前的长思考停顿，又不至于让真正掉死的连接一直挂着。
+const STREAMING_READ_TIMEOUT_SECS: u64 = 300;
+/// h2 keep-alive ping 间隔与超时；对 HTTP/1.1 无效，故与 read_timeout 并存。
+const STREAMING_H2_KEEPALIVE_INTERVAL_SECS: u64 = 20;
+const STREAMING_H2_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+/// 连接池空闲回收与 TCP keep-alive。
+const STREAMING_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+const STREAMING_TCP_KEEPALIVE_SECS: u64 = 30;
 
+/// 对 builder 应用 TLS 后端与可选代理。`build_client` 与
+/// `build_streaming_client` 共用，避免两处 TLS/代理逻辑漂移。
+fn apply_tls_and_proxy(
+    mut builder: reqwest::ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     match tls_backend {
         TlsBackend::Rustls => {
             builder = builder.use_rustls_tls();
@@ -69,16 +74,56 @@ pub fn build_client(
 
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
-
-        // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
             proxy = proxy.basic_auth(username, password);
         }
-
         builder = builder.proxy(proxy);
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
 
+    Ok(builder)
+}
+
+/// 构建**流式**上游客户端：用「连接超时 + 每次读超时 + keep-alive」代替总
+/// 超时。适用于 SSE/长流响应——总 `.timeout()` 会把从连接到读完整条流算作
+/// 一个死线，长 reasoning 回答一旦跨过就被 abort（表现为响应截断/挂起）。
+/// 参考 Grok Build 的 xai-grok-http：流式 client 不设总时限。
+///
+/// # Arguments
+/// * `proxy` - 可选的代理配置
+///
+/// # Returns
+/// 配置好的、无总时限的 reqwest::Client
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .connect_timeout(Duration::from_secs(STREAMING_CONNECT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(STREAMING_READ_TIMEOUT_SECS))
+        .pool_idle_timeout(Duration::from_secs(STREAMING_POOL_IDLE_TIMEOUT_SECS))
+        .http2_keep_alive_interval(Duration::from_secs(STREAMING_H2_KEEPALIVE_INTERVAL_SECS))
+        .http2_keep_alive_timeout(Duration::from_secs(STREAMING_H2_KEEPALIVE_TIMEOUT_SECS))
+        .tcp_keepalive(Duration::from_secs(STREAMING_TCP_KEEPALIVE_SECS));
+    let builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
+    Ok(builder.build()?)
+}
+
+/// 构建 HTTP Client
+///
+/// # Arguments
+/// * `proxy` - 可选的代理配置
+/// * `timeout_secs` - 超时时间（秒）
+///
+/// # Returns
+/// 配置好的 reqwest::Client
+pub fn build_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = apply_tls_and_proxy(builder, proxy, tls_backend)?;
     Ok(builder.build()?)
 }
 
@@ -105,6 +150,19 @@ mod tests {
     #[test]
     fn test_build_client_without_proxy() {
         let client = build_client(None, 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client_without_proxy() {
+        let client = build_streaming_client(None, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client_with_proxy() {
+        let config = ProxyConfig::new("http://127.0.0.1:7890");
+        let client = build_streaming_client(Some(&config), TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 
