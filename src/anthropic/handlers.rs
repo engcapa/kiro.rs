@@ -910,16 +910,28 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
                 serde_json::Value::Object(output_config_obj),
             );
         } else if has_reasoning {
-            // gpt-5.x 系列：effort 走 reasoning.effort，按 schema enum 收紧；
-            // mode 无客户端入口，交由上游按 schema default（standard）处理，不显式下发。
-            let effort_prop = properties
-                .get("reasoning")
-                .and_then(|p| p.get("properties"))
-                .and_then(|p| p.get("effort"));
+            // gpt-5.x 系列：effort 走 reasoning.effort，按 schema enum 收紧。
+            let reasoning_prop = properties.get("reasoning").and_then(|p| p.get("properties"));
+            let effort_prop = reasoning_prop.and_then(|p| p.get("effort"));
             let effort_valid =
                 crate::anthropic::converter::clamp_effort_value(&effort, effort_prop);
             let mut reasoning_obj = serde_json::Map::new();
             reasoning_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
+
+            // mode：仅当模型名带 `-mode-pro` 后缀且 schema 声明支持 mode 时才下发 pro，
+            // 按 schema enum 收紧（越界回退 standard）。不带后缀则不下发，由上游默认 standard。
+            if crate::anthropic::converter::model_requests_pro_mode(&payload.model) {
+                if let Some(mode_prop) = reasoning_prop.and_then(|p| p.get("mode")) {
+                    let mode_valid = crate::anthropic::converter::clamp_enum_value(
+                        "pro",
+                        Some(mode_prop),
+                        "standard",
+                    );
+                    reasoning_obj
+                        .insert("mode".to_string(), serde_json::Value::String(mode_valid));
+                }
+            }
+
             fields.insert(
                 "reasoning".to_string(),
                 serde_json::Value::Object(reasoning_obj),

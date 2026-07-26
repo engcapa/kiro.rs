@@ -403,6 +403,26 @@ pub fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCat
     }
 }
 
+/// 判断请求的模型名是否显式要求 reasoning.mode=pro（gpt-5.x 系列）。
+///
+/// 触发条件：清理掉 `[1m]` 上下文后缀后，模型名以 `-mode-pro` 结尾，或以
+/// `-mode-pro-thinking` 结尾（兼容后缀顺序）。仅识别显式 `-mode-pro`，不带则视为
+/// 默认（standard，由上游兜底）。用 -mode-pro 后缀避免误伤真实以 -pro 结尾的模型名。
+pub fn model_requests_pro_mode(model: &str) -> bool {
+    let mut s = model.trim().to_lowercase();
+    // 去掉 [1m] 之类的上下文后缀，避免 `gpt-5.6-sol-mode-pro[1m]` 漏判
+    if s.ends_with(']') {
+        if let Some(idx) = s.rfind('[') {
+            s = s[..idx].trim().to_string();
+        }
+    }
+    // 兼容 `-mode-pro` 与 `-mode-pro-thinking`（先剥末尾的 -thinking 再看是否 -mode-pro 结尾）
+    if let Some(stripped) = s.strip_suffix("-thinking") {
+        s = stripped.to_string();
+    }
+    s.ends_with("-mode-pro")
+}
+
 /// 模型映射：将 Anthropic 模型名或非 Claude 模型名智能映射到 Kiro 模型 ID
 ///
 /// # 映射逻辑 (Mapping Heuristics & Workflow)
@@ -479,9 +499,15 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     }
     
-    // 2. 清理其他后缀（移除末尾的 -thinking 和类似于 -20251101 的日期后缀）
-    if clean_model.ends_with("-thinking") {
-        clean_model = clean_model[..clean_model.len() - 9].trim().to_string();
+    // 2. 清理其他后缀（移除末尾的 -mode-pro / -thinking 和类似于 -20251101 的日期后缀）
+    //    -mode-pro 为 gpt-5.x 系列的 reasoning.mode=pro 开关，仅用于路由/映射，剥离后按基础模型匹配。
+    //    用 -mode-pro 而非 -pro 作后缀，避免误伤真实以 -pro 结尾的模型名。
+    //    先剥 -mode-pro 再剥 -thinking，可兼容 `...-thinking-mode-pro` 这类组合。
+    if let Some(stripped) = clean_model.strip_suffix("-mode-pro") {
+        clean_model = stripped.trim().to_string();
+    }
+    if let Some(stripped) = clean_model.strip_suffix("-thinking") {
+        clean_model = stripped.trim().to_string();
     }
     if clean_model.len() >= 9 {
         let suffix = &clean_model[clean_model.len() - 9..];
@@ -1578,6 +1604,36 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_mode_pro_suffix_stripped() {
+        // -mode-pro 后缀（gpt-5.x mode 开关）应被剥离，回落到基础模型（用 fallback 内已有模型验证）
+        assert_eq!(map_model("claude-opus-4-6-mode-pro"), Some("claude-opus-4.6".to_string()));
+        // 组合后缀：-mode-pro 与 -thinking 同时存在，任一顺序都应剥净
+        assert_eq!(
+            map_model("claude-opus-4-6-thinking-mode-pro"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-6-mode-pro-thinking"),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_requests_pro_mode() {
+        // 显式 -mode-pro → true
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro"));
+        assert!(model_requests_pro_mode("GPT-5.6-Sol-Mode-Pro")); // 大小写不敏感
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro[1m]")); // 带上下文后缀
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro-thinking")); // 组合后缀
+        assert!(model_requests_pro_mode("gpt-5.6-sol-thinking-mode-pro"));
+        // 无 -mode-pro → false
+        assert!(!model_requests_pro_mode("gpt-5.6-sol"));
+        assert!(!model_requests_pro_mode("gpt-5.6-sol-thinking"));
+        // 仅 -pro（非 -mode-pro）不应触发，避免误伤真实以 -pro 结尾的模型名
+        assert!(!model_requests_pro_mode("some-model-pro"));
     }
 
     #[test]
