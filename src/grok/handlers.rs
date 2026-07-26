@@ -49,6 +49,8 @@ struct RoutedGrokRequest {
     backend: GrokApiBackend,
     reasoning_effort: Option<ReasoningEffort>,
     uses_hosted_web_search: bool,
+    /// 请求携带图片输入；路由时用于排除 catalog 明确不支持 vision 的凭据。
+    needs_image: bool,
     upstream_stream: bool,
     signature_codec: ReasoningSignatureCodec,
 }
@@ -67,7 +69,6 @@ impl RoutedGrokRequest {
             &self.payload,
             &self.default_model,
             catalog.as_deref(),
-            Some(credential_id),
             Some(&self.signature_codec),
         )?;
         if converted.model != self.model
@@ -585,6 +586,7 @@ pub async fn post_messages(
                 plan.reasoning_effort,
                 routing_backend,
                 plan.needs_web_search,
+                plan.needs_image,
                 Some(&allowed_pools.0),
             )
         {
@@ -602,7 +604,6 @@ pub async fn post_messages(
         &payload,
         &state.default_model,
         routing_catalog.as_deref(),
-        pinned_credential_id,
         Some(&state.reasoning_signatures),
     ) {
         Ok(converted) => converted,
@@ -658,6 +659,7 @@ pub async fn post_messages(
         backend: converted.backend,
         reasoning_effort: converted.reasoning_effort,
         uses_hosted_web_search: converted.uses_hosted_web_search,
+        needs_image: plan.needs_image,
         upstream_stream,
         signature_codec: state.reasoning_signatures.clone(),
     };
@@ -766,6 +768,7 @@ fn create_sse_stream(
             &request.model,
             request.reasoning_effort,
             request.uses_hosted_web_search,
+            request.needs_image,
             Some(&allowed_pools),
             route,
             |credential_id| request.body_for_credential(&state, credential_id),
@@ -895,6 +898,7 @@ async fn non_stream_response(
             &request.model,
             request.reasoning_effort,
             request.uses_hosted_web_search,
+            request.needs_image,
             Some(allowed_pools),
             route,
             |credential_id| request.body_for_credential(&state, credential_id),
@@ -1036,6 +1040,7 @@ async fn messages_backend_response(
             &request.model,
             request.reasoning_effort,
             false,
+            request.needs_image,
             Some(&allowed_pools),
             route,
             |credential_id| request.body_for_credential(&state, credential_id),
@@ -1142,6 +1147,7 @@ fn create_messages_sse_stream(
             &request.model,
             request.reasoning_effort,
             false,
+            request.needs_image,
             Some(&allowed_pools),
             route,
             |credential_id| request.body_for_credential(&state, credential_id),

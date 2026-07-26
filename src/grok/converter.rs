@@ -6,9 +6,7 @@ use uuid::Uuid;
 use crate::anthropic::types::{ContentBlock, MessagesRequest, Tool};
 
 use super::model_catalog::{GrokApiBackend, GrokModel, GrokModelCatalog, ReasoningEffort};
-use super::reasoning_sig::{
-    ReasoningSignatureCodec, package_matches_route, package_to_input_items,
-};
+use super::reasoning_sig::{ReasoningSignatureCodec, package_to_input_items};
 
 #[derive(Debug)]
 pub struct ConvertedGrokRequest {
@@ -33,6 +31,10 @@ pub struct ConversionPlan {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub needs_web_search: bool,
     pub needs_files: bool,
+    /// 请求携带图片输入（vision）。用于在多账号异构时排除 catalog 明确声明
+    /// 不支持图片的凭据；不强制 backend（base64 图片在 Responses/Chat 均可，
+    /// 只有 `file_id` 图片才经 `needs_files` 强制 Responses）。
+    pub needs_image: bool,
 }
 
 impl ConversionPlan {
@@ -119,6 +121,7 @@ pub fn plan_request(
         .as_ref()
         .is_some_and(|tools| tools.iter().any(is_web_search_tool));
     let needs_files = request_has_file_inputs(request);
+    let needs_image = request_has_image_inputs(request);
     // 规划阶段对 effort 做宽松解析：有 model entry 时校验菜单；无 entry 时仍
     // 解析 wire 值，留给目标凭据 catalog 做最终裁决。
     let reasoning_effort = resolve_reasoning_effort(request, model_entry, &model)?;
@@ -127,6 +130,7 @@ pub fn plan_request(
         reasoning_effort,
         needs_web_search,
         needs_files,
+        needs_image,
     })
 }
 
@@ -135,16 +139,16 @@ pub fn convert_request(
     default_model: &str,
     catalog: Option<&GrokModelCatalog>,
 ) -> Result<ConvertedGrokRequest, ConversionError> {
-    convert_request_for_credential(request, default_model, catalog, None, None)
+    convert_request_for_credential(request, default_model, catalog, None)
 }
 
-/// 与 [`convert_request`] 相同，但携带路由凭据 id，用于校验历史
-/// `thinking.signature` 中打包的 xAI reasoning 是否可安全回放。
+/// 与 [`convert_request`] 相同，但携带 signature codec，用于把历史
+/// `thinking.signature` 中打包的 xAI reasoning 展开回放（HMAC + model/backend
+/// 校验；不再校验 credential，见 [`package_matches_route`]）。
 pub fn convert_request_for_credential(
     request: &MessagesRequest,
     default_model: &str,
     catalog: Option<&GrokModelCatalog>,
-    replay_credential_id: Option<u64>,
     signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<ConvertedGrokRequest, ConversionError> {
     if request.messages.is_empty() {
@@ -193,13 +197,7 @@ pub fn convert_request_for_credential(
 
     let body = match backend {
         GrokApiBackend::Responses => {
-            build_responses_body(
-                request,
-                &model,
-                reasoning_effort,
-                replay_credential_id,
-                signature_codec,
-            )?
+            build_responses_body(request, &model, reasoning_effort, signature_codec)?
         }
         GrokApiBackend::ChatCompletions => {
             build_chat_completions_body(request, &model, reasoning_effort)?
@@ -288,7 +286,6 @@ fn build_responses_body(
     request: &MessagesRequest,
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
-    replay_credential_id: Option<u64>,
     signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<Value, ConversionError> {
     let mut input = Vec::new();
@@ -312,13 +309,7 @@ fn build_responses_body(
                 }
             }
             "assistant" => {
-                append_assistant_message(
-                    &mut input,
-                    &message.content,
-                    model,
-                    replay_credential_id,
-                    signature_codec,
-                )?;
+                append_assistant_message(&mut input, &message.content, signature_codec)?;
             }
             _ => append_user_message(&mut input, &message.content)?,
         }
@@ -506,6 +497,7 @@ fn append_chat_user_message(
             }
             "image" | "image_url" => {
                 if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "image_url",
                         "image_url": {
@@ -655,9 +647,14 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
                         "file_id": file_id,
                     }));
                 } else if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "input_image",
                         "image_url": url,
+                        // xAI Responses 的 input_image 要求 detail 字段（缺省时
+                        // 部分上游会拒绝）。Anthropic image 块没有 detail 概念，
+                        // 与 Grok Build 参考实现一致固定用 auto，交上游自行取舍。
+                        "detail": "auto",
                     }));
                 } else {
                     return Err(ConversionError::UnsupportedContentBlock(
@@ -667,9 +664,11 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
             }
             "image_url" => {
                 if let Some(url) = image_url_from_block(&block) {
+                    validate_image_url(&url)?;
                     content_parts.push(json!({
                         "type": "input_image",
                         "image_url": url,
+                        "detail": "auto",
                     }));
                 } else {
                     return Err(ConversionError::UnsupportedContentBlock(
@@ -726,8 +725,6 @@ fn append_user_message(input: &mut Vec<Value>, content: &Value) -> Result<(), Co
 fn append_assistant_message(
     input: &mut Vec<Value>,
     content: &Value,
-    replay_model: &str,
-    replay_credential_id: Option<u64>,
     signature_codec: Option<&ReasoningSignatureCodec>,
 ) -> Result<(), ConversionError> {
     let blocks = parse_content_blocks(content);
@@ -767,33 +764,24 @@ fn append_assistant_message(
                     }
                 }
             }
-            // Claude Code 会原样回传 thinking + signature。仅当 xai-rs2 包通过
-            // HMAC 且 model/backend/credential 与本次真实路由完全一致时展开；
-            // 旧格式、篡改包与跨模型/跨账号包都回退为可见文本。
+            // Claude Code 会原样回传 thinking + signature。只要 xai-rs2 包通过
+            // HMAC 解码（decode 内部已强制 backend==responses、结构与大小合法）
+            // 即展开回放；旧格式/篡改包 decode 失败，回退为可见文本。
+            //
+            // 不再按 model 或 credential 过滤：encrypted_content 非账户作用域，
+            // 跨凭据 failover 可安全回放；model 亦放宽（同一会话通常同模型，
+            // 换模型时上游若拒会以 400+encrypted_content 触发既有重试）。这样
+            // 多轮 reasoning / KV-cache 在 failover 与目录漂移下都能保住。
             "thinking" => {
                 if let (Some(codec), Some(signature)) =
                     (signature_codec, block.signature.as_deref())
                 {
                     if let Some(package) = codec.decode(signature) {
-                        if package_matches_route(
-                            &package,
-                            replay_model,
-                            GrokApiBackend::Responses.as_str(),
-                            replay_credential_id,
-                        ) {
-                            flush_message(input, "assistant", &mut content_parts);
-                            for item in package_to_input_items(&package) {
-                                input.push(item);
-                            }
-                            continue;
+                        flush_message(input, "assistant", &mut content_parts);
+                        for item in package_to_input_items(&package) {
+                            input.push(item);
                         }
-                        tracing::debug!(
-                            package_credential = ?package.credential_id,
-                            replay_credential = ?replay_credential_id,
-                            package_model = %package.model,
-                            replay_model,
-                            "xai-rs2 reasoning signature 与当前路由不匹配，回退为 thinking 文本"
-                        );
+                        continue;
                     }
                 }
                 if let Some(text) = block.thinking.or(block.text) {
@@ -885,6 +873,47 @@ fn image_url_from_block(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// 解码后图片字节的上限（20 MiB）。与 Grok Build 持久化历史的
+/// `MAX_LOADED_IMAGE_BYTES` 一致，仅作 sanity 上限，拦掉明显过大的 data URL，
+/// 避免把巨型 base64 原样打给上游再被拒/超时。
+const MAX_IMAGE_DECODED_BYTES: usize = 20 * 1024 * 1024;
+
+/// 校验一个即将作为 input_image / image_url 发送的图片 URL。
+///
+/// 仅对**可本地检查**的 `data:` URL 生效：
+/// * 拒绝 xAI vision 明确不接受的格式（gif/bmp/tiff）——Grok Build 对这些
+///   格式要么转码要么判为 "API-rejected format"；代理无法转码，故给出清晰
+///   400，而不是把注定失败的请求打给上游。
+/// * 拒绝解码后超过 [`MAX_IMAGE_DECODED_BYTES`] 的负载。
+///
+/// 远程 http(s) URL 无法本地检查，原样放行、交上游裁决。
+fn validate_image_url(url: &str) -> Result<(), ConversionError> {
+    let Some(after_data) = url.strip_prefix("data:") else {
+        return Ok(());
+    };
+    let Some(comma) = after_data.find(',') else {
+        return Err(ConversionError::UnsupportedContentBlock(
+            "data URL 图片缺少 base64 负载分隔符".to_string(),
+        ));
+    };
+    let header = &after_data[..comma];
+    let mime = header.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(mime.as_str(), "image/gif" | "image/bmp" | "image/tiff") {
+        return Err(ConversionError::UnsupportedContentBlock(format!(
+            "xAI vision 不接受 {mime} 图片，请转换为 PNG/JPEG/WebP"
+        )));
+    }
+    // base64 解码后约为原长度的 3/4；直接用长度估算避免真的解码大字符串。
+    let payload_len = after_data[comma + 1..].len();
+    if payload_len / 4 * 3 > MAX_IMAGE_DECODED_BYTES {
+        return Err(ConversionError::UnsupportedContentBlock(format!(
+            "图片超过 {} MiB 上限，请压缩后再发送",
+            MAX_IMAGE_DECODED_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 /// Anthropic Files API 的 image/document source。
 fn file_id_from_block(block: &ContentBlock) -> Option<String> {
     let source = block.source.as_ref()?;
@@ -904,6 +933,22 @@ fn request_has_file_inputs(request: &MessagesRequest) -> bool {
                     .and_then(|source| source.get("type"))
                     .and_then(Value::as_str)
                     .is_some_and(|source_type| source_type == "file")
+            })
+        })
+    })
+}
+
+/// 请求是否携带图片输入。任何 `image` / `image_url` block（含 base64、远程
+/// URL 或 Files API `file_id`）都算，用于在路由阶段排除明确不支持 vision 的
+/// 凭据。仅探测存在性，不校验单块内容合法性——那由转换阶段负责。
+fn request_has_image_inputs(request: &MessagesRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("image") | Some("image_url")
+                )
             })
         })
     })
@@ -1518,6 +1563,95 @@ mod tests {
     }
 
     #[test]
+    fn input_image_carries_detail_auto_for_base64_and_url_sources() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"text","text":"describe"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}},
+                    {"type":"image_url","image_url":{"url":"https://example.com/a.png"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let converted = convert_request(&request, "grok-4.5", None).unwrap();
+        let content = converted.body["input"][0]["content"].as_array().unwrap();
+        // base64 source → data URL input_image，必须带 detail=auto。
+        assert_eq!(
+            content[1],
+            json!({
+                "type":"input_image",
+                "image_url":"data:image/png;base64,iVBOR",
+                "detail":"auto"
+            })
+        );
+        // image_url 兼容块同样带 detail=auto。
+        assert_eq!(
+            content[2],
+            json!({
+                "type":"input_image",
+                "image_url":"https://example.com/a.png",
+                "detail":"auto"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_image_url_rejects_gif_and_oversize_but_allows_png_and_remote() {
+        // xAI vision 不接受 gif → 明确拒绝。
+        assert!(validate_image_url("data:image/gif;base64,R0lGODdh").is_err());
+        // bmp/tiff 同样拒绝。
+        assert!(validate_image_url("data:image/bmp;base64,Qk0=").is_err());
+        // png data URL 放行。
+        assert!(validate_image_url("data:image/png;base64,iVBORw0KGgo=").is_ok());
+        // 远程 URL 无法本地检查，放行交上游裁决。
+        assert!(validate_image_url("https://example.com/a.gif").is_ok());
+        // 超过 20 MiB 解码上限 → 拒绝（base64 长度约为解码后的 4/3）。
+        let huge_payload = "A".repeat(28 * 1024 * 1024);
+        let huge = format!("data:image/png;base64,{huge_payload}");
+        assert!(validate_image_url(&huge).is_err());
+        // 刚好在上限内的小图放行。
+        assert!(validate_image_url("data:image/jpeg;base64,/9j/4AAQ").is_ok());
+    }
+
+    #[test]
+    fn converts_rejects_gif_image_block_with_clear_error() {
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 128,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"image","source":{"type":"base64","media_type":"image/gif","data":"R0lGODdh"}}
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+        let err = convert_request(&request, "grok-4.5", None).unwrap_err();
+        assert!(matches!(err, ConversionError::UnsupportedContentBlock(_)));
+    }
+
+    #[test]
     fn rejects_file_sources_for_non_responses_catalog_models() {
         let request = MessagesRequest {
             model: "grok-chat".to_string(),
@@ -1609,14 +1743,8 @@ mod tests {
             temperature: None,
             top_p: None,
         };
-        let converted = convert_request_for_credential(
-            &request,
-            "grok-4.5",
-            None,
-            Some(3),
-            Some(&codec),
-        )
-        .unwrap();
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&codec)).unwrap();
         assert_eq!(
             converted.body["include"],
             json!(["reasoning.encrypted_content"])
@@ -1633,9 +1761,108 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_reasoning_signature_falls_back_to_thinking_text() {
+    fn cross_model_reasoning_signature_still_replays() {
         use super::super::reasoning_sig::ReasoningSignatureCodec;
 
+        // 签发时 model=grok-4.5，本轮换到 grok-4.6：model gate 已放宽，只要
+        // HMAC 解码通过就回放 reasoning（不再降级成纯文本）。若上游因跨模型
+        // 拒收，会以 400+encrypted_content 触发既有重试，而不是这里前置降级。
+        let codec = ReasoningSignatureCodec::new(b"test-server-secret");
+        let signature = codec
+            .encode(
+                "grok-4.5",
+                Some(1),
+                &[json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_blob",
+                })],
+            )
+            .unwrap();
+        let request = MessagesRequest {
+            model: "grok-4.6".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "thinking",
+                    "thinking": "visible plan",
+                    "signature": signature,
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&codec)).unwrap();
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "enc_blob");
+    }
+
+    #[test]
+    fn tampered_reasoning_signature_falls_back_to_thinking_text() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        // 用不同密钥签发 → 本 codec HMAC 校验失败，decode 返回 None，回退为
+        // 可见文本（旧格式 / 篡改包同理）。
+        let signer = ReasoningSignatureCodec::new(b"other-secret");
+        let signature = signer
+            .encode(
+                "grok-4.5",
+                Some(1),
+                &[json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_blob",
+                })],
+            )
+            .unwrap();
+        let verifier = ReasoningSignatureCodec::new(b"server-secret");
+        let request = MessagesRequest {
+            model: "grok-4.5".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "thinking",
+                    "thinking": "visible plan",
+                    "signature": signature,
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+        };
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&verifier)).unwrap();
+        let input = converted.body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["text"], "visible plan");
+    }
+
+    #[test]
+    fn cross_credential_reasoning_signature_still_replays_after_failover() {
+        use super::super::reasoning_sig::ReasoningSignatureCodec;
+
+        // 签发时 credential=1，但本轮 failover 到别的账号：credential 不再是
+        // 门槛（encrypted_content 非账户作用域），reasoning 仍原样回放，保住
+        // 多轮 KV-cache，而不是降级成纯文本。
         let codec = ReasoningSignatureCodec::new(b"test-server-secret");
         let signature = codec
             .encode(
@@ -1669,18 +1896,14 @@ mod tests {
             temperature: None,
             top_p: None,
         };
-        let converted = convert_request_for_credential(
-            &request,
-            "grok-4.5",
-            None,
-            Some(99),
-            Some(&codec),
-        )
-        .unwrap();
+        // signature_codec 是服务端单例；同一 codec 解码即视为通过 HMAC。这里
+        // 不传任何 credential，等价于 failover 到与签发账号不同的凭据。
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&codec)).unwrap();
         let input = converted.body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["content"][0]["text"], "visible plan");
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "enc_blob");
     }
 
     #[test]
@@ -1725,14 +1948,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        let converted = convert_request_for_credential(
-            &request,
-            "grok-4.5",
-            None,
-            Some(3),
-            Some(&codec),
-        )
-        .unwrap();
+        let converted =
+            convert_request_for_credential(&request, "grok-4.5", None, Some(&codec)).unwrap();
         let input = converted.body["input"].as_array().unwrap();
         assert_eq!(input[0]["id"], "rs_1");
         assert_eq!(input[1]["type"], "message");

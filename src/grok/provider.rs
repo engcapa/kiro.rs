@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::model::config::TlsBackend;
 
 use super::credentials::{GrokCredentials, XAI_DEFAULT_BASE_URL};
@@ -136,6 +136,11 @@ pub struct GrokProvider {
     global_proxy: Option<ProxyConfig>,
     tls_backend: TlsBackend,
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// 流式上游（Messages/Responses/Chat 的 SSE 及非流式 JSON）专用 client：
+    /// 无总超时，用连接超时 + 每次读超时 + keep-alive 探测掉线，避免长 reasoning
+    /// 回答被 300s 总时限从中途 abort。与 `client_cache`（媒体/Files/catalog 仍
+    /// 保留 300s 总超时）分开缓存。
+    streaming_client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// `/v1/models` 定时刷新冷却。目录失败不会写入此时间，确保后续周期仍会
     /// 重试，同时不影响运行时凭据状态。
     catalog_refresh_at: Mutex<Option<std::time::Instant>>,
@@ -153,11 +158,15 @@ impl GrokProvider {
         let initial_client = build_client(global_proxy.as_ref(), 300, tls_backend)?;
         let mut client_cache = HashMap::new();
         client_cache.insert(global_proxy.clone(), initial_client);
+        let streaming_client = build_streaming_client(global_proxy.as_ref(), tls_backend)?;
+        let mut streaming_client_cache = HashMap::new();
+        streaming_client_cache.insert(global_proxy.clone(), streaming_client);
         Ok(Self {
             token_manager,
             global_proxy,
             tls_backend,
             client_cache: Mutex::new(client_cache),
+            streaming_client_cache: Mutex::new(streaming_client_cache),
             catalog_refresh_at: Mutex::new(None),
             video_jobs: Mutex::new(HashMap::new()),
         })
@@ -174,6 +183,20 @@ impl GrokProvider {
             return Ok(client.clone());
         }
         let client = build_client(effective_proxy.as_ref(), 300, self.tls_backend)?;
+        cache.insert(effective_proxy, client.clone());
+        Ok(client)
+    }
+
+    /// 流式上游调用（Messages/Responses/Chat）专用 client。与 [`Self::client_for`]
+    /// 相同的 per-credential 代理解析，但底层用 [`build_streaming_client`]：不设
+    /// 总超时，避免长回答的 SSE 被 300s 死线掐断。媒体/Files/catalog 不走这里。
+    fn streaming_client_for(&self, credentials: &GrokCredentials) -> anyhow::Result<Client> {
+        let effective_proxy = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.streaming_client_cache.lock();
+        if let Some(client) = cache.get(&effective_proxy) {
+            return Ok(client.clone());
+        }
+        let client = build_streaming_client(effective_proxy.as_ref(), self.tls_backend)?;
         cache.insert(effective_proxy, client.clone());
         Ok(client)
     }
@@ -262,6 +285,7 @@ impl GrokProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
         pinned_credential_id: Option<u64>,
     ) -> anyhow::Result<GrokUpstreamResponse> {
@@ -273,6 +297,7 @@ impl GrokProvider {
             model,
             reasoning_effort,
             requires_backend_search,
+            requires_image,
             allowed_pools,
             route,
             |_| Ok(body.clone()),
@@ -289,6 +314,7 @@ impl GrokProvider {
         model: &str,
         reasoning_effort: Option<ReasoningEffort>,
         requires_backend_search: bool,
+        requires_image: bool,
         allowed_pools: Option<&[String]>,
         route: GrokCredentialRoute,
         mut body_for_credential: F,
@@ -308,6 +334,7 @@ impl GrokProvider {
             reasoning_effort,
             Some(backend),
             requires_backend_search,
+            requires_image,
             allowed_pools,
         )?;
         candidates.truncate(MAX_TOTAL_RETRIES);
@@ -327,6 +354,7 @@ impl GrokProvider {
                     reasoning_effort,
                     Some(backend),
                     requires_backend_search,
+                    requires_image,
                     allowed_pools,
                 ) {
                     last_error = Some(error);
@@ -366,8 +394,10 @@ impl GrokProvider {
                     .filter(|value| !value.trim().is_empty());
                 let request_id = Uuid::new_v4().to_string();
                 let accepts_sse = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                // 用流式 client：Messages/Responses/Chat 的长回答不能受 300s
+                // 总超时限制（媒体/Files/catalog 仍走 client_for 的有界总超时）。
                 let mut request = self
-                    .client_for(&context.credentials)?
+                    .streaming_client_for(&context.credentials)?
                     .post(&url)
                     .header("content-type", "application/json")
                     .header(
@@ -401,6 +431,7 @@ impl GrokProvider {
                     reasoning_effort,
                     Some(backend),
                     requires_backend_search,
+                    requires_image,
                     allowed_pools,
                 ) {
                     last_error = Some(error);
@@ -509,6 +540,7 @@ impl GrokProvider {
                     None,
                     Some(GrokApiBackend::Responses),
                     false,
+                    false,
                     allowed_pools,
                 )
                 .await
@@ -524,6 +556,7 @@ impl GrokProvider {
                 None,
                 None,
                 Some(GrokApiBackend::Responses),
+                false,
                 false,
                 allowed_pools,
             ) {
@@ -620,7 +653,7 @@ impl GrokProvider {
         for attempt in 0..max_retries {
             let context = match self
                 .token_manager
-                .acquire_context(None, None, None, false, allowed_pools)
+                .acquire_context(None, None, None, false, false, allowed_pools)
                 .await
             {
                 Ok(context) => context,
@@ -634,6 +667,7 @@ impl GrokProvider {
                 None,
                 None,
                 None,
+                false,
                 false,
                 allowed_pools,
             ) {
@@ -741,6 +775,7 @@ impl GrokProvider {
                 None,
                 None,
                 None,
+                false,
                 false,
                 allowed_pools,
             )?;
@@ -1286,6 +1321,7 @@ mod tests {
                 GrokApiBackend::Responses,
                 "grok-4.5",
                 None,
+                false,
                 false,
                 None,
                 GrokCredentialRoute::Preferred(1),

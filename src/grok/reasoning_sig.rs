@@ -205,21 +205,6 @@ pub struct ReasoningSignaturePackage {
     pub items: Vec<Value>,
 }
 
-/// 仅在签发时的 model/backend/credential 与当前真实路由完全一致时允许回放。
-pub fn package_matches_route(
-    package: &ReasoningSignaturePackage,
-    replay_model: &str,
-    replay_backend: &str,
-    replay_credential_id: Option<u64>,
-) -> bool {
-    package.model.eq_ignore_ascii_case(replay_model)
-        && package.backend == replay_backend
-        && matches!(
-            (package.credential_id, replay_credential_id),
-            (Some(expected), Some(actual)) if expected == actual
-        )
-}
-
 /// 将包展开为 Responses `input` 可接受的 reasoning items（去掉 `status`）。
 pub fn package_to_input_items(package: &ReasoningSignaturePackage) -> Vec<Value> {
     package
@@ -386,41 +371,6 @@ mod tests {
                 .decode(std::str::from_utf8(&tampered).unwrap())
                 .is_none()
         );
-    }
-
-    #[test]
-    fn route_mismatch_detection() {
-        let package = ReasoningSignaturePackage {
-            v: PACKAGE_VERSION,
-            backend: "responses".to_string(),
-            model: "grok-4.5".to_string(),
-            credential_id: Some(1),
-            items: vec![sample_item("rs_1", "enc")],
-        };
-        assert!(package_matches_route(
-            &package,
-            "grok-4.5",
-            "responses",
-            Some(1)
-        ));
-        assert!(!package_matches_route(
-            &package,
-            "grok-4.5",
-            "responses",
-            Some(2)
-        ));
-        assert!(!package_matches_route(
-            &package,
-            "grok-4.6",
-            "responses",
-            Some(1)
-        ));
-        assert!(!package_matches_route(
-            &package,
-            "grok-4.5",
-            "chat_completions",
-            Some(1)
-        ));
     }
 
     #[test]

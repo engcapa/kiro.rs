@@ -175,6 +175,11 @@ pub struct GrokModel {
     /// 三态值参与每凭据路由，避免把“字段缺失”误判成“不支持”。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_backend_search: Option<bool>,
+    /// `Some(true)` 表示模型接受图片输入（vision），`Some(false)` 表示明确
+    /// 不支持，`None` 表示目录未声明、允许尝试并交给上游裁决。三态语义与
+    /// [`Self::supports_backend_search`] 一致，避免把“字段缺失”误判成“不支持”。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_image_input: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -296,6 +301,9 @@ impl GrokModelCatalog {
                     // bootstrap 用于真实 catalog 还未加载的兼容窗口；明确
                     // 标记支持 Responses Web Search。
                     supports_backend_search: Some(true),
+                    // vision 能力在 bootstrap 窗口保持未知：真实 catalog 一到位
+                    // 就按上游声明裁决，避免 bootstrap 阶段误判带图请求。
+                    supports_image_input: None,
                     reasoning_effort: None,
                     // 缺少服务端菜单时 Grok Build 使用 legacy 的
                     // low/medium/high/xhigh fallback，而不是把 xhigh 压缩。
@@ -395,6 +403,7 @@ impl GrokModel {
                 &["supportsBackendSearch", "supports_backend_search"],
             )
             .and_then(Value::as_bool),
+            supports_image_input: parse_image_input_support(object, meta),
             reasoning_effort,
             reasoning_efforts,
         })
@@ -412,6 +421,7 @@ struct GrokModelCapability {
     backend: GrokApiBackend,
     supports_reasoning_effort: bool,
     supports_backend_search: Option<bool>,
+    supports_image_input: Option<bool>,
     efforts: HashSet<ReasoningEffort>,
     uses_legacy_effort_menu: bool,
 }
@@ -429,6 +439,7 @@ impl GrokCredentialModelIndex {
                         backend: model.api_backend,
                         supports_reasoning_effort: model.supports_reasoning_effort,
                         supports_backend_search: model.supports_backend_search,
+                        supports_image_input: model.supports_image_input,
                         efforts: model
                             .reasoning_efforts
                             .iter()
@@ -448,6 +459,7 @@ impl GrokCredentialModelIndex {
         effort: Option<ReasoningEffort>,
         backend: Option<GrokApiBackend>,
         requires_backend_search: bool,
+        requires_image: bool,
     ) -> bool {
         let Some(model) = self.models.get(&model_id.to_ascii_lowercase()) else {
             return false;
@@ -456,6 +468,10 @@ impl GrokCredentialModelIndex {
             return false;
         }
         if requires_backend_search && model.supports_backend_search == Some(false) {
+            return false;
+        }
+        // 仅排除明确声明不支持 vision 的模型；`None`（未声明）放行交上游裁决。
+        if requires_image && model.supports_image_input == Some(false) {
             return false;
         }
         let Some(effort) = effort else {
@@ -515,9 +531,15 @@ pub fn merge_catalogs(catalogs: &[GrokModelCatalog]) -> GrokModelCatalog {
 fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
     existing.supported_in_api |= incoming.supported_in_api;
     existing.supports_reasoning_effort |= incoming.supports_reasoning_effort;
-    existing.supports_backend_search = merge_backend_search_capability(
+    existing.supports_backend_search = merge_capability_tristate(
         existing.supports_backend_search,
         incoming.supports_backend_search,
+    );
+    // vision 能力沿用同一三态并集：任一凭据明确支持即支持；存在未声明凭据
+    // 时保持未知；仅全部明确拒绝才是 false。
+    existing.supports_image_input = merge_capability_tristate(
+        existing.supports_image_input,
+        incoming.supports_image_input,
     );
     // 并集目录仅用于 /models 展示与别名解析。异构凭据的 apiBackend 可能不同：
     // 优先保留 Responses（Files / hosted Web Search 所需），其次 Messages，
@@ -551,7 +573,8 @@ fn merge_model(existing: &mut GrokModel, incoming: &GrokModel) {
 
 /// 合并后的 catalog 代表凭据并集：任一凭据明确支持即为支持；没有明确支持
 /// 时，只要存在未声明能力的凭据就保持未知；只有全部明确拒绝才是 false。
-fn merge_backend_search_capability(
+/// 供 `supportsBackendSearch` 与 `supportsImageInput` 等三态能力共用。
+fn merge_capability_tristate(
     existing: Option<bool>,
     incoming: Option<bool>,
 ) -> Option<bool> {
@@ -687,6 +710,57 @@ fn value_from<'a>(
         .or_else(|| meta.and_then(|meta| keys.iter().find_map(|key| meta.get(*key))))
 }
 
+/// 解析上游对图片输入（vision）的能力声明为三态值。
+///
+/// 不同上游用不同形状表达该能力，这里统一兼容，未命中任何形状时返回 `None`
+/// （未知放行，交上游裁决），与 `supportsBackendSearch` 的三态语义一致：
+/// * 布尔字段（`supportsImageInput` / `supportsVision` / `vision`）直接取值；
+/// * 输入模态数组（`supportedInputTypes` / `inputModalities` / `modalities`）
+///   含 image → `Some(true)`，非空但不含 → `Some(false)`，空数组 → `None`。
+fn parse_image_input_support(
+    object: &Map<String, Value>,
+    meta: Option<&Map<String, Value>>,
+) -> Option<bool> {
+    if let Some(explicit) = value_from(
+        object,
+        meta,
+        &[
+            "supportsImageInput",
+            "supports_image_input",
+            "supportsVision",
+            "supports_vision",
+            "vision",
+        ],
+    )
+    .and_then(Value::as_bool)
+    {
+        return Some(explicit);
+    }
+    let modalities = value_from(
+        object,
+        meta,
+        &[
+            "supportedInputTypes",
+            "supported_input_types",
+            "inputModalities",
+            "input_modalities",
+            "modalities",
+        ],
+    )
+    .and_then(Value::as_array)?;
+    let mut saw_entry = false;
+    for entry in modalities {
+        if let Some(text) = entry.as_str() {
+            saw_entry = true;
+            if text.eq_ignore_ascii_case("image") {
+                return Some(true);
+            }
+        }
+    }
+    // 声明了模态数组但不含 image：明确不支持；空/全非字符串数组视为未知。
+    saw_entry.then_some(false)
+}
+
 fn normalize_model_key(value: &str) -> String {
     value
         .chars()
@@ -749,18 +823,21 @@ mod tests {
             Some(ReasoningEffort::High),
             Some(GrokApiBackend::Responses),
             true,
+            false,
         ));
         assert!(!index.supports(
             "grok-4.5",
             Some(ReasoningEffort::Xhigh),
             Some(GrokApiBackend::Responses),
             true,
+            false,
         ));
         assert!(!index.supports(
             "grok-4.5",
             None,
             Some(GrokApiBackend::ChatCompletions),
             true,
+            false,
         ));
     }
 
@@ -792,6 +869,7 @@ mod tests {
             None,
             Some(GrokApiBackend::Responses),
             true,
+            false,
         ));
 
         let explicit_false = GrokModelCatalog::from_upstream(
@@ -807,6 +885,92 @@ mod tests {
             "grok-4.5",
             None,
             Some(GrokApiBackend::Responses),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn parses_image_input_capability_from_modalities_and_bool() {
+        // 布尔字段直接取值。
+        let explicit = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportsImageInput": true
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        assert_eq!(explicit.models[0].supports_image_input, Some(true));
+
+        // 模态数组含 image → Some(true)；不含 → Some(false)。
+        let vision = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-4.5",
+                "apiBackend":"responses",
+                "supportedInputTypes":["TEXT","IMAGE"]
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        assert_eq!(vision.models[0].supports_image_input, Some(true));
+
+        let text_only = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-code",
+                "apiBackend":"responses",
+                "supportedInputTypes":["TEXT"]
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        assert_eq!(text_only.models[0].supports_image_input, Some(false));
+
+        // 未声明 → None（未知放行）。
+        let unknown = GrokModelCatalog::from_upstream(
+            &json!({"data":[{"model":"grok-4.5","apiBackend":"responses"}]}),
+            "https://api.x.ai/v1",
+        );
+        assert_eq!(unknown.models[0].supports_image_input, None);
+    }
+
+    #[test]
+    fn catalog_index_allows_missing_image_support_but_rejects_explicit_false() {
+        let text_only = GrokModelCatalog::from_upstream(
+            &json!({"data":[{
+                "model":"grok-code",
+                "apiBackend":"responses",
+                "supportedInputTypes":["TEXT"]
+            }]}),
+            "https://api.x.ai/v1",
+        );
+        let index = GrokCredentialModelIndex::from_catalog(&text_only);
+        // 不带图请求：即使模型无 vision 也放行。
+        assert!(index.supports(
+            "grok-code",
+            None,
+            Some(GrokApiBackend::Responses),
+            false,
+            false,
+        ));
+        // 带图请求命中明确 text-only：排除。
+        assert!(!index.supports(
+            "grok-code",
+            None,
+            Some(GrokApiBackend::Responses),
+            false,
+            true,
+        ));
+
+        // 未声明 vision 的模型带图请求：未知放行。
+        let unknown = GrokModelCatalog::from_upstream(
+            &json!({"data":[{"model":"grok-4.5","apiBackend":"responses"}]}),
+            "https://api.x.ai/v1",
+        );
+        let unknown_index = GrokCredentialModelIndex::from_catalog(&unknown);
+        assert!(unknown_index.supports(
+            "grok-4.5",
+            None,
+            Some(GrokApiBackend::Responses),
+            false,
             true,
         ));
     }
