@@ -604,6 +604,26 @@ pub fn map_model(model: &str) -> Option<String> {
 /// - `None`：该凭据对此模型不下发任何扩展字段（schema 缺失或字段全被收紧掉）。
 ///
 /// 若该 model_id 不在此凭据 catalog 中（理论上已被选择阶段过滤），返回入参克隆以免误删。
+/// 将某个枚举字符串值按其 JSON Schema 属性收紧：
+/// - 若属性无 `enum` 定义，原样返回（无从校验）；
+/// - 若值在 `enum` 内，原样返回；
+/// - 否则回退到属性的 `default`，无 default 时回退到 `fallback`。
+pub fn clamp_enum_value(value: &str, prop: Option<&serde_json::Value>, fallback: &str) -> String {
+    match prop.and_then(|p| p.get("enum")).and_then(|e| e.as_array()) {
+        Some(vals) if !vals.iter().any(|v| v.as_str() == Some(value)) => prop
+            .and_then(|p| p.get("default"))
+            .and_then(|d| d.as_str())
+            .unwrap_or(fallback)
+            .to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// effort 专用收紧：越界回退 default，缺 default 时回退 `high`。
+pub fn clamp_effort_value(effort: &str, effort_prop: Option<&serde_json::Value>) -> String {
+    clamp_enum_value(effort, effort_prop, "high")
+}
+
 pub fn clamp_additional_fields(
     existing: &serde_json::Value,
     catalog: &crate::kiro::model::model_catalog::KiroModelCatalog,
@@ -653,21 +673,32 @@ pub fn clamp_additional_fields(
         }
     }
 
-    // output_config.effort：若不在 schema enum 内则回退 default/high
+    // output_config.effort（Claude 家族）：若不在 schema enum 内则回退 default/high
     if let (Some(oc), Some(oc_prop)) = (existing.get("output_config"), props.get("output_config")) {
         if let Some(effort) = oc.get("effort").and_then(|v| v.as_str()) {
             let effort_prop = oc_prop.get("properties").and_then(|p| p.get("effort"));
-            let valid_effort = match effort_prop.and_then(|e| e.get("enum")).and_then(|e| e.as_array()) {
-                Some(vals) if !vals.iter().any(|v| v.as_str() == Some(effort)) => effort_prop
-                    .and_then(|e| e.get("default"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("high")
-                    .to_string(),
-                _ => effort.to_string(),
-            };
+            let valid_effort = clamp_effort_value(effort, effort_prop);
             let mut o = serde_json::Map::new();
             o.insert("effort".to_string(), serde_json::Value::String(valid_effort));
             out.insert("output_config".to_string(), serde_json::Value::Object(o));
+        }
+    }
+
+    // reasoning.{effort,mode}（gpt-5.x 系列）：各自若不在 schema enum 内则回退 default/high
+    if let (Some(rs), Some(rs_prop)) = (existing.get("reasoning"), props.get("reasoning")) {
+        let mut o = serde_json::Map::new();
+        if let Some(effort) = rs.get("effort").and_then(|v| v.as_str()) {
+            let effort_prop = rs_prop.get("properties").and_then(|p| p.get("effort"));
+            let valid = clamp_effort_value(effort, effort_prop);
+            o.insert("effort".to_string(), serde_json::Value::String(valid));
+        }
+        if let Some(mode) = rs.get("mode").and_then(|v| v.as_str()) {
+            let mode_prop = rs_prop.get("properties").and_then(|p| p.get("mode"));
+            let valid = clamp_enum_value(mode, mode_prop, "standard");
+            o.insert("mode".to_string(), serde_json::Value::String(valid));
+        }
+        if !o.is_empty() {
+            out.insert("reasoning".to_string(), serde_json::Value::Object(o));
         }
     }
 
@@ -2662,5 +2693,84 @@ mod tests {
         // max 在 enum 内 → 保留
         let out = clamp_additional_fields(&existing, &catalog, "claude-opus-4.8").unwrap();
         assert_eq!(out["output_config"]["effort"], "max");
+    }
+
+    /// gpt-5.x 系列：reasoning.effort 在 schema enum 内 → 保留（xhigh 透传）
+    #[test]
+    fn test_clamp_additional_fields_keeps_valid_reasoning_effort() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        let schema = serde_json::json!({
+            "properties": {
+                "reasoning": {"properties": {
+                    "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"], "default": "high"},
+                    "mode": {"enum": ["standard", "pro"], "default": "standard"}
+                }}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: "GPT-5.6 Sol".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        let existing = serde_json::json!({ "reasoning": {"effort": "xhigh"} });
+        let out = clamp_additional_fields(&existing, &catalog, "gpt-5.6-sol").unwrap();
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
+        // 未显式下发 mode 时不应凭空补出
+        assert!(out["reasoning"].get("mode").is_none());
+    }
+
+    /// gpt-5.x 系列：reasoning.effort 越界 → 回退 schema default
+    #[test]
+    fn test_clamp_additional_fields_reasoning_effort_clamped_to_default() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        // 该凭据只支持到 high（无 xhigh/max），default=high
+        let schema = serde_json::json!({
+            "properties": {
+                "reasoning": {"properties": {
+                    "effort": {"enum": ["low", "medium", "high"], "default": "high"},
+                    "mode": {"enum": ["standard", "pro"], "default": "standard"}
+                }}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: "GPT-5.6 Sol".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        // xhigh 不在此凭据 enum 内 → 收紧为 high；mode 越界 → 收紧为 standard
+        let existing = serde_json::json!({ "reasoning": {"effort": "xhigh", "mode": "turbo"} });
+        let out = clamp_additional_fields(&existing, &catalog, "gpt-5.6-sol").unwrap();
+        assert_eq!(out["reasoning"]["effort"], "high");
+        assert_eq!(out["reasoning"]["mode"], "standard");
+    }
+
+    #[test]
+    fn test_clamp_effort_value_helper() {
+        let effort_prop = serde_json::json!({"enum": ["low", "high"], "default": "high"});
+        // 在 enum 内 → 保留
+        assert_eq!(clamp_effort_value("low", Some(&effort_prop)), "low");
+        assert_eq!(clamp_effort_value("high", Some(&effort_prop)), "high");
+        // 越界 → 回退 default
+        assert_eq!(clamp_effort_value("xhigh", Some(&effort_prop)), "high");
+        // 无 schema 属性 → 原样返回（无从校验）
+        assert_eq!(clamp_effort_value("xhigh", None), "xhigh");
     }
 }

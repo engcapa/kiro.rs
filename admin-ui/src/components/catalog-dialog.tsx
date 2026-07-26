@@ -51,7 +51,19 @@ function schemaProperties(model: KiroModel): Record<string, unknown> | null {
 function modelSupportsThinking(model: KiroModel): boolean {
   if (model.supportsReasoningEffort != null) return model.supportsReasoningEffort
   const props = schemaProperties(model)
-  return Boolean(props && 'thinking' in props)
+  // thinking：Claude 家族；reasoning：gpt-5.x 系列；output_config：Claude effort
+  return Boolean(
+    props && ('thinking' in props || 'reasoning' in props || 'output_config' in props)
+  )
+}
+
+/** 从形如 `{ properties: { effort: { enum: [...] } } }` 的容器中取 effort 枚举 */
+function effortEnumFrom(container: unknown): string[] | null {
+  if (!container || typeof container !== 'object') return null
+  const nested = (container as { properties?: unknown }).properties
+  const effort = (nested as { effort?: { enum?: unknown } } | undefined)?.effort
+  if (!effort || !Array.isArray(effort.enum)) return null
+  return effort.enum.filter((v): v is string => typeof v === 'string')
 }
 
 function extractEffortLevels(model: KiroModel): string[] {
@@ -60,15 +72,34 @@ function extractEffortLevels(model: KiroModel): string[] {
   }
   const props = schemaProperties(model)
   if (!props) return []
-  const effort = props.effort as { enum?: unknown } | undefined
-  if (!effort || !Array.isArray(effort.enum)) return []
-  return effort.enum.filter((v): v is string => typeof v === 'string')
+  // 兼容三种形状：顶层 effort、output_config.effort（Claude）、reasoning.effort（gpt-5.x）
+  const topEffort = props.effort as { enum?: unknown } | undefined
+  if (topEffort && Array.isArray(topEffort.enum)) {
+    return topEffort.enum.filter((v): v is string => typeof v === 'string')
+  }
+  return effortEnumFrom(props.reasoning) ?? effortEnumFrom(props.output_config) ?? []
+}
+
+/** 从 schema 的 effort 属性中取 default（reasoning.effort / output_config.effort） */
+function defaultEffortFrom(container: unknown): string | null {
+  if (!container || typeof container !== 'object') return null
+  const nested = (container as { properties?: unknown }).properties
+  const effort = (nested as { effort?: { default?: unknown } } | undefined)?.effort
+  return typeof effort?.default === 'string' ? effort.default : null
+}
+
+function extractDefaultEffort(model: KiroModel): string | null {
+  if (model.defaultReasoningEffort) return model.defaultReasoningEffort
+  const props = schemaProperties(model)
+  if (!props) return null
+  return defaultEffortFrom(props.reasoning) ?? defaultEffortFrom(props.output_config)
 }
 
 function ModelCard({ model, defaultModelId }: { model: KiroModel; defaultModelId?: string }) {
   const [expanded, setExpanded] = useState(false)
   const thinking = modelSupportsThinking(model)
   const efforts = extractEffortLevels(model)
+  const defaultEffort = extractDefaultEffort(model)
   const isDefault = defaultModelId === model.modelId
   const schema = model.additionalModelRequestFieldsSchema
   const fieldKeys = schemaProperties(model) ? Object.keys(schemaProperties(model)!) : []
@@ -208,9 +239,9 @@ function ModelCard({ model, defaultModelId }: { model: KiroModel; defaultModelId
                     </Badge>
                   ))}
                 </div>
-                {model.defaultReasoningEffort && (
+                {defaultEffort && (
                   <div className="mt-1 text-xs text-muted-foreground">
-                    默认: {model.defaultReasoningEffort}
+                    默认: {defaultEffort}
                   </div>
                 )}
               </div>
