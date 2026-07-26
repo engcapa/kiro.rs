@@ -553,31 +553,36 @@ impl AdminService {
                                 if let Some(prop_type) = prop_obj.get("type") {
                                     md.push_str(&format!("- **类型**: {}\n", prop_type));
                                 }
-                                if let Some(enum_vals) = prop_obj
-                                    .get("properties")
-                                    .and_then(|p| p.as_object())
-                                    .and_then(|p| p.get("type"))
-                                    .and_then(|t| t.get("enum"))
-                                    .and_then(|e| e.as_array())
+                                // 遍历嵌套子字段（如 thinking.type / output_config.effort /
+                                // reasoning.effort / reasoning.mode），渲染各自的枚举与默认值
+                                if let Some(sub_props) =
+                                    prop_obj.get("properties").and_then(|p| p.as_object())
                                 {
-                                    let vals: Vec<String> = enum_vals
-                                        .iter()
-                                        .filter_map(|v| v.as_str().map(|s| format!("`{}`", s)))
-                                        .collect();
-                                    if !vals.is_empty() {
-                                        md.push_str(&format!("- **支持的值**: {}\n", vals.join(", ")));
+                                    for (sub_key, sub_val) in sub_props {
+                                        if let Some(enum_vals) =
+                                            sub_val.get("enum").and_then(|e| e.as_array())
+                                        {
+                                            let vals: Vec<String> = enum_vals
+                                                .iter()
+                                                .filter_map(|v| {
+                                                    v.as_str().map(|s| format!("`{}`", s))
+                                                })
+                                                .collect();
+                                            if !vals.is_empty() {
+                                                md.push_str(&format!(
+                                                    "- `{}` 支持的值: {}\n",
+                                                    sub_key,
+                                                    vals.join(", ")
+                                                ));
+                                            }
+                                        }
+                                        if let Some(default_val) = sub_val.get("default") {
+                                            md.push_str(&format!(
+                                                "- `{}` 默认值: `{}`\n",
+                                                sub_key, default_val
+                                            ));
+                                        }
                                     }
-                                }
-                                if let Some(default_val) = prop_obj
-                                    .get("properties")
-                                    .and_then(|p| p.as_object())
-                                    .and_then(|p| p.get("type"))
-                                    .and_then(|t| t.get("default"))
-                                {
-                                    md.push_str(&format!(
-                                        "- **默认值**: `{}`\n",
-                                        default_val
-                                    ));
                                 }
                             }
                             md.push('\n');

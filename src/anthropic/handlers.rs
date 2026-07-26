@@ -98,13 +98,18 @@ pub async fn get_models() -> impl IntoResponse {
                 context_window,
             });
 
-            // 检查 schema properties 中是否包含 thinking 或 output_config 相关的配置
+            // 检查 schema properties 中是否包含 thinking / output_config / reasoning 相关配置
+            // （reasoning 为 gpt-5.x 系列的推理 effort 形状）
             let supports_thinking = m.additional_model_request_fields_schema
                 .as_ref()
                 .and_then(|s| s.as_object())
                 .and_then(|obj| obj.get("properties"))
                 .and_then(|props| props.as_object())
-                .map(|props| props.contains_key("thinking") || props.contains_key("output_config"))
+                .map(|props| {
+                    props.contains_key("thinking")
+                        || props.contains_key("output_config")
+                        || props.contains_key("reasoning")
+                })
                 .unwrap_or(false);
 
             if supports_thinking {
@@ -872,54 +877,66 @@ pub fn get_additional_model_request_fields(payload: &MessagesRequest) -> Option<
         // 判断是否为 Claude 模型且版本 <= 4.7
         let use_thinking_for_legacy = is_claude_model_lte_47(&payload.model);
 
-        // 检查 schema 是否支持 output_config (effort)
-        if !properties.contains_key("output_config") {
+        // schema 既不支持 output_config（Claude effort）也不支持 reasoning（gpt-5.x effort）
+        // => 该模型无 effort 类扩展字段，直接不下发
+        let has_output_config = properties.contains_key("output_config");
+        let has_reasoning = properties.contains_key("reasoning");
+        if !has_output_config && !has_reasoning {
             return None;
         }
 
         let mut fields = serde_json::Map::new();
 
-        // 根据 effort 计算有效的 effort 值
+        // 客户端请求的 effort（如 Claude Code 的 /effort → output_config.effort），缺省 high
         let effort = payload
             .output_config
             .as_ref()
             .map(|c| c.effort.clone())
             .unwrap_or_else(|| "high".to_string());
 
-        // 校验 effort 是否在 schema 允许的 enum 中
-        let effort_valid = if let Some(output_config_prop) = properties.get("output_config") {
-            if let Some(effort_prop) = output_config_prop.get("properties").and_then(|p| p.get("effort")) {
-                if let Some(enum_vals) = effort_prop.get("enum").and_then(|e| e.as_array()) {
-                    let mut matched = false;
-                    for val in enum_vals {
-                        if let Some(val_str) = val.as_str() {
-                            if val_str == effort {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if matched {
-                        effort.clone()
-                    } else {
-                        effort_prop.get("default")
-                            .and_then(|d| d.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "high".to_string())
-                    }
-                } else {
-                    effort.clone()
-                }
-            } else {
-                effort.clone()
-            }
-        } else {
-            effort.clone()
-        };
+        if has_output_config {
+            // Claude 家族：effort 走 output_config，按 schema enum 收紧
+            let effort_prop = properties
+                .get("output_config")
+                .and_then(|p| p.get("properties"))
+                .and_then(|p| p.get("effort"));
+            let effort_valid =
+                crate::anthropic::converter::clamp_effort_value(&effort, effort_prop);
+            let mut output_config_obj = serde_json::Map::new();
+            output_config_obj
+                .insert("effort".to_string(), serde_json::Value::String(effort_valid));
+            fields.insert(
+                "output_config".to_string(),
+                serde_json::Value::Object(output_config_obj),
+            );
+        } else if has_reasoning {
+            // gpt-5.x 系列：effort 走 reasoning.effort，按 schema enum 收紧。
+            let reasoning_prop = properties.get("reasoning").and_then(|p| p.get("properties"));
+            let effort_prop = reasoning_prop.and_then(|p| p.get("effort"));
+            let effort_valid =
+                crate::anthropic::converter::clamp_effort_value(&effort, effort_prop);
+            let mut reasoning_obj = serde_json::Map::new();
+            reasoning_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
 
-        let mut output_config_obj = serde_json::Map::new();
-        output_config_obj.insert("effort".to_string(), serde_json::Value::String(effort_valid));
-        fields.insert("output_config".to_string(), serde_json::Value::Object(output_config_obj));
+            // mode：仅当模型名带 `-mode-pro` 后缀且 schema 声明支持 mode 时才下发 pro，
+            // 按 schema enum 收紧（越界回退 standard）。不带后缀则不下发，由上游默认 standard。
+            if crate::anthropic::converter::model_requests_pro_mode(&payload.model) {
+                if let Some(mode_prop) = reasoning_prop.and_then(|p| p.get("mode")) {
+                    let mode_valid = crate::anthropic::converter::clamp_enum_value(
+                        "pro",
+                        Some(mode_prop),
+                        "standard",
+                    );
+                    reasoning_obj
+                        .insert("mode".to_string(), serde_json::Value::String(mode_valid));
+                }
+            }
+
+            fields.insert(
+                "reasoning".to_string(),
+                serde_json::Value::Object(reasoning_obj),
+            );
+        }
 
         // 对于 Claude 模型 <= 4.7，同时传递 thinking type
         if use_thinking_for_legacy && properties.contains_key("thinking") {

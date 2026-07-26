@@ -403,6 +403,26 @@ pub fn get_catalog_fallback() -> crate::kiro::model::model_catalog::KiroModelCat
     }
 }
 
+/// 判断请求的模型名是否显式要求 reasoning.mode=pro（gpt-5.x 系列）。
+///
+/// 触发条件：清理掉 `[1m]` 上下文后缀后，模型名以 `-mode-pro` 结尾，或以
+/// `-mode-pro-thinking` 结尾（兼容后缀顺序）。仅识别显式 `-mode-pro`，不带则视为
+/// 默认（standard，由上游兜底）。用 -mode-pro 后缀避免误伤真实以 -pro 结尾的模型名。
+pub fn model_requests_pro_mode(model: &str) -> bool {
+    let mut s = model.trim().to_lowercase();
+    // 去掉 [1m] 之类的上下文后缀，避免 `gpt-5.6-sol-mode-pro[1m]` 漏判
+    if s.ends_with(']') {
+        if let Some(idx) = s.rfind('[') {
+            s = s[..idx].trim().to_string();
+        }
+    }
+    // 兼容 `-mode-pro` 与 `-mode-pro-thinking`（先剥末尾的 -thinking 再看是否 -mode-pro 结尾）
+    if let Some(stripped) = s.strip_suffix("-thinking") {
+        s = stripped.to_string();
+    }
+    s.ends_with("-mode-pro")
+}
+
 /// 模型映射：将 Anthropic 模型名或非 Claude 模型名智能映射到 Kiro 模型 ID
 ///
 /// # 映射逻辑 (Mapping Heuristics & Workflow)
@@ -479,9 +499,15 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     }
     
-    // 2. 清理其他后缀（移除末尾的 -thinking 和类似于 -20251101 的日期后缀）
-    if clean_model.ends_with("-thinking") {
-        clean_model = clean_model[..clean_model.len() - 9].trim().to_string();
+    // 2. 清理其他后缀（移除末尾的 -mode-pro / -thinking 和类似于 -20251101 的日期后缀）
+    //    -mode-pro 为 gpt-5.x 系列的 reasoning.mode=pro 开关，仅用于路由/映射，剥离后按基础模型匹配。
+    //    用 -mode-pro 而非 -pro 作后缀，避免误伤真实以 -pro 结尾的模型名。
+    //    先剥 -mode-pro 再剥 -thinking，可兼容 `...-thinking-mode-pro` 这类组合。
+    if let Some(stripped) = clean_model.strip_suffix("-mode-pro") {
+        clean_model = stripped.trim().to_string();
+    }
+    if let Some(stripped) = clean_model.strip_suffix("-thinking") {
+        clean_model = stripped.trim().to_string();
     }
     if clean_model.len() >= 9 {
         let suffix = &clean_model[clean_model.len() - 9..];
@@ -604,6 +630,26 @@ pub fn map_model(model: &str) -> Option<String> {
 /// - `None`：该凭据对此模型不下发任何扩展字段（schema 缺失或字段全被收紧掉）。
 ///
 /// 若该 model_id 不在此凭据 catalog 中（理论上已被选择阶段过滤），返回入参克隆以免误删。
+/// 将某个枚举字符串值按其 JSON Schema 属性收紧：
+/// - 若属性无 `enum` 定义，原样返回（无从校验）；
+/// - 若值在 `enum` 内，原样返回；
+/// - 否则回退到属性的 `default`，无 default 时回退到 `fallback`。
+pub fn clamp_enum_value(value: &str, prop: Option<&serde_json::Value>, fallback: &str) -> String {
+    match prop.and_then(|p| p.get("enum")).and_then(|e| e.as_array()) {
+        Some(vals) if !vals.iter().any(|v| v.as_str() == Some(value)) => prop
+            .and_then(|p| p.get("default"))
+            .and_then(|d| d.as_str())
+            .unwrap_or(fallback)
+            .to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// effort 专用收紧：越界回退 default，缺 default 时回退 `high`。
+pub fn clamp_effort_value(effort: &str, effort_prop: Option<&serde_json::Value>) -> String {
+    clamp_enum_value(effort, effort_prop, "high")
+}
+
 pub fn clamp_additional_fields(
     existing: &serde_json::Value,
     catalog: &crate::kiro::model::model_catalog::KiroModelCatalog,
@@ -653,21 +699,32 @@ pub fn clamp_additional_fields(
         }
     }
 
-    // output_config.effort：若不在 schema enum 内则回退 default/high
+    // output_config.effort（Claude 家族）：若不在 schema enum 内则回退 default/high
     if let (Some(oc), Some(oc_prop)) = (existing.get("output_config"), props.get("output_config")) {
         if let Some(effort) = oc.get("effort").and_then(|v| v.as_str()) {
             let effort_prop = oc_prop.get("properties").and_then(|p| p.get("effort"));
-            let valid_effort = match effort_prop.and_then(|e| e.get("enum")).and_then(|e| e.as_array()) {
-                Some(vals) if !vals.iter().any(|v| v.as_str() == Some(effort)) => effort_prop
-                    .and_then(|e| e.get("default"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("high")
-                    .to_string(),
-                _ => effort.to_string(),
-            };
+            let valid_effort = clamp_effort_value(effort, effort_prop);
             let mut o = serde_json::Map::new();
             o.insert("effort".to_string(), serde_json::Value::String(valid_effort));
             out.insert("output_config".to_string(), serde_json::Value::Object(o));
+        }
+    }
+
+    // reasoning.{effort,mode}（gpt-5.x 系列）：各自若不在 schema enum 内则回退 default/high
+    if let (Some(rs), Some(rs_prop)) = (existing.get("reasoning"), props.get("reasoning")) {
+        let mut o = serde_json::Map::new();
+        if let Some(effort) = rs.get("effort").and_then(|v| v.as_str()) {
+            let effort_prop = rs_prop.get("properties").and_then(|p| p.get("effort"));
+            let valid = clamp_effort_value(effort, effort_prop);
+            o.insert("effort".to_string(), serde_json::Value::String(valid));
+        }
+        if let Some(mode) = rs.get("mode").and_then(|v| v.as_str()) {
+            let mode_prop = rs_prop.get("properties").and_then(|p| p.get("mode"));
+            let valid = clamp_enum_value(mode, mode_prop, "standard");
+            o.insert("mode".to_string(), serde_json::Value::String(valid));
+        }
+        if !o.is_empty() {
+            out.insert("reasoning".to_string(), serde_json::Value::Object(o));
         }
     }
 
@@ -1547,6 +1604,36 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_mode_pro_suffix_stripped() {
+        // -mode-pro 后缀（gpt-5.x mode 开关）应被剥离，回落到基础模型（用 fallback 内已有模型验证）
+        assert_eq!(map_model("claude-opus-4-6-mode-pro"), Some("claude-opus-4.6".to_string()));
+        // 组合后缀：-mode-pro 与 -thinking 同时存在，任一顺序都应剥净
+        assert_eq!(
+            map_model("claude-opus-4-6-thinking-mode-pro"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-6-mode-pro-thinking"),
+            Some("claude-opus-4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_requests_pro_mode() {
+        // 显式 -mode-pro → true
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro"));
+        assert!(model_requests_pro_mode("GPT-5.6-Sol-Mode-Pro")); // 大小写不敏感
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro[1m]")); // 带上下文后缀
+        assert!(model_requests_pro_mode("gpt-5.6-sol-mode-pro-thinking")); // 组合后缀
+        assert!(model_requests_pro_mode("gpt-5.6-sol-thinking-mode-pro"));
+        // 无 -mode-pro → false
+        assert!(!model_requests_pro_mode("gpt-5.6-sol"));
+        assert!(!model_requests_pro_mode("gpt-5.6-sol-thinking"));
+        // 仅 -pro（非 -mode-pro）不应触发，避免误伤真实以 -pro 结尾的模型名
+        assert!(!model_requests_pro_mode("some-model-pro"));
     }
 
     #[test]
@@ -2662,5 +2749,84 @@ mod tests {
         // max 在 enum 内 → 保留
         let out = clamp_additional_fields(&existing, &catalog, "claude-opus-4.8").unwrap();
         assert_eq!(out["output_config"]["effort"], "max");
+    }
+
+    /// gpt-5.x 系列：reasoning.effort 在 schema enum 内 → 保留（xhigh 透传）
+    #[test]
+    fn test_clamp_additional_fields_keeps_valid_reasoning_effort() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        let schema = serde_json::json!({
+            "properties": {
+                "reasoning": {"properties": {
+                    "effort": {"enum": ["none", "low", "medium", "high", "xhigh", "max"], "default": "high"},
+                    "mode": {"enum": ["standard", "pro"], "default": "standard"}
+                }}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: "GPT-5.6 Sol".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        let existing = serde_json::json!({ "reasoning": {"effort": "xhigh"} });
+        let out = clamp_additional_fields(&existing, &catalog, "gpt-5.6-sol").unwrap();
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
+        // 未显式下发 mode 时不应凭空补出
+        assert!(out["reasoning"].get("mode").is_none());
+    }
+
+    /// gpt-5.x 系列：reasoning.effort 越界 → 回退 schema default
+    #[test]
+    fn test_clamp_additional_fields_reasoning_effort_clamped_to_default() {
+        use crate::kiro::model::model_catalog::{KiroModel, KiroModelCatalog};
+        // 该凭据只支持到 high（无 xhigh/max），default=high
+        let schema = serde_json::json!({
+            "properties": {
+                "reasoning": {"properties": {
+                    "effort": {"enum": ["low", "medium", "high"], "default": "high"},
+                    "mode": {"enum": ["standard", "pro"], "default": "standard"}
+                }}
+            }
+        });
+        let catalog = KiroModelCatalog {
+            default_model: None,
+            models: vec![KiroModel {
+                model_id: "gpt-5.6-sol".to_string(),
+                model_name: "GPT-5.6 Sol".to_string(),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                supported_input_types: None,
+                token_limits: None,
+                prompt_caching: None,
+                additional_model_request_fields_schema: Some(schema),
+            }],
+        };
+        // xhigh 不在此凭据 enum 内 → 收紧为 high；mode 越界 → 收紧为 standard
+        let existing = serde_json::json!({ "reasoning": {"effort": "xhigh", "mode": "turbo"} });
+        let out = clamp_additional_fields(&existing, &catalog, "gpt-5.6-sol").unwrap();
+        assert_eq!(out["reasoning"]["effort"], "high");
+        assert_eq!(out["reasoning"]["mode"], "standard");
+    }
+
+    #[test]
+    fn test_clamp_effort_value_helper() {
+        let effort_prop = serde_json::json!({"enum": ["low", "high"], "default": "high"});
+        // 在 enum 内 → 保留
+        assert_eq!(clamp_effort_value("low", Some(&effort_prop)), "low");
+        assert_eq!(clamp_effort_value("high", Some(&effort_prop)), "high");
+        // 越界 → 回退 default
+        assert_eq!(clamp_effort_value("xhigh", Some(&effort_prop)), "high");
+        // 无 schema 属性 → 原样返回（无从校验）
+        assert_eq!(clamp_effort_value("xhigh", None), "xhigh");
     }
 }
