@@ -26,6 +26,17 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 2;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 一次成功的上游 API 调用
+///
+/// 除了响应本身，还回传实际服务该请求的凭据 ID。故障转移可能换过凭据，
+/// 调用方要把上游下发的扣费归属到正确的凭据上，必须知道这个 ID。
+pub struct ApiCall {
+    /// 上游响应
+    pub response: reqwest::Response,
+    /// 实际服务本次请求的凭据 ID
+    pub credential_id: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -117,12 +128,12 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<ApiCall> {
         self.call_api_with_retry(request_body, false, allowed_pools).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str, allowed_pools: Option<&[String]>) -> anyhow::Result<ApiCall> {
         self.call_api_with_retry(request_body, true, allowed_pools).await
     }
 
@@ -288,7 +299,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         allowed_pools: Option<&[String]>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ApiCall> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -380,7 +391,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ApiCall {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息

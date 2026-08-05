@@ -69,6 +69,14 @@ impl AdminService {
         &self.api_key_manager
     }
 
+    /// 读取请求计量账本快照
+    ///
+    /// credits 全部来自上游 `meteringEvent`，未收到该事件的请求计入
+    /// `unmeteredRequests` 而不做估算。
+    pub fn usage(&self) -> crate::kiro::usage::UsageSnapshot {
+        self.token_manager.usage_snapshot()
+    }
+
     /// 获取所有凭据状态
     pub async fn get_all_credentials(&self) -> CredentialsStatusResponse {
         // 查询时尝试更新模型元数据，失败沿用上次
@@ -101,6 +109,8 @@ impl AdminService {
                 user_name: entry.user_name,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
+                credits_used: entry.credits_used,
+                metered_requests: entry.metered_requests,
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,

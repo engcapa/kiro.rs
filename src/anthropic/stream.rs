@@ -324,6 +324,20 @@ pub struct StreamContext {
     pub text_block_index: Option<i32>,
     /// 捕获到的推理签名
     pub signature: Option<String>,
+    /// 上游 meteringEvent 下发的本次请求扣费（`None` 表示未收到）
+    pub credits: Option<f64>,
+    /// 扣费单位（如 "credits"）
+    pub credits_unit: Option<String>,
+    /// 上游实际服务的模型 ID（来自 assistantResponseEvent.modelId）
+    pub served_model: Option<String>,
+    /// 回答字符数累计（用于成本口径分析）
+    pub answer_chars: u64,
+    /// 思考字符数累计
+    pub reasoning_chars: u64,
+    /// 工具调用字符数累计（toolUseEvent 的 name + input）
+    pub tool_chars: u64,
+    /// 上游下发的上下文使用百分比原值
+    pub context_usage_percentage: Option<f64>,
 }
 
 impl StreamContext {
@@ -349,6 +363,39 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             signature: None,
+            credits: None,
+            credits_unit: None,
+            served_model: None,
+            answer_chars: 0,
+            reasoning_chars: 0,
+            tool_chars: 0,
+            context_usage_percentage: None,
+        }
+    }
+
+    /// 汇总本次请求的用量，供计量账本记账
+    ///
+    /// `credential_id` 是实际服务本次请求的凭据（故障转移后可能不是首选那张），
+    /// `requested_model` 是下发给上游的 modelId（映射后的值，而非客户端模型名）。
+    pub fn to_request_usage(
+        &self,
+        credential_id: Option<u64>,
+        conversation_id: Option<String>,
+        requested_model: impl Into<String>,
+        stream: bool,
+    ) -> crate::kiro::usage::RequestUsage {
+        crate::kiro::usage::RequestUsage {
+            credential_id,
+            conversation_id,
+            requested_model: requested_model.into(),
+            served_model: self.served_model.clone(),
+            credits: self.credits,
+            unit: self.credits_unit.clone(),
+            answer_chars: self.answer_chars,
+            reasoning_chars: self.reasoning_chars,
+            tool_chars: self.tool_chars,
+            context_usage_percentage: self.context_usage_percentage,
+            stream,
         }
     }
 
@@ -418,11 +465,35 @@ impl StreamContext {
                 if let Some(ref sig) = resp.signature {
                     self.signature = Some(sig.clone());
                 }
+                self.reasoning_chars += resp.text.chars().count() as u64;
                 self.process_reasoning_content(&resp.text)
             }
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
-            Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
+            Event::AssistantResponse(resp) => {
+                self.answer_chars += resp.content.chars().count() as u64;
+                // 上游可能静默替换模型。modelId 每个 delta 都会带，只在首次取值，
+                // 避免整条响应期间反复分配 String。
+                if self.served_model.is_none() {
+                    self.served_model = resp.model_id.clone().filter(|m| !m.is_empty());
+                }
+                self.process_assistant_response(&resp.content)
+            }
+            Event::ToolUse(tool_use) => {
+                // 工具调用的 input JSON 同样是模型生成的输出，必须计入成本口径。
+                // name 只在收尾帧记一次，避免每个 delta 重复累加。
+                self.tool_chars += tool_use.input.chars().count() as u64;
+                if tool_use.stop {
+                    self.tool_chars += tool_use.name.chars().count() as u64;
+                }
+                self.process_tool_use(tool_use)
+            }
+            Event::Metering(metering) => {
+                self.credits = Some(metering.usage);
+                self.credits_unit = Some(metering.unit_label().to_string());
+                tracing::debug!("收到 meteringEvent: {}", metering);
+                Vec::new()
+            }
             Event::ContextUsage(context_usage) => {
+                self.context_usage_percentage = Some(context_usage.context_usage_percentage);
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens = (context_usage.context_usage_percentage
@@ -786,6 +857,11 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    /// 内部流上下文（用于读取累计的计量数据）
+    pub fn inner(&self) -> &StreamContext {
+        &self.inner
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1155,5 +1231,119 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    #[test]
+    fn test_metering_event_accumulated() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-6", 0, false, HashMap::new());
+        assert_eq!(ctx.credits, None);
+
+        let events = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent::new(2.5),
+        ));
+        // 计费事件不产生任何面向客户端的 SSE
+        assert!(events.is_empty());
+        assert_eq!(ctx.credits, Some(2.5));
+        assert_eq!(ctx.credits_unit.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn test_served_model_and_output_chars_accumulated() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-6", 0, true, HashMap::new());
+
+        ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent::new("思考"),
+        ));
+        let mut answer = crate::kiro::model::events::AssistantResponseEvent::new("hello");
+        answer.model_id = Some("claude-opus-4.7".to_string());
+        ctx.process_kiro_event(&Event::AssistantResponse(answer));
+
+        assert_eq!(ctx.reasoning_chars, 2, "按字符计数而非字节");
+        assert_eq!(ctx.answer_chars, 5);
+        assert_eq!(ctx.served_model.as_deref(), Some("claude-opus-4.7"));
+    }
+
+    /// 工具调用的 input 也是模型输出，必须计入成本口径
+    ///
+    /// 回归用例：实测一次「28 字符回答 + 一个大 tool_use」的请求扣了 0.114 credits，
+    /// 只算回答文本会把单位成本高估约 6.7 倍。
+    #[test]
+    fn test_tool_use_chars_counted_as_output() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        // input 分两个 delta 到达，name 只在收尾帧计一次
+        ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Bash".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"command":"#.to_string(),
+            stop: false,
+        }));
+        ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Bash".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#""ls -la"}"#.to_string(),
+            stop: true,
+        }));
+
+        // 11 + 9 个 input 字符 + 一次 "Bash"(4)
+        assert_eq!(ctx.tool_chars, 24, "name 不应随每个 delta 重复累加");
+
+        let mut answer = crate::kiro::model::events::AssistantResponseEvent::new("ok");
+        answer.model_id = None;
+        ctx.process_kiro_event(&Event::AssistantResponse(answer));
+
+        let usage = ctx.to_request_usage(Some(1), None, "m", true);
+        assert_eq!(usage.answer_chars, 2);
+        assert_eq!(usage.tool_chars, 24);
+        // 成本分母必须含工具输出，否则带工具轮次的单位成本被系统性高估
+        assert_eq!(usage.output_chars(), 26);
+    }
+
+    /// 用真实抓包的上游响应验证整条计量提取链路
+    ///
+    /// `docs/kiro_rs_aws_turn1_res.txt` 是一次真实 `generateAssistantResponse`
+    /// 的原始 event-stream 字节流，末尾带 `meteringEvent`。
+    #[test]
+    fn test_extract_usage_from_real_capture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/kiro_rs_aws_turn1_res.txt"
+        );
+        let bytes = std::fs::read(path).expect("真实抓包文件缺失，无法验证计量提取");
+
+        let mut decoder = crate::kiro::parser::decoder::EventStreamDecoder::new();
+        decoder.feed(&bytes).unwrap();
+
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 0, true, HashMap::new());
+        for result in decoder.decode_iter() {
+            if let Ok(frame) = result {
+                if let Ok(event) = Event::from_frame(frame) {
+                    ctx.process_kiro_event(&event);
+                }
+            }
+        }
+
+        // 扣费取自 meteringEvent，必须精确等于上游下发的值
+        let credits = ctx.credits.expect("未从真实抓包中解析出 meteringEvent");
+        assert!(
+            (credits - 2.3283256603316747).abs() < f64::EPSILON,
+            "credits = {}",
+            credits
+        );
+        assert_eq!(ctx.credits_unit.as_deref(), Some("credits"));
+        // 请求发的是 opus-4.8，上游实际用 opus-4.7 服务
+        assert_eq!(ctx.served_model.as_deref(), Some("claude-opus-4.7"));
+        assert!(ctx.answer_chars > 0, "回答字符数应被累计");
+        assert!(ctx.reasoning_chars > 0, "思考字符数应被累计");
+        assert!(ctx.context_usage_percentage.is_some());
+
+        // 账本口径：由 StreamContext 汇总出的 RequestUsage 应保留同样的值
+        let usage = ctx.to_request_usage(Some(7), Some("conv-x".to_string()), "claude-opus-4.8", true);
+        assert_eq!(usage.credits, ctx.credits);
+        assert_eq!(usage.effective_model(), "claude-opus-4.7");
+        assert!(usage.is_substituted(), "请求与实际服务模型不一致应被标记");
     }
 }

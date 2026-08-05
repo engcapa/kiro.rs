@@ -18,5 +18,6 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/kiro_usage.json
 /test-output/
 /api_keys.json

@@ -34,6 +34,13 @@ pub struct AssistantResponseEvent {
     #[serde(default)]
     pub content: String,
 
+    /// 实际服务本次请求的模型 ID
+    ///
+    /// 上游会静默替换模型（实测请求 `claude-opus-4.8` 可能由 `claude-opus-4.7`
+    /// 服务），而不同模型的 `rateMultiplier` 不同，直接影响扣费，因此需要记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
     #[serde(skip_serializing)]
@@ -51,6 +58,7 @@ impl Default for AssistantResponseEvent {
     fn default() -> Self {
         Self {
             content: String::new(),
+            model_id: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -61,6 +69,7 @@ impl AssistantResponseEvent {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            model_id: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -82,6 +91,22 @@ mod tests {
         let json = r#"{"content":"Hello, world!"}"#;
         let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.content, "Hello, world!");
+    }
+
+    #[test]
+    fn test_deserialize_model_id() {
+        // 取自真实抓包：assistantResponseEvent 会带上实际服务模型
+        let json = r##"{"content":"# Th","modelId":"claude-opus-4.7"}"##;
+        let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.content, "# Th");
+        assert_eq!(event.model_id.as_deref(), Some("claude-opus-4.7"));
+    }
+
+    #[test]
+    fn test_deserialize_without_model_id() {
+        let json = r#"{"content":"hi"}"#;
+        let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.model_id, None);
     }
 
     #[test]

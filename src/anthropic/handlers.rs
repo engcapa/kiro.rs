@@ -258,6 +258,54 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 计量归属上下文
+///
+/// 随请求一路带到收尾记账。这里存的是**下发给上游的**模型 ID（映射后）和会话 ID，
+/// 而不是客户端侧的模型名——扣费倍率按上游模型算，账本必须用同一口径。
+#[derive(Debug, Clone)]
+struct UsageContext {
+    /// 下发给上游的 modelId
+    upstream_model_id: String,
+    /// conversationState.conversationId
+    conversation_id: String,
+}
+
+/// 用量上报器
+///
+/// 把「实际服务凭据 + 上游模型 ID + 会话 ID」与账本绑在一起，供各条响应链路
+/// 在收尾时统一记账，避免三处链路各写一遍口径不一致的上报代码。
+struct UsageReporter {
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    credential_id: u64,
+    usage_ctx: UsageContext,
+}
+
+impl UsageReporter {
+    fn new(
+        provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+        credential_id: u64,
+        usage_ctx: UsageContext,
+    ) -> Self {
+        Self {
+            provider,
+            credential_id,
+            usage_ctx,
+        }
+    }
+
+    /// 上报一次流式请求的用量
+    fn report_stream(&self, ctx: &StreamContext) {
+        self.provider
+            .token_manager()
+            .report_usage(&ctx.to_request_usage(
+                Some(self.credential_id),
+                Some(self.usage_ctx.conversation_id.clone()),
+                self.usage_ctx.upstream_model_id.clone(),
+                true,
+            ));
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -361,6 +409,17 @@ pub async fn post_messages(
         additional_model_request_fields: additional_model_fields,
     };
 
+    // 计量口径：取下发给上游的真实 modelId 与会话 ID
+    let usage_ctx = UsageContext {
+        upstream_model_id: kiro_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .model_id
+            .clone(),
+        conversation_id: kiro_request.conversation_state.conversation_id.clone(),
+    };
+
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
@@ -416,11 +475,12 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             Some(&allowed_pools.0),
+            usage_ctx,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0)).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0), usage_ctx).await
     }
 }
 
@@ -437,6 +497,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     allowed_pools: Option<&[String]>,
+    usage_ctx: UsageContext,
 ) -> Response {
     let stream = create_sse_stream(
         provider,
@@ -446,6 +507,7 @@ async fn handle_stream_request(
         thinking_enabled,
         tool_name_map,
         allowed_pools.map(|s| s.to_vec()),
+        usage_ctx,
     );
 
     Response::builder()
@@ -503,6 +565,7 @@ fn create_sse_stream(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     allowed_pools: Option<Vec<String>>,
+    usage_ctx: UsageContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     async_stream::stream! {
         let mut ctx = StreamContext::new_with_thinking(&model, input_tokens, thinking_enabled, tool_name_map);
@@ -532,10 +595,11 @@ fn create_sse_stream(
                 }
             }
         };
-        let Some(response) = response else { return };
+        let Some(api_call) = response else { return };
+        let credential_id = api_call.credential_id;
 
         // 3) 处理上游事件流，同时继续 ping 保活
-        let body = response.bytes_stream();
+        let body = api_call.response.bytes_stream();
         tokio::pin!(body);
         let mut decoder = EventStreamDecoder::new();
         loop {
@@ -579,6 +643,10 @@ fn create_sse_stream(
                 }
             }
         }
+
+        // 4) 流收尾：把上游下发的扣费与实际服务模型记入账本
+        // provider 仍被 connect future 借用，这里克隆 Arc 而非移动
+        UsageReporter::new(provider.clone(), credential_id, usage_ctx).report_stream(&ctx);
     }
 }
 
@@ -593,15 +661,17 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     allowed_pools: Option<&[String]>,
+    usage_ctx: UsageContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body, allowed_pools).await {
+    let api_call = match provider.call_api(request_body, allowed_pools).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let credential_id = api_call.credential_id;
 
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match api_call.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -641,6 +711,14 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // 计量：上游下发的扣费、实际服务模型与输出规模
+    let mut usage = crate::kiro::usage::RequestUsage {
+        credential_id: Some(credential_id),
+        conversation_id: Some(usage_ctx.conversation_id.clone()),
+        requested_model: usage_ctx.upstream_model_id.clone(),
+        stream: false,
+        ..Default::default()
+    };
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -652,16 +730,32 @@ async fn handle_non_stream_request(
                 if let Ok(event) = Event::from_frame(frame) {
                     match event {
                         Event::ReasoningContent(resp) => {
+                            usage.reasoning_chars += resp.text.chars().count() as u64;
                             thinking_content.push_str(&resp.text);
                             if let Some(ref sig) = resp.signature {
                                 signature = Some(sig.clone());
                             }
                         }
                         Event::AssistantResponse(resp) => {
+                            usage.answer_chars += resp.content.chars().count() as u64;
+                            // modelId 每个 delta 都会带，只在首次取值
+                            if usage.served_model.is_none() {
+                                usage.served_model =
+                                    resp.model_id.clone().filter(|m| !m.is_empty());
+                            }
                             text_content.push_str(&resp.content);
+                        }
+                        Event::Metering(metering) => {
+                            usage.credits = Some(metering.usage);
+                            usage.unit = Some(metering.unit_label().to_string());
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
+                            // 工具调用的 input JSON 也是模型生成的输出，计入成本口径
+                            usage.tool_chars += tool_use.input.chars().count() as u64;
+                            if tool_use.stop {
+                                usage.tool_chars += tool_use.name.chars().count() as u64;
+                            }
 
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
@@ -698,6 +792,8 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
+                            usage.context_usage_percentage =
+                                Some(context_usage.context_usage_percentage);
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
@@ -729,6 +825,9 @@ async fn handle_non_stream_request(
             }
         }
     }
+
+    // 事件流已处理完，把上游下发的扣费与实际服务模型记入账本
+    provider.token_manager().report_usage(&usage);
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -1076,6 +1175,17 @@ pub async fn post_messages_cc(
         additional_model_request_fields: additional_model_fields,
     };
 
+    // 计量口径：取下发给上游的真实 modelId 与会话 ID
+    let usage_ctx = UsageContext {
+        upstream_model_id: kiro_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .model_id
+            .clone(),
+        conversation_id: kiro_request.conversation_state.conversation_id.clone(),
+    };
+
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
         Err(e) => {
@@ -1120,11 +1230,12 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             Some(&allowed_pools.0),
+            usage_ctx,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0)).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, thinking_enabled, tool_name_map, Some(&allowed_pools.0), usage_ctx).await
     }
 }
 
@@ -1140,18 +1251,24 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     allowed_pools: Option<&[String]>,
+    usage_ctx: UsageContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body, allowed_pools).await {
+    let api_call = match provider.call_api_stream(request_body, allowed_pools).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let credential_id = api_call.credential_id;
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(
+        api_call.response,
+        ctx,
+        UsageReporter::new(provider, credential_id, usage_ctx),
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1173,6 +1290,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    reporter: UsageReporter,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1183,8 +1301,9 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            reporter,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, reporter)| async move {
             if finished {
                 return None;
             }
@@ -1199,7 +1318,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, reporter)));
                     }
 
                     // 然后处理数据流
@@ -1230,20 +1349,22 @@ fn create_buffered_sse_stream(
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                reporter.report_stream(ctx.inner());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, reporter)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                reporter.report_stream(ctx.inner());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, reporter)));
                             }
                         }
                     }

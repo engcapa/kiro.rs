@@ -25,6 +25,7 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::model::model_catalog::{CredentialModelIndex, KiroModelCatalog, merge_catalogs};
+use crate::kiro::usage::{RequestUsage, UsageBucket, UsageLedger, UsageSnapshot};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -487,6 +488,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 累计扣费（来自上游 meteringEvent，非估算）
+    credits_used: f64,
+    /// 已计量的请求数（收到 meteringEvent 的请求）
+    metered_requests: u64,
     /// 该凭据的真实模型目录（per-credential，刷新时按各自 region/profileArn 拉取）
     /// `Arc` 让服务期读取为廉价克隆。`None` 表示尚未成功拉取，回退到并集/fallback。
     catalog: Option<Arc<KiroModelCatalog>>,
@@ -512,10 +517,18 @@ enum DisabledReason {
 }
 
 /// 统计数据持久化条目
+///
+/// 新增字段一律带 `serde(default)`，保证能读旧版 `kiro_stats.json`。
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    /// 该凭据累计扣费（来自上游 meteringEvent）
+    #[serde(default)]
+    credits_used: f64,
+    /// 该凭据已计量的请求数（收到 meteringEvent 的请求）
+    #[serde(default)]
+    metered_requests: u64,
 }
 
 // ============================================================================
@@ -560,6 +573,10 @@ pub struct CredentialEntrySnapshot {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 累计扣费（来自上游 meteringEvent）
+    pub credits_used: f64,
+    /// 已计量的请求数
+    pub metered_requests: u64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -614,6 +631,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 请求计量账本（credits / 实际服务模型，按凭据/模型/会话聚合）
+    usage: UsageLedger,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -738,6 +757,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    credits_used: 0.0,
+                    metered_requests: 0,
                     catalog: None,
                     index: None,
                 }
@@ -801,6 +822,11 @@ impl MultiTokenManager {
                 .unwrap_or(0)
         };
 
+        // 账本与统计文件同目录（credentials.json 所在目录）
+        let usage_path = credentials_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.join("kiro_usage.json")));
+
         let manager = Self {
             config,
             proxy,
@@ -812,6 +838,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            usage: UsageLedger::new(usage_path),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1315,6 +1342,8 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.credits_used = s.credits_used;
+                entry.metered_requests = s.metered_requests;
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1339,6 +1368,8 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            credits_used: e.credits_used,
+                            metered_requests: e.metered_requests,
                         },
                     )
                 })
@@ -1397,6 +1428,90 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 请求计量账本
+    pub fn usage(&self) -> &UsageLedger {
+        &self.usage
+    }
+
+    /// 读取计量账本快照（Admin API）
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.usage.snapshot()
+    }
+
+    /// 读取指定凭据的累计用量
+    pub fn usage_for(&self, id: u64) -> Option<UsageBucket> {
+        self.usage.credential_bucket(id)
+    }
+
+    /// 记一次请求的用量
+    ///
+    /// credits 一律取自上游 `meteringEvent`；缺失时记为「未计量」而不做任何估算，
+    /// 保证账本口径与上游账单一致。
+    pub fn report_usage(&self, usage: &RequestUsage) {
+        self.usage.record(usage);
+
+        // 只有拿到真实扣费才动凭据统计，避免把 0 写进累计值
+        if let (Some(id), Some(credits)) = (usage.credential_id, usage.credits) {
+            {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    entry.credits_used += credits;
+                    entry.metered_requests += 1;
+                }
+            }
+            self.save_stats_debounced();
+        }
+
+        let cred = usage
+            .credential_id
+            .map(|i| format!("#{}", i))
+            .unwrap_or_else(|| "#-".to_string());
+        let substituted = if usage.is_substituted() {
+            format!(
+                " | 上游替换模型: 请求 {} → 实际 {}",
+                usage.requested_model,
+                usage.effective_model()
+            )
+        } else {
+            String::new()
+        };
+
+        // 区分「上游确认用了同一模型」和「上游没回报 modelId」：两者的
+        // effective_model() 都等于请求模型，只看模型名无法分辨。对 auto
+        // 这类必然要解析到具体模型的请求，后者意味着无法归因。
+        let model_label = match usage.served_model.as_deref().filter(|s| !s.is_empty()) {
+            Some(_) => usage.effective_model().to_string(),
+            None => format!("{}(上游未回报实际模型)", usage.requested_model),
+        };
+
+        match usage.credits {
+            Some(credits) => tracing::info!(
+                "用量: 凭据 {} 模型 {} 扣费 {:.4} {} | 输出 {} 字符(回答 {} / 思考 {} / 工具 {}) | 单位成本 {} | 会话 {}{}",
+                cred,
+                model_label,
+                credits,
+                usage.unit.as_deref().unwrap_or("credits"),
+                usage.output_chars(),
+                usage.answer_chars,
+                usage.reasoning_chars,
+                usage.tool_chars,
+                match usage.output_chars() {
+                    0 => "-".to_string(),
+                    n => format!("{:.4}/1k字符", credits / (n as f64) * 1000.0),
+                },
+                usage.conversation_id.as_deref().unwrap_or("-"),
+                substituted
+            ),
+            None => tracing::warn!(
+                "用量: 凭据 {} 模型 {} 未收到 meteringEvent，本次请求未计入扣费 | 输出 {} 字符{}",
+                cred,
+                model_label,
+                usage.output_chars(),
+                substituted
+            ),
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1753,6 +1868,8 @@ impl MultiTokenManager {
                     user_name: e.credentials.user_name.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
+                    credits_used: e.credits_used,
+                    metered_requests: e.metered_requests,
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
@@ -2236,6 +2353,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                credits_used: 0.0,
+                metered_requests: 0,
                 catalog: None,
                 index: None,
             });
@@ -2647,6 +2766,8 @@ impl Drop for MultiTokenManager {
         if self.stats_dirty.load(Ordering::Relaxed) {
             self.save_stats();
         }
+        // 账本同样走去抖落盘，退出时补一次，避免丢掉最后 30 秒的记账
+        self.usage.flush();
     }
 }
 
