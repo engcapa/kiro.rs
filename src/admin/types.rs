@@ -60,6 +60,10 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 累计扣费（来自上游 meteringEvent，非估算值）
+    pub credits_used: f64,
+    /// 已计量的请求数（收到 meteringEvent 的请求）
+    pub metered_requests: u64,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）

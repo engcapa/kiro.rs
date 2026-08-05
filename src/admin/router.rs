@@ -9,7 +9,7 @@ use super::{
     handlers::{
         add_api_key, add_credential, delete_api_key, delete_credential, export_model_catalog,
         force_refresh_token, get_all_api_keys, get_all_credentials, get_all_pools,
-        get_credential_balance, get_credential_catalog, get_load_balancing_mode,
+        get_credential_balance, get_credential_catalog, get_load_balancing_mode, get_usage,
         reset_failure_count, set_credential_disabled, set_credential_name, set_credential_pools,
         set_credential_priority, set_load_balancing_mode, update_api_key,
     },
@@ -31,6 +31,7 @@ use super::{
 /// - `GET /credentials/:id/catalog` - 获取凭据模型目录（支持 `?refresh=true`）
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /usage` - 获取请求计量账本（credits / 实际服务模型，按凭据/模型/会话聚合）
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -67,6 +68,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             axum::routing::put(update_api_key).delete(delete_api_key),
         )
         .route("/pools", get(get_all_pools))
+        .route("/usage", get(get_usage))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

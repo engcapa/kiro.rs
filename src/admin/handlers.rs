@@ -261,6 +261,14 @@ pub async fn delete_api_key(
     }
 }
 
+/// GET /api/admin/usage
+///
+/// 返回请求计量账本：总计 + 按凭据 / 模型 / 会话聚合 + 最近请求明细。
+/// credits 一律来自上游 `meteringEvent`，不含任何估算值。
+pub async fn get_usage(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.usage())
+}
+
 /// GET /api/admin/pools
 pub async fn get_all_pools(State(state): State<AdminState>) -> impl IntoResponse {
     let credential_pools: Vec<String> = state
